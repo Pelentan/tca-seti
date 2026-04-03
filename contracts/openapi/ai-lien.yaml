@@ -1,0 +1,568 @@
+openapi: 3.1.0
+
+info:
+  title: SETI - AI-lien Job
+  description: |
+    Internal AI reasoning engine for the SETI constellation. The only
+    Job in the constellation running a local AI model instance.
+
+    AI-lien has exactly one external caller relationship: SETI. No
+    user-facing traffic, no concurrent session management, no external
+    exposure. The single-caller constraint is what makes an internal
+    AI Job viable here — the concurrency argument that pushes AI to
+    external services in every other TCA application does not apply.
+
+    AI-lien accepts structured analysis packages from authorized SETI
+    Jobs (Interactions, Watchdog) and returns structured assessments.
+    The model underneath is an implementation detail — Ollama with
+    Qwen2.5-Coder in the demo environment. The contract defines the
+    surface. What runs inside the container is opaque to all callers.
+
+    DOUBLE-TAP PATTERN:
+    Every analysis request executes in two model calls.
+
+    First tap: AI-lien feeds the package and supporting data to the
+    model with a meta-prompt asking it to construct the optimal query
+    for the analysis type requested. The model produces a well-formed,
+    context-aware prompt in its own idiom — better than any
+    deterministic assembler can produce from structured fields.
+
+    Second tap: AI-lien submits the first-tap prompt to the model as
+    the actual analysis query, requesting a response conforming to the
+    caller-supplied response_schema.
+
+    The first-tap prompt is returned in the response and persisted in
+    the Results Job audit trail. When an assessment is reviewed later —
+    by a human, by the Watchdog, by a future diagnostic — the exact
+    question asked of the model is visible, not just the raw input.
+
+    This is the first TCA Job to run an AI model as an internal
+    implementation component rather than calling an external service.
+    The three-year lifecycle applies. Model selection is an operational
+    decision. The contract is what persists.
+
+    Internal service — mTLS only, not externally exposed.
+  version: 0.1.0
+
+x-tca-security:
+  transport: mtls
+  tls-min-version: "1.3"
+  client-cert-required: true
+  reject-without-client-cert: true
+  ca-cert: /certs/ca.crt
+  service-cert: /certs/ai-lien.crt
+  service-key: /certs/ai-lien.key
+  implementation:
+    server:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      require-and-verify-client-cert: true
+    client:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      verify-server-cert: true
+  notes: >
+    Every inbound connection must present a certificate signed by the
+    SETI CA. Connections without a valid client certificate must be
+    rejected. Authorized callers: Interactions Job, Watchdog Job.
+    No other Job in the constellation has legitimate reason to call
+    AI-lien directly. Any unrecognized caller certificate must be
+    rejected and logged as a security event — AI-lien sitting behind
+    a compromised intermediary is a meaningful threat vector.
+
+x-tca-observability:
+  report-outbound-calls: true
+  endpoint: https://seti-observability:4011/event
+  pattern: fire-and-forget
+  caller-name: "ai-lien"
+  required-fields:
+    - caller
+    - callee
+    - method
+    - path
+    - status_code
+    - latency_ms
+    - protocol
+  implementation:
+    timing: wrap-every-outbound-http-call
+    non-blocking: true
+    on-failure: log-and-drop
+    do-not-instrument:
+      - seti-observability
+  notes: >
+    Report all outbound HTTP calls to the SETI Observability Job.
+    AI-lien's outbound calls are to the local Ollama instance only.
+    The Ollama endpoint is treated as an internal dependency for
+    observability reporting purposes — caller: "ai-lien",
+    callee: "ollama". Model inference latency is the primary
+    operational signal worth tracking here. Two calls per analysis
+    request (first tap + second tap) — both are reported.
+
+servers:
+  - url: https://ai-lien:4252
+    description: Internal SETI network (mTLS enforced)
+
+tags:
+  - name: analysis
+    description: Analysis request processing
+  - name: health
+    description: Service health and model status
+
+paths:
+
+  /analyze:
+    post:
+      tags: [analysis]
+      summary: Submit a structured analysis package for AI assessment
+      description: |
+        Accepts a structured analysis package and returns an AI-generated
+        assessment using the double-tap pattern.
+
+        First tap constructs an optimized prompt from the package and
+        supporting data. Second tap executes the analysis using that
+        prompt and returns a structured response conforming to the
+        caller-supplied response_schema.
+
+        Callers supply the analysis_type to identify what kind of
+        reasoning is needed. AI-lien uses this to select the appropriate
+        first-tap meta-prompt template. New analysis types are added
+        by extending the enum and adding a corresponding meta-prompt
+        template inside the Job — no contract change required for
+        callers unless the package or response shapes change.
+
+        Latency note: two model inference calls means response time
+        is 2x single-call latency. Callers must not put AI-lien on
+        any critical path. It is an advisory engine, not a gating
+        component. Timeouts should be set accordingly — 120 seconds
+        default, configurable per caller in the request meta.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnalysisRequest'
+            example:
+              analysis_type: "failure_analysis"
+              package:
+                application_id: "app-tca-vox-prod"
+                job_name: "vote-handler"
+                test_tier: "contract"
+                failure_detail: "POST /vote returning 500 on missing poll_guid field instead of 400"
+                consecutive_failures: 3
+                first_failure_at: "2026-03-27T01:45:00Z"
+              supporting_data:
+                recent_deployments:
+                  - job: "vote-handler"
+                    deployed_at: "2026-03-27T01:30:00Z"
+                    version: "0.4.1"
+                trend_7d:
+                  pass_rate: "0.94"
+                  previous_failures: 2
+                call_chain_anomaly: false
+              response_schema:
+                assessment: "string — diagnosis of the failure"
+                likely_cause: "string — most probable root cause"
+                recommended_action: "string enum: investigate, rollback, monitor, escalate"
+                supporting_evidence: "array of strings — evidence supporting the assessment"
+                confidence: "string decimal 0.0-1.0"
+              meta:
+                max_tokens: 1000
+                confidence_threshold: "0.70"
+                allow_escalate: true
+                timeout_seconds: 120
+      responses:
+        '200':
+          description: Analysis completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalysisResponse'
+        '400':
+          description: Invalid analysis request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: >
+            Model returned a response that could not be validated
+            against the supplied response_schema. Raw model output
+            included for diagnostic purposes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationFailureResponse'
+        '503':
+          description: >
+            Model unavailable. Ollama instance unreachable or
+            model not loaded. Caller should retry with backoff
+            or route to human escalation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '504':
+          description: Analysis timed out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimeoutResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      tags: [health]
+      summary: Service health and model status
+      description: |
+        Returns AI-lien service health including Ollama connectivity
+        and model load status. A degraded status here means callers
+        should route to human escalation rather than waiting for
+        AI-lien to recover.
+      responses:
+        '200':
+          description: Health status returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  schemas:
+
+    AnalysisRequest:
+      type: object
+      required:
+        - analysis_type
+        - package
+        - response_schema
+        - meta
+      properties:
+        analysis_type:
+          type: string
+          enum:
+            - failure_analysis
+            - anomaly_detection
+            - trend_assessment
+            - plot_regeneration_advisory
+            - cross_application_correlation
+          description: >
+            Identifies the reasoning context for first-tap prompt
+            template selection. New types are added to the enum as
+            SETI's analysis needs expand — callers use whatever type
+            matches their need, AI-lien handles the prompt construction
+            internally.
+
+            failure_analysis — test failure diagnosis for Interactions Job.
+            anomaly_detection — behavioral signal analysis for Watchdog.
+            trend_assessment — pattern analysis over historical results.
+            plot_regeneration_advisory — guidance on what changed in a
+            contract and what a regenerated Plot should cover.
+            cross_application_correlation — multi-application pattern
+            analysis, Watchdog primary use case.
+        package:
+          type: object
+          description: >
+            Structured request data typed to the analysis_type.
+            Contents vary by analysis type — AI-lien uses the
+            analysis_type to interpret the package correctly.
+            Financial values within the package must be strings.
+            No schema enforcement at the contract level — the
+            fluidity is intentional. Pydantic validation inside
+            AI-lien enforces type safety per analysis_type.
+        supporting_data:
+          type: object
+          description: >
+            Freeform JSON containing any additional context the
+            caller wants the model to have access to. Recent
+            deployment history, trend data, call chain observations,
+            cross-application signals — whatever enriches the
+            analysis. AI-lien feeds this to the first tap alongside
+            the package so the prompt constructor has full context.
+        response_schema:
+          type: object
+          description: >
+            Caller-supplied description of the desired response
+            structure. AI-lien instructs the model to conform to
+            this shape on the second tap and validates the output
+            before returning. Described as a JSON object where
+            keys are field names and values are type descriptions.
+            Example: {"assessment": "string", "confidence": "decimal string"}
+        meta:
+          $ref: '#/components/schemas/AnalysisMeta'
+
+    AnalysisMeta:
+      type: object
+      required:
+        - max_tokens
+        - confidence_threshold
+        - allow_escalate
+      properties:
+        max_tokens:
+          type: integer
+          minimum: 100
+          maximum: 4000
+          description: >
+            Maximum tokens for the second-tap model response.
+            Does not apply to first tap — prompt construction
+            is always allowed full token budget.
+          example: 1000
+        confidence_threshold:
+          type: string
+          description: >
+            Minimum acceptable confidence as decimal string.
+            Responses below this threshold are flagged as
+            low_confidence. Does not suppress the response —
+            the assessment is still returned with the flag set.
+          example: "0.70"
+        allow_escalate:
+          type: boolean
+          description: >
+            Whether AI-lien may return escalation_requested: true
+            when it determines it lacks sufficient data to make
+            a confident assessment. When false, AI-lien always
+            returns an assessment regardless of confidence.
+          example: true
+        timeout_seconds:
+          type: integer
+          minimum: 30
+          maximum: 300
+          description: >
+            Maximum time allowed for both taps combined before
+            returning 504. Default 120 seconds.
+          example: 120
+        model_preference:
+          type: string
+          description: >
+            Optional model identifier hint. If the specified model
+            is loaded and available in Ollama, it will be used.
+            If not available, AI-lien falls back to its configured
+            default model. This is a preference, not a requirement —
+            callers must not depend on a specific model being used.
+          example: "qwen2.5-coder:32b"
+
+    AnalysisResponse:
+      type: object
+      required:
+        - analysis_type
+        - first_tap_prompt
+        - assessment
+        - confidence
+        - low_confidence
+        - escalation_requested
+        - model_used
+        - first_tap_latency_ms
+        - second_tap_latency_ms
+        - processed_at
+      properties:
+        analysis_type:
+          type: string
+          description: Echo of the request analysis_type
+        first_tap_prompt:
+          type: string
+          description: >
+            The AI-generated prompt produced by the first tap.
+            Preserved verbatim for audit trail. Persisted by
+            callers in the Results Job. When an assessment is
+            reviewed later, this field shows exactly what was
+            asked of the model — not just the raw input data.
+        assessment:
+          type: object
+          description: >
+            Structured assessment conforming to the caller-supplied
+            response_schema. Validated by Pydantic inside AI-lien
+            before this response is returned. If validation fails,
+            422 is returned instead of 200.
+        confidence:
+          type: string
+          description: >
+            Model's self-assessed confidence in the assessment
+            as decimal string. Extracted from model output and
+            validated as a decimal between 0.0 and 1.0.
+          example: "0.87"
+        low_confidence:
+          type: boolean
+          description: >
+            True when confidence is below the caller-supplied
+            threshold. Assessment is still returned — caller
+            decides how to handle low-confidence results.
+        low_confidence_reason:
+          type: string
+          description: >
+            Present when low_confidence is true. Model's
+            explanation of why confidence is limited.
+          example: >
+            Insufficient historical failure data for this Job.
+            Only 2 prior failures in 30-day window — pattern
+            analysis requires more data points for reliable
+            root cause assessment.
+        escalation_requested:
+          type: boolean
+          description: >
+            True when allow_escalate was true and the model
+            determined it cannot make a useful assessment
+            with the available data.
+        escalation_reason:
+          type: string
+          description: >
+            Present when escalation_requested is true.
+            Specific description of what additional data
+            or human judgment is needed.
+        model_used:
+          type: string
+          description: >
+            Actual model identifier used for both taps.
+            May differ from model_preference if the preferred
+            model was unavailable.
+          example: "qwen2.5-coder:32b"
+        first_tap_latency_ms:
+          type: integer
+          description: Time for first tap (prompt construction) in milliseconds
+        second_tap_latency_ms:
+          type: integer
+          description: Time for second tap (analysis execution) in milliseconds
+        processed_at:
+          type: string
+          format: date-time
+
+    ValidationFailureResponse:
+      type: object
+      required:
+        - analysis_type
+        - first_tap_prompt
+        - validation_error
+        - raw_model_output
+        - model_used
+        - processed_at
+      properties:
+        analysis_type:
+          type: string
+        first_tap_prompt:
+          type: string
+          description: >
+            First tap prompt preserved for diagnostic purposes
+            even on validation failure.
+        validation_error:
+          type: string
+          description: >
+            Pydantic validation error describing why the model
+            output did not conform to response_schema.
+        raw_model_output:
+          type: string
+          description: >
+            Verbatim model output that failed validation.
+            Included so callers can diagnose whether the
+            response_schema description needs refinement.
+        model_used:
+          type: string
+        processed_at:
+          type: string
+          format: date-time
+
+    TimeoutResponse:
+      type: object
+      required:
+        - analysis_type
+        - timed_out_at_seconds
+        - tap_reached
+        - processed_at
+      properties:
+        analysis_type:
+          type: string
+        timed_out_at_seconds:
+          type: integer
+          description: Configured timeout that was exceeded
+        tap_reached:
+          type: string
+          enum: [first, second]
+          description: >
+            Which tap was executing when the timeout occurred.
+            first — timed out during prompt construction.
+            second — timed out during analysis execution.
+        first_tap_prompt:
+          type: string
+          description: >
+            Present when tap_reached is second — the prompt
+            that was constructed before the second tap timed out.
+        processed_at:
+          type: string
+          format: date-time
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - ollama_reachable
+        - model_loaded
+        - model_name
+        - analyses_completed
+        - analyses_failed
+        - analyses_escalated
+        - average_first_tap_ms
+        - average_second_tap_ms
+        - uptime_seconds
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unavailable]
+          description: >
+            healthy — model loaded and responding.
+            degraded — model loaded but response quality metrics
+            suggest issues (high validation failure rate).
+            unavailable — Ollama unreachable or model not loaded.
+            Callers should route to human escalation when unavailable.
+        ollama_reachable:
+          type: boolean
+        model_loaded:
+          type: boolean
+        model_name:
+          type: string
+          description: Currently loaded model identifier
+          example: "qwen2.5-coder:32b"
+        analyses_completed:
+          type: integer
+          description: Successful analyses since last restart
+        analyses_failed:
+          type: integer
+          description: >
+            Analyses that returned 422 or 504 since last restart.
+            Growing failure count is a signal to check model health.
+        analyses_escalated:
+          type: integer
+          description: >
+            Analyses where the model requested escalation.
+            High escalation rate may indicate insufficient
+            supporting_data being provided by callers.
+        validation_failure_rate:
+          type: string
+          description: >
+            Ratio of 422 responses to total completed analyses
+            as decimal string. Above 0.05 warrants investigation.
+          example: "0.02"
+        average_first_tap_ms:
+          type: integer
+          description: Rolling average first tap latency since last restart
+        average_second_tap_ms:
+          type: integer
+          description: Rolling average second tap latency since last restart
+        uptime_seconds:
+          type: integer
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          example: "MODEL_UNAVAILABLE"
+        message:
+          type: string
+          example: "Ollama instance unreachable at configured endpoint"

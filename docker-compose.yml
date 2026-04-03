@@ -1,0 +1,597 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # cert-forge — TCA certificate authority init tool.
+  # Stdlib-only Go binary. No external dependencies. Runs once and exits.
+  # ---------------------------------------------------------------------------
+  cert-init:
+    build:
+      context: .
+      dockerfile: cert-forge/Dockerfile
+    container_name: seti-cert-init
+    volumes:
+      - certs:/certs
+    restart: "no"
+    networks:
+      - seti-internal
+
+  # ---------------------------------------------------------------------------
+  # Redis — session store, pub/sub, and Augur Canis coordination channels
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: seti-redis
+    networks:
+      - seti-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Augur Canis (AC) — behavioral health verification and alert agent
+  # Attached to seti-internal for admin API + one dedicated net per Job
+  # Phase 1: stub mode, canned query execution not yet active
+  # Silence detection: ACTIVE
+  # Latency drift / failure rate: STUBBED
+  # ---------------------------------------------------------------------------
+  augur-canis:
+    build:
+      context: .
+      dockerfile: augur-canis/Dockerfile
+    container_name: seti-augur-canis
+    environment:
+      PORT: "4010"
+      REDIS_URL: "redis:6379"
+      SERVICE_NAME: "augur-canis"
+      OBSERVABILITY_URL: "https://seti-observability:4011"
+      CONSTELLATION: "tca-seti"
+      CONSTELLATION_ID: "tca-seti"
+      CHECK_INTERVAL_SECONDS: "30"
+      RESULT_TTL_SECONDS: "30"
+      SILENCE_THRESHOLD_SECONDS: "90"
+      REMINDER_INTERVAL_SECONDS: "30"
+      MAX_INITIAL_BARKS: "3"
+      STAR_GAZER_CERT: "/certs/star-gazer.crt"
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # seti-observability — scratch container
+  # ---------------------------------------------------------------------------
+  seti-observability:
+    build:
+      context: .
+      dockerfile: seti-observability/Dockerfile
+    container_name: seti-observability
+    environment:
+      PORT: "4011"
+      REDIS_URL: "redis:6379"
+      SERVICE_NAME: "seti-observability"
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # signal-clearance — distroless/nodejs
+  # ---------------------------------------------------------------------------
+  signal-clearance:
+    build: ./signal-clearance
+    container_name: seti-signal-clearance
+    environment:
+      PORT: "4001"
+      REDIS_URL: "redis:6379"
+      SERVICE_NAME: "signal-clearance"
+      OBSERVABILITY_URL: "https://seti-observability:4011"
+      JWT_SECRET: "${JWT_SECRET}"
+      AUTH_MODE: "${AUTH_MODE:-dev}"
+      OIDC_REDIRECT_URI: "${OIDC_REDIRECT_URI:-https://localhost:4000/auth/callback}"
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      seti-observability:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/nodejs/bin/node", "/healthcheck.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 25s
+
+  # ---------------------------------------------------------------------------
+  # gateway — distroless/static
+  # ---------------------------------------------------------------------------
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    container_name: seti-gateway
+    ports:
+      - "4000:4000"
+    environment:
+      EXTERNAL_PORT: "4000"
+      SIGNAL_CLEARANCE_URL: "https://signal-clearance:4001"
+      OBSERVABILITY_URL: "https://seti-observability:4011"
+      REDIS_URL: "redis:6379"
+      SERVICE_NAME: "gateway"
+      JWT_SECRET: "${JWT_SECRET}"
+      AUTH_MODE: "${AUTH_MODE:-dev}"
+      UI_URL: "https://ui:4020"
+      CONTRACT_TEST_URL: "https://contract-test:4003"
+      RESULTS_URL: "https://results:4008"
+      PLOT_STORE_URL: "https://plot-store:4005"
+      PLOT_TEST_URL: "https://plot-test:4004"
+      SIGNAL_AGG_URL: "https://signal-aggregator:4006"
+      INTEGRATION_URL: "https://integration:4013"
+      POLICY_URL: "https://policy:4002"
+      FEED_WRANGLER_URL: "https://feed-wrangler:4007"
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      seti-observability:
+        condition: service_healthy
+      signal-clearance:
+        condition: service_healthy
+      ui:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # ui — distroless/static
+  # ---------------------------------------------------------------------------
+  ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+      args:
+        VITE_GATEWAY_URL: "${VITE_GATEWAY_URL:-}"
+        VITE_AUTH_MODE: "${AUTH_MODE:-dev}"
+    container_name: seti-ui
+    environment:
+      PORT: "4020"
+      GATEWAY_URL: "https://gateway:4000"
+      REDIS_URL: "redis:6379"
+      SERVICE_NAME: "ui"
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      augur-canis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 35s
+
+
+  # ---------------------------------------------------------------------------
+  # policy — application registry, service account issuance
+  # ---------------------------------------------------------------------------
+  policy:
+    build:
+      context: .
+      dockerfile: policy/Dockerfile
+    container_name: seti-policy
+    environment:
+      PORT: "4002"
+      REDIS_URL: "redis:6379"
+      SERVICE_NAME: "policy"
+      OBSERVABILITY_URL: "https://seti-observability:4011"
+      JWT_SECRET: "${JWT_SECRET}"
+      CONTRACTS_PATH: "/contracts/openapi"
+      SELF_GATEWAY_URL: "https://gateway:4000"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
+    volumes:
+      - certs:/certs:ro
+      - ./contracts:/contracts:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      seti-observability:
+        condition: service_healthy
+      augur-canis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # contract-test — reads contracts, routes tests through AC via Redis
+  # ---------------------------------------------------------------------------
+  contract-test:
+    build:
+      context: .
+      dockerfile: contract-test/Dockerfile
+    container_name: seti-contract-test
+    environment:
+      PORT: "4003"
+      REDIS_URL: "redis:6379"
+      SERVICE_NAME: "contract-test"
+      OBSERVABILITY_URL: "https://seti-observability:4011"
+      POLICY_URL: "https://policy:4002"
+      RESULTS_URL: "https://results:4008"
+      CONTRACTS_PATH: "/contracts/openapi"
+    volumes:
+      - certs:/certs:ro
+      - ./contracts:/contracts:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      seti-observability:
+        condition: service_healthy
+      policy:
+        condition: service_healthy
+      augur-canis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # results — historical test results store (in-memory Phase 2)
+  # ---------------------------------------------------------------------------
+  results:
+    build:
+      context: .
+      dockerfile: results/Dockerfile
+    container_name: seti-results
+    environment:
+      PORT: "4008"
+      REDIS_URL: "redis:6379"
+      SERVICE_NAME: "results"
+      OBSERVABILITY_URL: "https://seti-observability:4011"
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      seti-observability:
+        condition: service_healthy
+      augur-canis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 25s
+
+
+  # ---------------------------------------------------------------------------
+  # signal-aggregator — subscribes to constellation event streams
+  # ---------------------------------------------------------------------------
+  signal-aggregator:
+    build:
+      context: .
+      dockerfile: signal-aggregator/Dockerfile
+    container_name: seti-signal-aggregator
+    environment:
+      PORT: "4006"
+      REDIS_URL: "redis:6379"
+      SERVICE_NAME: "signal-aggregator"
+      OBSERVABILITY_URL: "https://seti-observability:4011"
+      POLICY_URL: "https://policy:4002"
+      SETI_INSTANCE_ID: "tca-seti-primary"
+      STAR_GAZER_CERT: "/certs/star-gazer.crt"
+      STAR_GAZER_KEY: "/certs/star-gazer.key"
+      SILENCE_THRESHOLD_SECONDS: "90"
+      AC_ENDPOINT: "https://augur-canis:4010"
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      seti-observability:
+        condition: service_healthy
+      augur-canis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # plot-store — owns the Plot database
+  # ---------------------------------------------------------------------------
+  plot-store:
+    build:
+      context: .
+      dockerfile: plot-store/Dockerfile
+    container_name: seti-plot-store
+    environment:
+      PORT: "4005"
+      REDIS_URL: "redis:6379"
+      SERVICE_NAME: "plot-store"
+      OBSERVABILITY_URL: "https://seti-observability:4011"
+      PLOTS_PATH: "/contracts/plots"
+    volumes:
+      - certs:/certs:ro
+      - ./contracts:/contracts:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      seti-observability:
+        condition: service_healthy
+      augur-canis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # plot-test — executes Plots, verifies call chains
+  # ---------------------------------------------------------------------------
+  plot-test:
+    build:
+      context: .
+      dockerfile: plot-test/Dockerfile
+    container_name: seti-plot-test
+    environment:
+      PORT: "4004"
+      REDIS_URL: "redis:6379"
+      SERVICE_NAME: "plot-test"
+      OBSERVABILITY_URL: "https://seti-observability:4011"
+      PLOT_STORE_URL: "https://plot-store:4005"
+      SIGNAL_AGGREGATOR_URL: "https://signal-aggregator:4006"
+      RESULTS_URL: "https://results:4008"
+      INTERACTIONS_URL: "https://interactions:4009"
+      POLICY_URL: "https://policy:4002"
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      seti-observability:
+        condition: service_healthy
+      plot-store:
+        condition: service_healthy
+      signal-aggregator:
+        condition: service_healthy
+      results:
+        condition: service_healthy
+      interactions:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # interactions — failure notification stub (Phase 4: AI-lien calls)
+  # ---------------------------------------------------------------------------
+  interactions:
+    build:
+      context: .
+      dockerfile: interactions/Dockerfile
+    container_name: seti-interactions
+    environment:
+      PORT: "4009"
+      SERVICE_NAME: "interactions"
+      REDIS_URL: "redis:6379"
+      OBSERVABILITY_URL: "https://seti-observability:4011"
+      AI_LIEN_URL: "https://ai-lien:4252"
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      seti-observability:
+        condition: service_healthy
+      augur-canis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # feed-wrangler — scoped signal delivery (Elixir/OTP)
+  # ---------------------------------------------------------------------------
+  feed-wrangler:
+    build:
+      context: feed-wrangler/
+      dockerfile: Dockerfile
+    container_name: seti-feed-wrangler
+    environment:
+      PORT: "4007"
+      REDIS_URL: "redis:6379"
+      SERVICE_NAME: "feed-wrangler"
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      seti-observability:
+        condition: service_healthy
+      augur-canis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "/healthcheck.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+
+  # ---------------------------------------------------------------------------
+  # integration — versioned read-only API for customer tooling
+  # ---------------------------------------------------------------------------
+  integration:
+    build:
+      context: .
+      dockerfile: integration/Dockerfile
+    container_name: seti-integration
+    environment:
+      PORT: "4013"
+      REDIS_URL: "redis:6379"
+      SERVICE_NAME: "integration"
+      OBSERVABILITY_URL: "https://seti-observability:4011"
+      POLICY_URL: "https://policy:4002"
+      RESULTS_URL: "https://results:4008"
+      PLOT_STORE_URL: "https://plot-store:4005"
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      seti-observability:
+        condition: service_healthy
+      policy:
+        condition: service_healthy
+      results:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # ai-lien — double-tap Ollama diagnostic engine
+  # ---------------------------------------------------------------------------
+  ai-lien:
+    build:
+      context: .
+      dockerfile: ai-lien/Dockerfile
+    container_name: seti-ai-lien
+    environment:
+      PORT: "4252"
+      REDIS_URL: "redis:6379"
+      SERVICE_NAME: "ai-lien"
+      OBSERVABILITY_URL: "https://seti-observability:4011"
+      POLICY_URL: "https://policy:4002"
+      RESULTS_URL: "https://results:4008"
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      seti-observability:
+        condition: service_healthy
+      policy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  certs:
+    driver: local
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  seti-internal:
+    driver: bridge
+  # ac-net: shared Augur Canis network (Docker Compose dev)
+  # Maps to per-service NetworkPolicies in K8s for true point-to-point isolation
+  ac-net:
+    driver: bridge

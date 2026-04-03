@@ -1,0 +1,33 @@
+{
+  "name": "Integration API",
+  "description": "Verifies the versioned read-only API surface is reachable and returning data. This is the customer tooling integration point — if this plot fails, external tools cannot query SETI results.",
+  "application_id": "seti-self",
+  "author": "seti-self",
+  "version": "1.0.0",
+  "tags": ["integration", "external-api", "core"],
+  "steps": [
+    {
+      "step_number": 1,
+      "description": "Query cluster health via the v1 API",
+      "method": "GET",
+      "path": "/v1/cluster/health",
+      "expected_status": 200,
+      "expected_chain": [
+        { "caller": "gateway", "callee": "integration", "method": "GET", "path": "/v1/cluster/health" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 2,
+      "description": "Query registered applications via the v1 API",
+      "method": "GET",
+      "path": "/v1/applications",
+      "expected_status": 200,
+      "expected_chain": [
+        { "caller": "gateway", "callee": "integration", "method": "GET", "path": "/v1/applications" },
+        { "caller": "integration", "callee": "policy", "method": "GET", "path": "/applications" }
+      ],
+      "verify_within_seconds": 15
+    }
+  ]
+}

@@ -1,0 +1,1319 @@
+openapi: 3.1.0
+
+info:
+  title: SETI - Augur Canis (AC)
+  description: |
+    Augur Canis (AC) is a standard TCA component — not SETI-specific.
+    Every TCA constellation includes one. It provides behavioral health
+    verification for every Job in the constellation and publishes health
+    state to a Redis pub/sub channel that SETI subscribes to.
+
+    NETWORK TOPOLOGY — POINT-TO-POINT ISOLATION:
+    Augur Canis connects to each Job via its own dedicated network
+    containing exactly two members: Augur Canis and that Job. If the
+    constellation has N Jobs, there are N dedicated watchdog networks.
+    No Job has visibility into any other Job through these networks.
+    A compromised Job sees only Augur Canis on its dedicated link and
+    cannot initiate to Augur Canis — Augur Canis is the sole initiator
+    on all point-to-point networks.
+
+    This is categorically different from a shared watchdog network, where
+    a compromised Job could reach all other Jobs. Point-to-point networks
+    mean the blast radius of any compromise stops at that Job's own
+    networks plus its dedicated watchdog link — and the watchdog link
+    cannot be used by the compromised Job to pivot.
+
+    HEALTH CHECK MECHANISM — REDIS-MEDIATED:
+    Health checks work through Redis pub/sub with no open HTTP ports on
+    any Job. The mechanism:
+
+    1. The healthcheck binary inside a Job publishes a check request to
+       Redis channel tca:check-requests with a unique request_id,
+       container_id, and service_name.
+    2. Augur Canis subscribes to tca:check-requests, receives the
+       request, looks up the canned query for service_name from its DB.
+    3. Augur Canis executes the canned query over the dedicated mTLS
+       point-to-point network to that Job.
+    4. Augur Canis publishes the result to tca:check-results:{request_id}
+       with a 30-second TTL. The TTL prevents accumulation if the
+       healthcheck binary crashes or times out before reading.
+    5. The healthcheck binary subscribes to tca:check-results:{request_id},
+       reads the result, exits 0 (healthy) or 1 (unhealthy).
+
+    Augur Canis never needs to be a server on the point-to-point networks.
+    It remains the sole initiator on those links. No Job ever makes a
+    direct network call to Augur Canis. Redis is the coordination layer.
+
+    CONTRACT TEST EXECUTION — REDIS-MEDIATED:
+    Augur Canis is also the sole executor for SETI Contract Tests. SETI's
+    Contract Test Job publishes test requests to the constellation's Redis
+    — the same Redis instance Augur Canis already uses. AC subscribes,
+    executes each test over the dedicated point-to-point mTLS network to
+    the target Job, and publishes results back.
+
+    Contract Test never has direct network access to any constellation Job.
+    AC is the sole executor on point-to-point networks — for both health
+    checks and contract tests. The JWT for authenticated endpoints travels
+    inside the test request payload; SETI obtains it via its service account
+    credentials from that constellation's Signal Clearance and packages it
+    with each request.
+
+    Mechanism:
+    1. SETI Contract Test publishes to tca:contract-requests on the target
+       constellation's Redis. Payload: request_id, service_name, method,
+       path, headers (including Authorization if required), body,
+       expected_status, expected_response_fields.
+    2. AC subscribes to tca:contract-requests, routes to the appropriate
+       Job over its dedicated point-to-point network.
+    3. AC publishes result to tca:contract-results with 60-second TTL.
+    4. SETI Contract Test correlates by request_id, passes to Results Job.
+
+    For SETI self-registration, SETI and AC share the same Redis instance.
+
+    CANNED QUERIES:
+    Augur Canis stores a query definition per Job in its own isolated DB.
+    A query is the simplest possible behavioral verification for that Job —
+    the minimum request that confirms the Job is alive and responding
+    correctly per its contract. Not a contract test. Not a Plot. Just
+    enough to distinguish "running and healthy" from "running and broken."
+
+    Query definitions are versioned and updateable by the Sec Wr4ngler
+    without code changes. The version used is recorded in every check
+    result for audit purposes. As a constellation evolves, query
+    definitions evolve with it — Augur Canis does not need to be
+    redeployed to update a check.
+
+    HEALTH FEED:
+    Augur Canis publishes all check results to Redis channel tca:augur-canis
+    — one channel per constellation carrying health state, latency, and
+    time-to-complete for every Job. SETI subscribes to this channel
+    alongside tca:events to get constellation health state. The channel
+    is designed for trend analysis — the Sec Wr4ngler adds finer-grained
+    monitoring as needed.
+
+    STUB STATUS: Core Redis pub/sub health check mechanism is stubbed.
+    Canned query execution against point-to-point networks is stubbed.
+    The /check-request endpoint (for healthcheck binary registration)
+    and the tca:augur-canis publisher are the implementation targets.
+    Admin and configuration endpoints are implemented.
+
+    Internal service — mTLS only on point-to-point Job networks.
+    Admin API reachable via Policy Job on the SETI internal network.
+  version: 0.3.0
+
+x-tca-security:
+  transport: mtls
+  tls-min-version: "1.3"
+  client-cert-required: true
+  reject-without-client-cert: true
+  ca-cert: /certs/ca.crt
+  service-cert: /certs/watchdog.crt
+  service-key: /certs/watchdog.key
+  implementation:
+    server:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      require-and-verify-client-cert: true
+    client:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      verify-server-cert: true
+  notes: >
+    Augur Canis is primarily an mTLS client — it initiates outbound to
+    every Job over dedicated point-to-point networks. It is also an mTLS
+    server for admin API calls from the Policy Job and Gateway.
+    On point-to-point networks Augur Canis presents its certificate and
+    verifies the Job's certificate on every check. Jobs cannot initiate
+    connections to Augur Canis over these links — Augur Canis is the
+    sole initiator. The check request/response coordination happens
+    through Redis, not through the point-to-point network links.
+
+x-tca-observability:
+  report-outbound-calls: true
+  endpoint: https://seti-observability:4011/event
+  pattern: fire-and-forget
+  caller-name: "augur-canis"
+  required-fields:
+    - caller
+    - callee
+    - method
+    - path
+    - status_code
+    - latency_ms
+    - protocol
+  implementation:
+    timing: wrap-every-outbound-http-call
+    non-blocking: true
+    on-failure: log-and-drop
+    do-not-instrument:
+      - seti-observability
+  notes: >
+    Report all outbound HTTP calls. Augur Canis's primary outbound
+    calls are the canned query executions against each Job over the
+    point-to-point networks. Every check execution is reported —
+    caller: watchdog, callee: the checked service name. This makes
+    Watchdog check traffic visible in the SETI observability stream
+    separately from normal application traffic.
+
+servers:
+  - url: https://augur-canis:4010
+    description: Internal SETI network (mTLS enforced) — admin API only
+
+tags:
+  - name: queries
+    description: Canned query definition management
+  - name: checks
+    description: Check execution and result retrieval
+  - name: jobs
+    description: Registered Job management
+  - name: configuration
+    description: Watchdog behavioral configuration
+  - name: health
+    description: Watchdog agent health
+
+paths:
+
+  # ---------------------------------------------------------------------------
+  # CANNED QUERY MANAGEMENT
+  # ---------------------------------------------------------------------------
+
+  /queries:
+    get:
+      tags: [queries]
+      summary: List all canned query definitions
+      description: |
+        Returns all canned query definitions across all registered Jobs.
+        Each definition describes the minimal behavioral verification
+        for one Job — what to call, what to send, what to expect back.
+      responses:
+        '200':
+          description: Query definitions returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryDefinitionList'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /queries/{service_name}:
+    get:
+      tags: [queries]
+      summary: Get the canned query definition for a specific Job
+      parameters:
+        - name: service_name
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "gateway"
+      responses:
+        '200':
+          description: Query definition returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryDefinition'
+        '404':
+          description: No query defined for this service
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    put:
+      tags: [queries]
+      summary: Create or update a canned query definition
+      description: |
+        Defines or updates the canned query for a Job. The query is the
+        simplest possible behavioral verification — the minimum request
+        that confirms the Job is alive and responding correctly per its
+        contract. Version is auto-incremented on update.
+
+        The Sec Wr4ngler owns query definitions. Updates take effect
+        on the next check cycle — no redeployment required.
+      parameters:
+        - name: service_name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryDefinitionInput'
+            example:
+              description: "Minimal GET /health verification for gateway"
+              method: "GET"
+              path: "/health"
+              expected_status: 200
+              timeout_ms: 2000
+              notes: "Gateway /health does not require auth — simplest possible check"
+      responses:
+        '200':
+          description: Query definition updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryDefinition'
+        '201':
+          description: Query definition created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryDefinition'
+        '400':
+          description: Invalid query definition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Service not registered with Watchdog
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    delete:
+      tags: [queries]
+      summary: Remove a canned query definition
+      description: |
+        Removes the query definition for a Job. The Job will no longer
+        be checked until a new query is defined. Watchdog logs a warning
+        on each check cycle for Jobs with no query defined.
+      parameters:
+        - name: service_name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Query definition removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryRemovalResult'
+        '404':
+          description: Query definition not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # CHECK RESULTS
+  # ---------------------------------------------------------------------------
+
+  /checks/recent:
+    get:
+      tags: [checks]
+      summary: Get recent check results across all Jobs
+      description: |
+        Returns the most recent check result per Job plus aggregate
+        health statistics. Designed for the admin dashboard view —
+        a quick health picture of the full constellation.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        '200':
+          description: Recent check results returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecentChecksResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /checks/{service_name}:
+    get:
+      tags: [checks]
+      summary: Get check history for a specific Job
+      parameters:
+        - name: service_name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Check history returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckHistory'
+        '404':
+          description: Service not registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /checks/trigger/{service_name}:
+    post:
+      tags: [checks]
+      summary: Trigger an immediate check for a specific Job
+      description: |
+        STUB — logs trigger and returns last known state.
+
+        When implemented: immediately executes the canned query for the
+        specified Job over its dedicated point-to-point network and
+        returns the result. Use for on-demand verification after
+        a deployment or suspected issue.
+      parameters:
+        - name: service_name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Check result returned (stub returns last known state)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckResult'
+        '404':
+          description: Service not registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # REGISTERED JOBS
+  # ---------------------------------------------------------------------------
+
+  /jobs:
+    get:
+      tags: [jobs]
+      summary: List all Jobs registered with Augur Canis
+      description: |
+        Returns all Jobs Augur Canis knows about — their network
+        endpoint on the dedicated point-to-point network, query
+        definition status, and last check result.
+      responses:
+        '200':
+          description: Registered Jobs returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisteredJobList'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    post:
+      tags: [jobs]
+      summary: Register a Job with Augur Canis
+      description: |
+        Registers a Job for health monitoring. On registration the
+        Watchdog records the Job's endpoint on its dedicated
+        point-to-point network and begins including it in check cycles.
+        A canned query must be defined separately via PUT /queries/{service_name}.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobRegistration'
+            example:
+              service_name: "gateway"
+              network_endpoint: "https://gateway:4000"
+              description: "SETI external gateway"
+      responses:
+        '201':
+          description: Job registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisteredJob'
+        '400':
+          description: Invalid registration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Job already registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /jobs/{service_name}:
+    delete:
+      tags: [jobs]
+      summary: Deregister a Job from Watchdog monitoring
+      parameters:
+        - name: service_name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job deregistered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobDeregistrationResult'
+        '404':
+          description: Job not registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # CONFIGURATION
+  # ---------------------------------------------------------------------------
+
+  /configuration:
+    get:
+      tags: [configuration]
+      summary: Get current Watchdog configuration
+      responses:
+        '200':
+          description: Configuration returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WatchdogConfiguration'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    put:
+      tags: [configuration]
+      summary: Update Watchdog configuration
+      description: |
+        Updates check interval, result TTL, and other behavioral
+        parameters. Changes take effect on the next check cycle.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WatchdogConfigurationUpdate'
+      responses:
+        '200':
+          description: Configuration updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WatchdogConfiguration'
+        '400':
+          description: Invalid configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      tags: [health]
+      summary: Watchdog agent health
+      responses:
+        '200':
+          description: Health status returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /federation/register:
+    post:
+      tags: [federation]
+      summary: Register SETI as a verified federation observer
+      description: |
+        Called by SETI when a Sec Wr4ngler adds a new constellation to
+        the monitoring board. SETI presents its star-gazer certificate
+        signature to prove its identity.
+
+        On receipt, AC:
+        1. Verifies the request signature against the known SETI star-gazer
+           public key (pre-distributed via the orchestrator at deploy time).
+        2. Generates a new session key pair specific to this SETI registration.
+        3. Returns the session public certificate to SETI.
+        4. Begins signing all tca:augur-canis feed events with the session
+           private key.
+
+        The session key pair is ephemeral — it lives in AC memory only.
+        If AC restarts, the session certificate is lost. SETI detects feed
+        silence or signature verification failure and re-submits registration.
+        AC treats every registration request identically regardless of whether
+        it is a first registration or a re-registration after restart.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FederationRegistrationRequest'
+      responses:
+        '200':
+          description: Registration accepted, session certificate returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FederationRegistrationResponse'
+        '401':
+          description: Star-gazer signature verification failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '400':
+          description: Malformed request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /federation/status:
+    get:
+      tags: [federation]
+      summary: Get current federation registration status
+      description: |
+        Returns whether SETI is currently registered as a federation
+        observer, and when the session certificate was last issued.
+        Useful for diagnosing feed delivery issues.
+      responses:
+        '200':
+          description: Federation status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FederationStatus'
+
+  /services/register:
+    post:
+      tags: [services]
+      summary: Self-register a constellation service with Augur Canis
+      description: |
+        Called by each TCA service on startup. The service signs its
+        registration payload with its own private key (from the shared
+        certs volume). AC verifies the signature against the constellation
+        CA certificate before accepting the registration.
+
+        This replaces the bootstrap hardcoded registry. Once self-registration
+        is implemented, AC builds its job map dynamically from verified
+        registrations rather than a compile-time list.
+
+        A service that fails signature verification is logged and rejected.
+        It will not appear in the AC job registry and will not receive
+        health check queries.
+
+        Idempotent — a service that restarts and re-registers simply
+        refreshes its entry. AC does not distinguish first registration
+        from re-registration.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServiceRegistrationRequest'
+      responses:
+        '200':
+          description: Registration accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceRegistrationAck'
+        '401':
+          description: Service signature verification failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '400':
+          description: Malformed registration payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+
+components:
+  schemas:
+
+    QueryDefinitionInput:
+      type: object
+      required:
+        - description
+        - method
+        - path
+        - expected_status
+        - timeout_ms
+      properties:
+        description:
+          type: string
+          description: >
+            Human-readable description of what this query verifies and
+            why it was chosen as the minimal check for this Job.
+          example: "Minimal GET /health verification — confirms Job is alive and TLS is functioning"
+        method:
+          type: string
+          enum: [GET, POST, PUT, PATCH, DELETE]
+          example: "GET"
+        path:
+          type: string
+          description: Request path to call on the Job
+          example: "/health"
+        request_body:
+          type: object
+          description: >
+            Optional request body for POST/PUT checks. Must be minimal —
+            the simplest payload that produces a meaningful response.
+            Financial values must be strings.
+        expected_status:
+          type: integer
+          description: HTTP status code that indicates a healthy response
+          example: 200
+        expected_response_field:
+          type: string
+          description: >
+            Optional dot-notation path to a field in the response body.
+            If present, the field must exist for the check to pass.
+          example: "status"
+        expected_response_value:
+          description: >
+            Optional expected value for expected_response_field.
+            If present, the field must equal this value.
+          example: "healthy"
+        timeout_ms:
+          type: integer
+          minimum: 100
+          maximum: 10000
+          description: >
+            Maximum time to wait for a response before marking unhealthy.
+            Should be well below the Docker/K8s healthcheck timeout.
+          example: 2000
+        notes:
+          type: string
+          description: >
+            Additional context for the Sec Wr4ngler — why this specific
+            check was chosen, any known caveats, when it should be updated.
+
+    QueryDefinition:
+      allOf:
+        - $ref: '#/components/schemas/QueryDefinitionInput'
+        - type: object
+          required:
+            - service_name
+            - version
+            - created_at
+            - updated_at
+          properties:
+            service_name:
+              type: string
+              example: "gateway"
+            version:
+              type: integer
+              description: >
+                Auto-incremented on each update. Recorded in every check
+                result for audit purposes. When a check starts failing
+                after a query update, the version number identifies which
+                definition was in use.
+              example: 3
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
+
+    QueryDefinitionList:
+      type: object
+      required:
+        - queries
+        - total
+      properties:
+        queries:
+          type: array
+          items:
+            $ref: '#/components/schemas/QueryDefinition'
+        total:
+          type: integer
+
+    QueryRemovalResult:
+      type: object
+      required:
+        - service_name
+        - version_removed
+        - removed_at
+      properties:
+        service_name:
+          type: string
+        version_removed:
+          type: integer
+        removed_at:
+          type: string
+          format: date-time
+
+    CheckResult:
+      type: object
+      required:
+        - request_id
+        - service_name
+        - healthy
+        - latency_ms
+        - time_to_complete_ms
+        - query_version
+        - checked_at
+        - stub_active
+      properties:
+        request_id:
+          type: string
+          description: Unique identifier correlating the check request to this result
+          example: "chk-a1b2c3d4"
+        service_name:
+          type: string
+          example: "gateway"
+        healthy:
+          type: integer
+          enum: [0, 1]
+          description: >
+            1 — Job responded correctly to the canned query within timeout.
+            0 — Job did not respond, responded incorrectly, or timed out.
+        failure_reason:
+          type: string
+          description: >
+            Present when healthy is 0. Describes why the check failed.
+            Connection refused, timeout, unexpected status code, missing
+            response field, or unexpected response value.
+          example: "Timeout after 2000ms — no response received"
+        latency_ms:
+          type: integer
+          description: >
+            Time from when Augur Canis initiated the canned query to
+            when the response was received. Excludes Redis coordination
+            overhead — measures only the Job's actual response time.
+        time_to_complete_ms:
+          type: integer
+          description: >
+            Total time from check request publication to result publication.
+            Includes Redis pub/sub coordination overhead plus query latency.
+            This is the value that appears in the tca:augur-canis feed and
+            maps to the health check timeout in Docker/K8s configuration.
+        query_version:
+          type: integer
+          description: Version of the query definition used for this check
+        checked_at:
+          type: string
+          format: date-time
+        stub_active:
+          type: boolean
+          description: >
+            True when Augur Canis is in stub mode. A result with
+            stub_active: true does not reflect real Job health.
+
+    CheckHistory:
+      type: object
+      required:
+        - service_name
+        - results
+        - total
+        - healthy_count
+        - unhealthy_count
+        - average_latency_ms
+      properties:
+        service_name:
+          type: string
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/CheckResult'
+        total:
+          type: integer
+        healthy_count:
+          type: integer
+        unhealthy_count:
+          type: integer
+        average_latency_ms:
+          type: integer
+          description: Rolling average latency across returned results
+
+    RecentChecksResponse:
+      type: object
+      required:
+        - checks
+        - total_jobs
+        - healthy_jobs
+        - unhealthy_jobs
+        - jobs_with_no_query
+        - generated_at
+      properties:
+        checks:
+          type: array
+          items:
+            $ref: '#/components/schemas/CheckResult'
+          description: Most recent result per Job
+        total_jobs:
+          type: integer
+        healthy_jobs:
+          type: integer
+        unhealthy_jobs:
+          type: integer
+        jobs_with_no_query:
+          type: integer
+          description: >
+            Jobs registered but with no query definition. These are not
+            checked and generate a warning in the tca:augur-canis feed.
+        generated_at:
+          type: string
+          format: date-time
+
+    JobRegistration:
+      type: object
+      required:
+        - service_name
+        - network_endpoint
+        - description
+      properties:
+        service_name:
+          type: string
+          description: >
+            Service name exactly as it appears in the constellation.
+            Must match the tca:check-requests service_name field sent
+            by the healthcheck binary in this Job's container.
+          example: "gateway"
+        network_endpoint:
+          type: string
+          description: >
+            The Job's address on its dedicated Watchdog point-to-point
+            network. The Watchdog calls this endpoint when executing
+            the canned query for this Job.
+          example: "https://gateway:4000"
+        description:
+          type: string
+          example: "SETI external gateway"
+
+    RegisteredJob:
+      type: object
+      required:
+        - service_name
+        - network_endpoint
+        - description
+        - has_query
+        - registered_at
+      properties:
+        service_name:
+          type: string
+        network_endpoint:
+          type: string
+        description:
+          type: string
+        has_query:
+          type: boolean
+          description: Whether a canned query definition exists for this Job
+        last_check:
+          $ref: '#/components/schemas/CheckResult'
+          description: Most recent check result. Absent if never checked.
+        registered_at:
+          type: string
+          format: date-time
+
+    RegisteredJobList:
+      type: object
+      required:
+        - jobs
+        - total
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/RegisteredJob'
+        total:
+          type: integer
+
+    JobDeregistrationResult:
+      type: object
+      required:
+        - service_name
+        - deregistered_at
+      properties:
+        service_name:
+          type: string
+        deregistered_at:
+          type: string
+          format: date-time
+
+    WatchdogConfiguration:
+      type: object
+      required:
+        - check_interval_seconds
+        - result_ttl_seconds
+        - feed_channel
+        - request_channel
+        - stub_active
+        - jobs_registered
+        - queries_defined
+      properties:
+        check_interval_seconds:
+          type: integer
+          description: >
+            How often Augur Canis cycles through all registered Jobs
+            and publishes health state to tca:augur-canis. Default 30.
+          example: 30
+        result_ttl_seconds:
+          type: integer
+          description: >
+            TTL on tca:check-results:{request_id} keys in Redis.
+            Prevents accumulation when healthcheck binary times out.
+            Default 30. May be reduced as check latencies become known.
+          example: 30
+        feed_channel:
+          type: string
+          description: Redis channel for health state publication
+          example: "tca:augur-canis"
+        request_channel:
+          type: string
+          description: Redis channel Augur Canis subscribes to for check requests
+          example: "tca:check-requests"
+        stub_active:
+          type: boolean
+          description: >
+            True when canned query execution is stubbed. Checks are
+            simulated — results do not reflect real Job health.
+        jobs_registered:
+          type: integer
+        queries_defined:
+          type: integer
+
+    WatchdogConfigurationUpdate:
+      type: object
+      properties:
+        check_interval_seconds:
+          type: integer
+          minimum: 10
+          maximum: 300
+        result_ttl_seconds:
+          type: integer
+          minimum: 5
+          maximum: 60
+          description: >
+            Keep this well above the expected time_to_complete_ms for
+            the slowest Job in the constellation. A TTL shorter than
+            the actual check time means the healthcheck binary will
+            always time out waiting for a result that already expired.
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - stub_active
+        - jobs_registered
+        - queries_defined
+        - checks_completed
+        - checks_failed
+        - redis_connected
+        - last_cycle_at
+        - uptime_seconds
+      properties:
+        status:
+          type: string
+          enum: [healthy, stub_active, degraded]
+          description: >
+            healthy — check cycles running, Redis connected, real checks.
+            stub_active — running in stub mode, no real check execution.
+            degraded — Redis disconnected or check cycle stalled.
+        stub_active:
+          type: boolean
+        jobs_registered:
+          type: integer
+        queries_defined:
+          type: integer
+        checks_completed:
+          type: integer
+          description: Total check executions since last restart
+        checks_failed:
+          type: integer
+          description: >
+            Checks where healthy was 0. Growing without bound indicates
+            a systematic problem with one or more Jobs.
+        redis_connected:
+          type: boolean
+        last_cycle_at:
+          type: string
+          format: date-time
+          description: >
+            Timestamp of the last complete check cycle across all Jobs.
+            Significantly in the past indicates the cycle scheduler stalled.
+        uptime_seconds:
+          type: integer
+
+
+    FederationRegistrationRequest:
+      type: object
+      required: [seti_instance_id, star_gazer_public_cert, timestamp, signature]
+      properties:
+        seti_instance_id:
+          type: string
+          description: >
+            Unique identifier for this SETI instance. Allows AC to associate
+            the registration with a specific SETI deployment.
+        star_gazer_public_cert:
+          type: string
+          description: >
+            SETI's star-gazer public certificate in PEM format.
+            AC stores this for verifying future requests from this SETI instance.
+        timestamp:
+          type: string
+          format: date-time
+          description: >
+            Registration request timestamp. Included in the signed payload
+            to prevent replay attacks.
+        signature:
+          type: string
+          description: >
+            Base64-encoded signature of (seti_instance_id + timestamp) signed
+            with the star-gazer private key. AC verifies this against the
+            star-gazer public cert before proceeding.
+
+    FederationRegistrationResponse:
+      type: object
+      required: [session_cert, session_cert_id, issued_at, feed_channel]
+      properties:
+        session_cert:
+          type: string
+          description: >
+            Session public certificate in PEM format. SETI stores this and
+            uses it to verify the signature on every event published to
+            the tca:augur-canis Redis channel. Ephemeral — invalidated when
+            AC restarts.
+        session_cert_id:
+          type: string
+          description: >
+            Short identifier for the session certificate. Included in every
+            signed event so SETI can detect certificate rotation without
+            attempting verification with a stale cert.
+        issued_at:
+          type: string
+          format: date-time
+        feed_channel:
+          type: string
+          description: >
+            Redis channel name for this constellation's AC health feed.
+            Typically tca:augur-canis but may be namespaced in multi-tenant
+            deployments.
+        constellation_id:
+          type: string
+          description: >
+            Identifier for this constellation as known to the AC.
+
+    FederationStatus:
+      type: object
+      required: [registered, constellation_id]
+      properties:
+        registered:
+          type: boolean
+        constellation_id:
+          type: string
+        session_cert_id:
+          type: string
+          description: Present when registered is true
+        registered_at:
+          type: string
+          format: date-time
+          description: When the current session was established
+        events_signed:
+          type: integer
+          description: Count of events signed in current session
+
+    ServiceRegistrationRequest:
+      type: object
+      required: [service_name, network_endpoint, cert_fingerprint, timestamp, signature]
+      properties:
+        service_name:
+          type: string
+          description: >
+            Service name as it appears in the constellation's OpenAPI contracts.
+            Must match the CN of the service's TLS certificate.
+        network_endpoint:
+          type: string
+          description: >
+            HTTPS endpoint AC uses to execute canned queries against this service.
+            Typically https://{service_name}:{port}.
+        networks:
+          type: array
+          items:
+            type: string
+          description: >
+            Docker/K8s networks this service is attached to. Used by the
+            Bridge pattern for topology verification (future iteration).
+        cert_fingerprint:
+          type: string
+          description: >
+            SHA-256 fingerprint of the service's TLS certificate. AC records
+            this to detect certificate rotation between restarts.
+        timestamp:
+          type: string
+          format: date-time
+          description: >
+            Registration timestamp. Included in the signed payload to
+            prevent replay attacks.
+        signature:
+          type: string
+          description: >
+            Base64-encoded signature of (service_name + network_endpoint +
+            cert_fingerprint + timestamp) signed with the service's private key.
+            AC verifies against the constellation CA certificate.
+
+    ServiceRegistrationAck:
+      type: object
+      required: [service_name, registered_at, status]
+      properties:
+        service_name:
+          type: string
+        registered_at:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum: [registered, refreshed]
+          description: >
+            registered — first time this service has registered in this
+            AC session.
+            refreshed — service was already known, entry updated (restart
+            or re-registration).
+
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          example: "SERVICE_NOT_REGISTERED"
+        message:
+          type: string
+          example: "Service 'gateway' is not registered with Augur Canis"
+
+  # ---------------------------------------------------------------------------
+  # Redis channel documentation
+  # ---------------------------------------------------------------------------
+  # tca:check-requests — Watchdog subscribes
+  #   Published by: healthcheck binary inside each Job container
+  #   Schema: { request_id: string, container_id: string, service_name: string,
+  #             published_at: ISO8601 }
+  #
+  # tca:check-results:{request_id} — healthcheck binary subscribes
+  #   Published by: Watchdog after executing canned query
+  #   TTL: 30 seconds (configurable, see result_ttl_seconds)
+  #   Schema: { request_id: string, healthy: 0|1, latency_ms: int,
+  #             time_to_complete_ms: int, failure_reason?: string,
+  #             query_version: int, checked_at: ISO8601 }
+  #   Exit codes: healthy=1 → exit 0, healthy=0 → exit 1
+  #
+  # tca:augur-canis — SETI Signal Aggregator subscribes
+  #   Published by: AC after each check cycle and individual checks
+  #   Schema: { service_name: string, healthy: 0|1, latency_ms: int,
+  #             time_to_complete_ms: int, query_version: int,
+  #             failure_reason?: string, checked_at: ISO8601,
+  #             constellation: string }
+  #
+  # tca:augur-canis:alerts — SETI, operators, AI monitors subscribe
+  #   Published by: AC on condition detection, each bark, on resolve
+  #   Schema: { alert_id, service_name, alert_type, severity, message,
+  #             triggered_at, bark_number?, resolution_type?, constellation }
+  #
+  # tca:contract-requests — AC subscribes
+  #   Published by: SETI Contract Test Job
+  #   TTL: none (consumed immediately or discarded)
+  #   Schema: { request_id: string, service_name: string, method: string,
+  #             path: string, headers: object, body?: object,
+  #             expected_status: int, expected_response_fields?: string[],
+  #             test_name: string, contract_version: string,
+  #             published_at: ISO8601 }
+  #
+  # tca:contract-results — SETI Contract Test Job subscribes
+  #   Published by: AC after executing contract test request
+  #   TTL: 60 seconds
+  #   Schema: { request_id: string, service_name: string, test_name: string,
+  #             passed: bool, actual_status: int, expected_status: int,
+  #             actual_response?: object, failure_reason?: string,
+  #             latency_ms: int, executed_at: ISO8601 }

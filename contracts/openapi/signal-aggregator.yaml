@@ -1,0 +1,1143 @@
+openapi: 3.1.0
+
+info:
+  title: SETI - Signal Aggregator Job
+  description: |
+    Subscribes to tca:events Redis pub/sub streams from all registered
+    TCA applications and aggregates them into a single cluster-level
+    signal layer. The Signal Aggregator is the only SETI Job with
+    multi-application event stream access.
+
+    Three primary functions:
+
+    1. CALL CHAIN VERIFICATION — during Plot Test execution, the Plot
+       Test Job queries the Signal Aggregator to verify that the
+       expected inter-service call chain actually occurred in the
+       monitored application's observability stream. The Signal
+       Aggregator correlates events by timestamp window and application
+       ID to answer the question: "did these calls happen, in this
+       order, within the expected time window?"
+
+    2. CROSS-APPLICATION CORRELATION — the Signal Aggregator maintains
+       a rolling event window across all registered applications. This
+       is the foundation for detecting anomalous patterns that are
+       invisible to any single application's monitoring — traffic
+       correlations, timing relationships, and behavioral changes that
+       span application boundaries.
+
+    3. WATCHDOG HEALTH AGGREGATION — the Signal Aggregator subscribes
+       to each registered application's tca:augur-canis Redis channel
+       alongside tca:events. Health state, latency, and
+       time-to-complete for every Job in every monitored constellation
+       flow into the same signal layer as observability events. This
+       gives SETI a unified view of both behavioral traffic and Job
+       health across all monitored applications. The Watchdog feed is
+       included in cross-application correlation queries and surfaces
+       in the Results Job trend data as constellation health metrics.
+
+    The Signal Aggregator does not make policy decisions. It observes,
+    correlates, and answers queries. Callers decide what to do with
+    the data.
+
+    Signal Aggregator runs continuously. It maintains Redis subscriptions
+    to all registered application event streams and keeps a rolling
+    in-memory event window for correlation queries. The window size is
+    configurable — default 10 minutes. Events older than the window
+    are not retained in memory but are available via the Results Job
+    historical query path.
+
+    Internal service — mTLS only, not externally exposed.
+  version: 0.1.0
+
+x-tca-security:
+  transport: mtls
+  tls-min-version: "1.3"
+  client-cert-required: true
+  reject-without-client-cert: true
+  ca-cert: /certs/ca.crt
+  service-cert: /certs/signal-aggregator.crt
+  service-key: /certs/signal-aggregator.key
+  implementation:
+    server:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      require-and-verify-client-cert: true
+    client:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      verify-server-cert: true
+  notes: >
+    Every inbound connection must present a certificate signed by the
+    SETI CA. Connections without a valid client certificate must be
+    rejected. Authorized callers: Plot Test Job (call chain
+    verification), Watchdog Job (correlation queries), Results Job
+    (trend data reads), Feed Wr4ngler (live event forwarding to
+    authorized feeds). Signal Aggregator has access to observability
+    data from every registered application — it is a high-value
+    target. Unknown caller certificates are rejected and logged.
+
+x-tca-observability:
+  report-outbound-calls: true
+  endpoint: https://seti-observability:4011/event
+  pattern: fire-and-forget
+  caller-name: "signal-aggregator"
+  required-fields:
+    - caller
+    - callee
+    - method
+    - path
+    - status_code
+    - latency_ms
+    - protocol
+  implementation:
+    timing: wrap-every-outbound-http-call
+    non-blocking: true
+    on-failure: log-and-drop
+    do-not-instrument:
+      - seti-observability
+  notes: >
+    Report all outbound HTTP calls to the SETI Observability Job.
+    Signal Aggregator's primary outbound traffic is Redis subscription
+    management — not HTTP. HTTP calls are to Policy Job (application
+    registry reads on startup and registration change events) and
+    to the Feed Wr4ngler (forwarding matched events to live feeds).
+
+servers:
+  - url: https://signal-aggregator:4006
+    description: Internal SETI network (mTLS enforced)
+
+tags:
+  - name: verification
+    description: Call chain verification for Plot Test execution
+  - name: correlation
+    description: Cross-application correlation queries
+  - name: subscriptions
+    description: Application stream subscription management
+  - name: health
+    description: Service health and subscription status
+
+paths:
+
+  # ---------------------------------------------------------------------------
+  # CALL CHAIN VERIFICATION
+  # ---------------------------------------------------------------------------
+
+  /verify/call-chain:
+    post:
+      tags: [verification]
+      summary: Verify an expected inter-service call chain occurred
+      description: |
+        Called by the Plot Test Job after each Plot step executes.
+        Queries the rolling event window to verify that the expected
+        sequence of inter-service calls occurred in the target
+        application's observability stream within the specified
+        time window.
+
+        Matching is ordered — the calls must appear in the sequence
+        specified. Gaps between calls are allowed (other calls may
+        occur between expected ones). Strict mode requires no
+        unexpected calls between the expected sequence members.
+
+        This is a hot path during Plot Test execution — Plot Test
+        waits on this response before proceeding to the next step.
+        Response must be fast. The event window query is in-memory.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CallChainVerificationRequest'
+            example:
+              application_id: "app-tca-vox-prod"
+              window_start: "2026-03-27T14:00:05Z"
+              window_end: "2026-03-27T14:00:08Z"
+              expected_chain:
+                - caller: "game-state"
+                  callee: "deck-service"
+                  method: "POST"
+                  path_pattern: "/deal"
+                - caller: "game-state"
+                  callee: "hand-evaluator"
+                  method: "POST"
+                  path_pattern: "/evaluate"
+              strict: false
+      responses:
+        '200':
+          description: Verification result returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CallChainVerificationResult'
+        '400':
+          description: Invalid verification request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Application not found in active subscriptions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '408':
+          description: >
+            Window not yet available — requested window_end is in the
+            future or too recent. Caller should retry after a short delay.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # CORRELATION
+  # ---------------------------------------------------------------------------
+
+  /correlate:
+    post:
+      tags: [correlation]
+      summary: Query cross-application event correlations
+      description: |
+        Queries the rolling event window across multiple applications
+        for correlated patterns. Used by the Watchdog Job for anomaly
+        detection and by the AI-lien Job when analysis_type is
+        cross_application_correlation.
+
+        Correlation queries are more expensive than verification
+        queries — they span multiple application event streams.
+        Not on any critical path. Callers should set appropriate
+        timeouts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CorrelationRequest'
+      responses:
+        '200':
+          description: Correlation results returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CorrelationResult'
+        '400':
+          description: Invalid correlation request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /events/{application_id}:
+    get:
+      tags: [correlation]
+      summary: Get recent events for an application from the rolling window
+      description: |
+        Returns events from the in-memory rolling window for a specific
+        application. Used by the Feed Wr4ngler to populate live feeds
+        and by the Watchdog for behavioral analysis.
+
+        Only returns events within the current window. For historical
+        events beyond the window, use the Results Job.
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "app-tca-vox-prod"
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: >
+            Start of time range. Must be within the rolling window.
+            If omitted, returns all events in the current window.
+        - name: caller
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter by caller service name
+        - name: callee
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter by callee service name
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+      responses:
+        '200':
+          description: Events returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventPage'
+        '404':
+          description: Application not found in active subscriptions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # SUBSCRIPTION MANAGEMENT
+  # ---------------------------------------------------------------------------
+
+  /subscriptions:
+    get:
+      tags: [subscriptions]
+      summary: List active application stream subscriptions
+      description: |
+        Returns the current state of all Redis pub/sub subscriptions.
+        A missing application here when it should be present is an
+        operational signal — subscription may have dropped and not
+        recovered.
+      responses:
+        '200':
+          description: Subscription list returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionList'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /subscriptions/{application_id}/watchdog:
+    post:
+      tags: [subscriptions]
+      summary: Add a tca:augur-canis subscription for a registered application
+      description: |
+        Called by the Policy Job when a new application is registered
+        with SETI — immediately after the tca:events subscription is
+        opened. The Signal Aggregator opens a Redis subscription to
+        the application's tca:augur-canis channel and begins including
+        Augur Canis health events in the rolling window alongside
+        observability events.
+
+        Watchdog events in the window are tagged with source: watchdog
+        so they can be distinguished from tca:events traffic in
+        correlation queries.
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              \$ref: '#/components/schemas/AugurCanisSubscriptionRequest'
+      responses:
+        '201':
+          description: Augur Canis subscription opened
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subscription'
+        '400':
+          description: Invalid subscription request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Augur Canis subscription already active for this application
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    delete:
+      tags: [subscriptions]
+      summary: Remove tca:augur-canis subscription for a deregistered application
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Augur Canis subscription closed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionCloseResult'
+        '404':
+          description: No active Augur Canis subscription for this application
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /subscriptions/{application_id}:
+    post:
+      tags: [subscriptions]
+      summary: Add a subscription for a newly registered application
+      description: |
+        Called by the Policy Job when a new application is registered
+        with SETI. Signal Aggregator opens a Redis subscription to
+        the application's tca:events channel and begins including its
+        events in the rolling window.
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubscriptionRequest'
+      responses:
+        '201':
+          description: Subscription opened
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subscription'
+        '400':
+          description: Invalid subscription request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Subscription already active for this application
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    delete:
+      tags: [subscriptions]
+      summary: Remove a subscription for a deregistered application
+      description: |
+        Called by the Policy Job when an application is deregistered.
+        Signal Aggregator closes the Redis subscription and purges
+        the application's events from the rolling window.
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Subscription closed and events purged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionCloseResult'
+        '404':
+          description: No active subscription for this application
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      tags: [health]
+      summary: Service health and subscription status
+      responses:
+        '200':
+          description: Health status returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /federation/events/{application_id}:
+    post:
+      tags: [federation]
+      summary: Ingest a verified health event from an external AC feed
+      description: |
+        Internal endpoint. Called by the Signal Aggregator's own feed
+        monitor when an event arrives on an external AC's tca:augur-canis
+        Redis channel.
+
+        Before calling this endpoint the feed monitor verifies the event
+        signature against the stored session certificate for this
+        application. Events that fail verification are dropped and trigger
+        a re-registration request to the AC via the Policy Job.
+
+        Events that pass verification are merged into the rolling window
+        alongside seti-self events. Plot Tests and the AI-lien Job see
+        a unified event stream regardless of which constellation generated
+        each event.
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FederatedHealthEvent'
+      responses:
+        '202':
+          description: Event accepted into rolling window
+        '401':
+          description: Signature verification failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Application not registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /federation/subscriptions:
+    get:
+      tags: [federation]
+      summary: List all active external AC feed subscriptions
+      description: |
+        Returns the current state of all external AC feed subscriptions.
+        Each entry shows the application, the AC endpoint, feed health,
+        and when the session certificate was last updated.
+
+        A subscription in degraded state means the feed monitor has
+        detected silence or verification failure and is attempting
+        re-registration. This is expected and recoverable — AC may
+        have restarted.
+
+        A subscription missing from this list when it should be present
+        means the Signal Aggregator has not yet established the subscription
+        or it failed to initialize. Check the Policy Job's federation
+        status for the affected application.
+      responses:
+        '200':
+          description: Active external AC subscriptions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscriptions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FederationSubscriptionStatus'
+
+  /federation/subscriptions/{application_id}/reconnect:
+    post:
+      tags: [federation]
+      summary: Force reconnection to an external AC feed
+      description: |
+        Triggers immediate re-registration with the external AC for this
+        application. Fetches the current ac_endpoint and session cert from
+        the Policy Job, re-submits the star-gazer registration request,
+        and updates the stored session certificate on success.
+
+        Called automatically by the feed monitor on silence threshold breach
+        or signature verification failure. Can also be called manually for
+        debugging.
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Reconnection initiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FederationSubscriptionStatus'
+        '404':
+          description: Application not found or no ac_endpoint configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: AC endpoint unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+
+components:
+  schemas:
+
+    ExpectedCall:
+      type: object
+      required:
+        - caller
+        - callee
+      properties:
+        caller:
+          type: string
+          description: Expected caller service name
+          example: "game-state"
+        callee:
+          type: string
+          description: Expected callee service name
+          example: "deck-service"
+        method:
+          type: string
+          enum: [GET, POST, PUT, PATCH, DELETE]
+          description: Optional — if omitted any method satisfies
+        path_pattern:
+          type: string
+          description: >
+            Optional path pattern. Supports {id} wildcards.
+            If omitted any path satisfies.
+          example: "/deal"
+        max_latency_ms:
+          type: integer
+          description: >
+            Optional maximum acceptable latency for this call.
+            If the observed call exceeded this latency the step
+            is flagged even if the call occurred.
+
+    ObservedCall:
+      type: object
+      required:
+        - caller
+        - callee
+        - method
+        - path
+        - status_code
+        - latency_ms
+        - protocol
+        - observed_at
+      properties:
+        caller:
+          type: string
+        callee:
+          type: string
+        method:
+          type: string
+        path:
+          type: string
+          description: Sanitized path from the observability stream
+        status_code:
+          type: integer
+        latency_ms:
+          type: integer
+        protocol:
+          type: string
+        observed_at:
+          type: string
+          format: date-time
+
+    CallChainVerificationRequest:
+      type: object
+      required:
+        - application_id
+        - window_start
+        - window_end
+        - expected_chain
+      properties:
+        application_id:
+          type: string
+          description: Application whose event stream to query
+          example: "app-tca-vox-prod"
+        window_start:
+          type: string
+          format: date-time
+          description: Start of the time window to search
+        window_end:
+          type: string
+          format: date-time
+          description: End of the time window to search
+        expected_chain:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExpectedCall'
+          minItems: 1
+          description: >
+            Expected call sequence in order. Calls must appear
+            in this sequence within the window.
+        strict:
+          type: boolean
+          default: false
+          description: >
+            When true, no calls other than those in expected_chain
+            may appear between matched calls. Use for validating
+            that a step did not trigger unexpected downstream calls.
+
+    CallChainVerificationResult:
+      type: object
+      required:
+        - application_id
+        - verified
+        - matched_calls
+        - window_start
+        - window_end
+      properties:
+        application_id:
+          type: string
+        verified:
+          type: boolean
+          description: >
+            True when all expected calls were found in sequence
+            within the window. False if any expected call was
+            missing, out of order, or (in strict mode) unexpected
+            calls appeared between sequence members.
+        matched_calls:
+          type: array
+          items:
+            type: object
+            required:
+              - expected
+              - observed
+              - matched
+            properties:
+              expected:
+                $ref: '#/components/schemas/ExpectedCall'
+              observed:
+                $ref: '#/components/schemas/ObservedCall'
+              matched:
+                type: boolean
+              latency_exceeded:
+                type: boolean
+                description: >
+                  Present when expected.max_latency_ms was set and
+                  the observed call exceeded it.
+        missing_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExpectedCall'
+          description: Expected calls not found in the window
+        unexpected_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ObservedCall'
+          description: >
+            Present in strict mode. Calls observed between sequence
+            members that were not in the expected chain.
+        window_start:
+          type: string
+          format: date-time
+        window_end:
+          type: string
+          format: date-time
+
+    CorrelationRequest:
+      type: object
+      required:
+        - application_ids
+        - window_minutes
+      properties:
+        application_ids:
+          type: array
+          items:
+            type: string
+          minItems: 2
+          description: Applications to correlate across
+          example: ["app-tca-vox-prod", "app-tca-seti"]
+        window_minutes:
+          type: integer
+          minimum: 1
+          maximum: 10
+          description: >
+            Time window to search for correlations. Bounded by
+            the rolling window size. Cannot exceed the configured
+            window — use Results Job for longer historical correlation.
+          example: 5
+        pattern_hints:
+          type: array
+          items:
+            type: string
+          description: >
+            Optional. Hints to guide the correlation search.
+            Used by the Watchdog to focus the query before
+            passing results to AI-lien for deeper analysis.
+          example:
+            - "traffic spike in app-a correlates with errors in app-b"
+            - "unusual silence from service after deployment"
+
+    CorrelationResult:
+      type: object
+      required:
+        - application_ids
+        - window_minutes
+        - events_analyzed
+        - correlations
+        - generated_at
+      properties:
+        application_ids:
+          type: array
+          items:
+            type: string
+        window_minutes:
+          type: integer
+        events_analyzed:
+          type: integer
+          description: Total events across all applications in the window
+        correlations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Correlation'
+          description: Detected correlations. Empty if none found.
+        generated_at:
+          type: string
+          format: date-time
+
+    Correlation:
+      type: object
+      required:
+        - correlation_type
+        - applications_involved
+        - description
+        - confidence
+        - supporting_events
+      properties:
+        correlation_type:
+          type: string
+          enum:
+            - traffic_spike_correlation
+            - error_rate_correlation
+            - timing_correlation
+            - silence_correlation
+            - latency_spike_correlation
+          description: Category of correlation detected
+        applications_involved:
+          type: array
+          items:
+            type: string
+          description: Which applications are involved in this correlation
+        description:
+          type: string
+          description: >
+            Human-readable description of the correlation.
+            Written to be directly usable as supporting_data
+            for an AI-lien correlation analysis request.
+        confidence:
+          type: string
+          description: Correlation confidence as decimal string
+          example: "0.82"
+        supporting_events:
+          type: array
+          items:
+            $ref: '#/components/schemas/ObservedCall'
+          description: Events that support this correlation finding
+
+    EventPage:
+      type: object
+      required:
+        - application_id
+        - events
+        - total
+        - window_start
+        - window_end
+      properties:
+        application_id:
+          type: string
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/ObservedCall'
+        total:
+          type: integer
+        window_start:
+          type: string
+          format: date-time
+        window_end:
+          type: string
+          format: date-time
+
+    SubscriptionRequest:
+      type: object
+      required:
+        - application_id
+        - redis_connection
+        - channel
+      properties:
+        application_id:
+          type: string
+        redis_connection:
+          type: string
+          description: Redis connection string for this application's event stream
+          example: "redis://vox-redis-prod:6379"
+        channel:
+          type: string
+          description: >
+            Redis pub/sub channel name. Convention: tca:events.
+            Specified explicitly to support applications that
+            use a non-standard channel name.
+          example: "tca:events"
+
+    AugurCanisSubscriptionRequest:
+      type: object
+      required:
+        - application_id
+        - redis_connection
+      properties:
+        application_id:
+          type: string
+        redis_connection:
+          type: string
+          description: Redis connection string for this application's Watchdog feed
+          example: "redis://vox-redis-prod:6379"
+        channel:
+          type: string
+          description: >
+            Redis pub/sub channel name. Convention: tca:augur-canis.
+            Specified explicitly to support non-standard channel names.
+          default: "tca:augur-canis"
+          example: "tca:augur-canis"
+
+    Subscription:
+      type: object
+      required:
+        - application_id
+        - redis_connection
+        - channel
+        - status
+        - subscribed_at
+        - events_received
+      properties:
+        application_id:
+          type: string
+        redis_connection:
+          type: string
+        channel:
+          type: string
+        status:
+          type: string
+          enum: [active, reconnecting, failed]
+          description: >
+            active — subscription healthy, events flowing.
+            reconnecting — Redis connection dropped, retrying.
+            failed — repeated reconnection failures, manual intervention needed.
+        subscribed_at:
+          type: string
+          format: date-time
+        events_received:
+          type: integer
+          description: Total events received since subscription opened
+        last_event_at:
+          type: string
+          format: date-time
+          description: Timestamp of most recent event received
+
+    SubscriptionList:
+      type: object
+      required:
+        - subscriptions
+        - total
+        - active
+        - reconnecting
+        - failed
+      properties:
+        subscriptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Subscription'
+        total:
+          type: integer
+        active:
+          type: integer
+        reconnecting:
+          type: integer
+        failed:
+          type: integer
+          description: Non-zero value here requires immediate attention
+
+    SubscriptionCloseResult:
+      type: object
+      required:
+        - application_id
+        - events_purged
+        - closed_at
+      properties:
+        application_id:
+          type: string
+        events_purged:
+          type: integer
+        closed_at:
+          type: string
+          format: date-time
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - subscriptions_active
+        - subscriptions_reconnecting
+        - subscriptions_failed
+        - window_size_minutes
+        - events_in_window
+        - total_events_received
+        - uptime_seconds
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+          description: >
+            degraded when any subscription is in failed state
+            or window coverage is incomplete.
+        subscriptions_active:
+          type: integer
+        subscriptions_reconnecting:
+          type: integer
+        subscriptions_failed:
+          type: integer
+        window_size_minutes:
+          type: integer
+          description: Configured rolling window size
+        events_in_window:
+          type: integer
+          description: Current event count across all applications in window
+        total_events_received:
+          type: integer
+          description: Total events received across all subscriptions since restart
+        uptime_seconds:
+          type: integer
+
+
+    FederatedHealthEvent:
+      type: object
+      required: [service_name, healthy, checked_at, session_cert_id, signature]
+      properties:
+        service_name:
+          type: string
+          description: Service name within its own constellation
+        healthy:
+          type: boolean
+        latency_ms:
+          type: integer
+        checked_at:
+          type: string
+          format: date-time
+        session_cert_id:
+          type: string
+          description: >
+            Identifies which session certificate signed this event.
+            If this does not match the stored session_cert_id for this
+            application, the feed monitor treats it as a rotation signal
+            and triggers re-registration before processing further events.
+        signature:
+          type: string
+          description: >
+            Base64-encoded signature of the event payload signed with
+            the AC's session private key. Verified against the session
+            public certificate stored when SETI last registered with
+            this AC.
+        alert:
+          type: object
+          description: Present when the AC is emitting an alert for this event
+          properties:
+            alert_id:
+              type: string
+            alert_type:
+              type: string
+              enum: [silence, latency_drift, failure_rate]
+            bark_count:
+              type: integer
+            message:
+              type: string
+
+    FederationSubscriptionStatus:
+      type: object
+      required: [application_id, status, ac_endpoint]
+      properties:
+        application_id:
+          type: string
+        ac_endpoint:
+          type: string
+        status:
+          type: string
+          enum: [active, degraded, reconnecting, failed]
+          description: >
+            active — feed live, events verifying correctly.
+            degraded — silence threshold breached, re-registration in progress.
+            reconnecting — re-registration request sent, awaiting response.
+            failed — AC unreachable after retry limit, requires Sec Wr4ngler
+            attention.
+        session_cert_id:
+          type: string
+          description: Present when status is active
+        last_event_at:
+          type: string
+          format: date-time
+        reconnect_count:
+          type: integer
+        silence_threshold_seconds:
+          type: integer
+          description: Seconds of feed silence before re-registration is triggered
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          example: "APPLICATION_NOT_SUBSCRIBED"
+        message:
+          type: string
+          example: "Application 'app-tca-vox-prod' has no active subscription"

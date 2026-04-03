@@ -1,0 +1,889 @@
+openapi: 3.1.0
+
+info:
+  title: SETI - Gateway Job
+  description: |
+    Single external entry point for the SETI constellation. The Gateway
+    is the only Job with an externally published port. All Wr4ngler
+    traffic and all admin operations enter the constellation here.
+
+    Responsibilities:
+    - TLS termination on the external boundary
+    - JWT validation on all authenticated routes
+    - Request routing to internal Jobs via mTLS
+    - SSE connection management for real-time feed delivery
+    - Rate limiting per Wr4ngler
+
+    The Gateway acts as an mTLS client when calling all upstream
+    internal Jobs. It presents its own certificate on every upstream
+    connection and verifies upstream certificates against the SETI CA.
+
+    External boundary: standard TLS. Wr4nglers do not present client
+    certificates. JWT validation substitutes for mTLS on the external
+    boundary — this is not a weakening of the zero-trust posture, it
+    is the correct adaptation for a boundary that terminates user traffic.
+
+    Internal boundary: mTLS on every upstream call, identical to all
+    other SETI Jobs acting as clients.
+
+    The Gateway has no business logic. It routes. It validates tokens.
+    It enforces rate limits. It does not interpret the content of
+    requests or responses beyond what routing requires.
+  version: 0.1.0
+
+x-tca-security:
+  external-transport: tls
+  internal-transport: mtls
+  notes: >
+    External (Wr4ngler-facing): standard TLS. JWT validation on all
+    authenticated routes. Clearance level extracted from JWT claims
+    and passed to upstream Jobs via X-Wrangler-Clearance header.
+    Internal (service-to-service): Gateway acts as mTLS client when
+    calling all upstream SETI Jobs. Must load its own certificate and
+    key and present them on every upstream connection. Must verify
+    upstream service certificates against the SETI CA. Upstream Jobs
+    will reject connections without a valid client certificate.
+  internal-client:
+    load-ca-cert: /certs/ca.crt
+    load-service-cert: /certs/gateway.crt
+    load-service-key: /certs/gateway.key
+    verify-server-cert: true
+  rate-limiting:
+    default-per-wrangler: 60
+    window-seconds: 60
+    feed-provisioning: 10
+    notes: >
+      Feed provisioning is rate-limited separately — a Wr4ngler
+      should not be opening and closing feed subscriptions rapidly.
+      High provisioning rate is a diagnostic signal.
+
+x-tca-observability:
+  report-outbound-calls: true
+  endpoint: https://seti-observability:4011/event
+  pattern: fire-and-forget
+  caller-name: "gateway"
+  required-fields:
+    - caller
+    - callee
+    - method
+    - path
+    - status_code
+    - latency_ms
+    - protocol
+  implementation:
+    timing: wrap-every-outbound-http-call
+    non-blocking: true
+    on-failure: log-and-drop
+    do-not-instrument:
+      - seti-observability
+  notes: >
+    Every upstream call the Gateway makes to an internal SETI Job must
+    be reported to the Observability Job. This includes all routing
+    calls, Signal Clearance calls, and feed provisioning calls.
+    The Gateway is the highest-traffic reporter in the constellation —
+    fire-and-forget discipline is especially important here.
+
+servers:
+  - url: https://seti.cluster.internal
+    description: External SETI gateway (TLS, JWT required on authenticated routes)
+
+tags:
+  - name: auth
+    description: Authentication flow (proxied to Signal Clearance)
+  - name: feeds
+    description: Signal feed provisioning and SSE delivery
+  - name: applications
+    description: Application registry operations (proxied to Policy)
+  - name: results
+    description: Test result queries (proxied to Results via Feed Wr4ngler)
+  - name: admin
+    description: Administrative operations (elevated clearance required)
+  - name: health
+    description: Gateway health
+
+paths:
+
+  # ---------------------------------------------------------------------------
+  # AUTHENTICATION — proxied to Signal Clearance
+  # ---------------------------------------------------------------------------
+
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Initiate Wr4ngler authentication
+      description: |
+        Proxied to Signal Clearance /auth/login.
+        No JWT required — this is the unauthenticated entry point.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contact]
+              properties:
+                contact:
+                  type: string
+                  example: "michael@example.com"
+      responses:
+        '200':
+          description: Challenge issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProxiedResponse'
+        '404':
+          description: Wr4ngler not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/verify:
+    post:
+      tags: [auth]
+      summary: Complete Wr4ngler authentication
+      description: Proxied to Signal Clearance /auth/verify.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challenge_id, credential_response]
+              properties:
+                challenge_id:
+                  type: string
+                credential_response:
+                  type: object
+      responses:
+        '200':
+          description: Authentication successful. JWT and refresh token returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProxiedResponse'
+        '401':
+          description: Authentication failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: Refresh expired JWT
+      description: Proxied to Signal Clearance /auth/refresh.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+      responses:
+        '200':
+          description: New token pair issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProxiedResponse'
+        '401':
+          description: Invalid or expired refresh token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: Invalidate current session
+      description: |
+        Proxied to Signal Clearance /auth/logout.
+        JWT required.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Session invalidated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProxiedResponse'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # FEEDS — provisioning and SSE delivery
+  # ---------------------------------------------------------------------------
+
+  /feeds:
+    post:
+      tags: [feeds]
+      summary: Request a signal feed
+      description: |
+        Validates the Wr4ngler's clearance for the requested scope via
+        Signal Clearance, then calls Feed Wr4ngler to provision a
+        scoped Redis pub/sub channel. Returns the SSE endpoint URL
+        the Wr4ngler should connect to for the feed.
+
+        JWT required. Clearance level is extracted from JWT claims
+        and used in the Signal Clearance validation call.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FeedRequest'
+            example:
+              requested_scope:
+                application_ids: ["app-tca-vox-prod"]
+                test_tiers: ["contract"]
+                environments: ["production"]
+                feed_types: ["failures"]
+      responses:
+        '201':
+          description: Feed provisioned. SSE endpoint returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeedProvisionResult'
+        '400':
+          description: Invalid feed request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Insufficient clearance for requested scope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClearanceDenialResponse'
+        '429':
+          description: Feed provisioning rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /feeds/{feed_id}/stream:
+    get:
+      tags: [feeds]
+      summary: Connect to a provisioned feed via SSE
+      description: |
+        Opens a Server-Sent Events stream for a provisioned feed.
+        The feed_id is returned by POST /feeds. The Wr4ngler connects
+        here immediately after provisioning — feed channels have a
+        30-second idle timeout before they are closed.
+
+        JWT required. The JWT must match the Wr4ngler who provisioned
+        the feed — feed channels are not shareable.
+
+        Events are published to this stream as SETI produces test
+        results, failures, and anomaly signals matching the feed scope.
+        The stream stays open until the Wr4ngler disconnects or the
+        JWT expires. On JWT expiry the stream closes — the Wr4ngler
+        must refresh their JWT and provision a new feed.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: feed_id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "feed-a1b2c3d4"
+      responses:
+        '200':
+          description: SSE stream opened
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/SETIEvent'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: JWT does not match feed owner
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Feed not found or expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /feeds/{feed_id}:
+    delete:
+      tags: [feeds]
+      summary: Close a feed
+      description: |
+        Closes the feed channel and releases the Redis pub/sub
+        subscription. Wr4nglers should close feeds explicitly
+        when done rather than letting them timeout.
+        JWT required.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: feed_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Feed closed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeedCloseResult'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Feed not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # RESULTS — proxied to Results via Feed Wr4ngler clearance check
+  # ---------------------------------------------------------------------------
+
+  /results/contract:
+    get:
+      tags: [results]
+      summary: Query Contract Test results
+      description: |
+        Clearance-checked query proxied to Results Job.
+        Scope of results returned is bounded by the Wr4ngler's
+        clearance level — applications outside their clearance
+        are silently excluded from results.
+        JWT required.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: application_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: environment
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [production, staging, development]
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [passed, failed, error, timeout]
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Results returned (scoped to Wr4ngler clearance)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProxiedResponse'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /results/plot:
+    get:
+      tags: [results]
+      summary: Query Plot Test results
+      description: |
+        Clearance-checked query proxied to Results Job.
+        JWT required.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: application_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: environment
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [production, staging, development]
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [passed, failed, error, timeout]
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Results returned (scoped to Wr4ngler clearance)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProxiedResponse'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # ADMIN — elevated clearance required
+  # ---------------------------------------------------------------------------
+
+  /admin/applications:
+    post:
+      tags: [admin]
+      summary: Register a new application for SETI monitoring
+      description: |
+        Admin clearance required.
+        Proxied to Policy Job /applications.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProxiedRequest'
+      responses:
+        '201':
+          description: Application registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProxiedResponse'
+        '400':
+          description: Invalid registration payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Admin clearance required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      tags: [admin]
+      summary: List registered applications
+      description: Admin clearance required. Proxied to Policy Job.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Application list returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProxiedResponse'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Admin clearance required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/wranglers:
+    post:
+      tags: [admin]
+      summary: Register a new Wr4ngler
+      description: Admin clearance required. Proxied to Signal Clearance.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProxiedRequest'
+      responses:
+        '201':
+          description: Wr4ngler registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProxiedResponse'
+        '400':
+          description: Invalid registration payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Admin clearance required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      tags: [health]
+      summary: Gateway health check
+      description: No JWT required.
+      responses:
+        '200':
+          description: Gateway healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        JWT issued by Signal Clearance on successful authentication.
+        15-minute TTL. Contains wrangler_id and clearance_level claims.
+
+  schemas:
+
+    FeedRequest:
+      type: object
+      required:
+        - requested_scope
+      properties:
+        requested_scope:
+          type: object
+          description: Signal scope the Wr4ngler is requesting
+          properties:
+            application_ids:
+              type: array
+              items:
+                type: string
+            test_tiers:
+              type: array
+              items:
+                type: string
+                enum: [contract, plot]
+            environments:
+              type: array
+              items:
+                type: string
+                enum: [production, staging, development]
+            feed_types:
+              type: array
+              items:
+                type: string
+                enum: [results, failures, trends, anomalies, cluster]
+
+    FeedProvisionResult:
+      type: object
+      required:
+        - feed_id
+        - sse_endpoint
+        - granted_scope
+        - expires_at
+      properties:
+        feed_id:
+          type: string
+          description: Feed identifier for SSE connection and close calls
+          example: "feed-a1b2c3d4"
+        sse_endpoint:
+          type: string
+          description: >
+            Full SSE endpoint URL. Connect here immediately after
+            provisioning — channel has 30-second idle timeout.
+          example: "https://seti.cluster.internal/feeds/feed-a1b2c3d4/stream"
+        granted_scope:
+          type: object
+          description: The scope actually granted (may be subset of requested)
+        expires_at:
+          type: string
+          format: date-time
+          description: Feed channel expiry — tied to JWT expiry
+
+    FeedCloseResult:
+      type: object
+      required:
+        - feed_id
+        - closed_at
+      properties:
+        feed_id:
+          type: string
+        closed_at:
+          type: string
+          format: date-time
+
+    SETIEvent:
+      type: object
+      description: >
+        Server-Sent Event payload published to feed streams.
+        Event type identifies the signal category.
+      required:
+        - event_type
+        - application_id
+        - payload
+        - published_at
+      properties:
+        event_type:
+          type: string
+          enum:
+            - contract_test_result
+            - plot_test_result
+            - contract_test_failure
+            - plot_test_failure
+            - anomaly_detected
+            - plot_needs_regeneration
+            - application_status_change
+        application_id:
+          type: string
+        environment:
+          type: string
+        payload:
+          type: object
+          description: Event-specific data. Shape varies by event_type.
+        published_at:
+          type: string
+          format: date-time
+
+    ClearanceDenialResponse:
+      type: object
+      required:
+        - denied_dimensions
+      properties:
+        denied_dimensions:
+          type: array
+          items:
+            type: string
+          description: Which dimensions of the requested scope exceeded clearance
+          example: ["feed_types: anomalies requires elevated clearance"]
+
+    ProxiedRequest:
+      type: object
+      description: >
+        Passthrough request body. The Gateway forwards the body
+        verbatim to the upstream Job after JWT validation and
+        clearance checking. Schema enforcement is the upstream
+        Job's responsibility.
+
+    ProxiedResponse:
+      type: object
+      description: >
+        Passthrough response body. The Gateway returns the upstream
+        Job's response verbatim. See the upstream Job's contract
+        for the specific response schema.
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - active_feeds
+        - requests_routed
+        - upstream_jobs_healthy
+        - upstream_jobs_degraded
+        - uptime_seconds
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+        active_feeds:
+          type: integer
+          description: Currently open SSE feed connections
+        requests_routed:
+          type: integer
+          description: Total requests routed since last restart
+        upstream_jobs_healthy:
+          type: integer
+        upstream_jobs_degraded:
+          type: integer
+          description: >
+            Non-zero value here means one or more internal Jobs
+            are returning degraded health. Specific Job health
+            available via /admin endpoints.
+        uptime_seconds:
+          type: integer
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          example: "INSUFFICIENT_CLEARANCE"
+        message:
+          type: string
+          example: "JWT clearance level 'connie-wrangler' does not grant access to anomaly feeds"

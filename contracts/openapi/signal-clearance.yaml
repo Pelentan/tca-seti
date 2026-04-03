@@ -1,0 +1,1250 @@
+openapi: 3.1.0
+
+info:
+  title: SETI - Signal Clearance Job
+  description: |
+    SETI's purpose-built authorization layer. Signal Clearance is not
+    a standard role-based User Job — it manages clearance levels that
+    govern what signals a Wr4ngler is authorized to observe.
+
+    The distinction is intentional and architectural. A standard User
+    Job manages what a user can do. Signal Clearance manages what a
+    Wr4ngler is cleared to see. Those are different enough concerns
+    that a specialized implementation is justified — not cosmetically
+    different, genuinely different in threat model and access pattern.
+
+    IDENTITY: FEDERATED VIA CUSTOMER ACTIVE DIRECTORY
+
+    Signal Clearance does not manage passwords, passkeys, or credentials.
+    Identity is delegated entirely to the customer's identity provider
+    — Active Directory via Azure Entra ID, ADFS, or any OIDC-compliant
+    IdP. The customer already manages user lifecycle, MFA enforcement,
+    and offboarding. SETI piggybacks on that rather than duplicating it.
+
+    Authentication flow:
+    1. Wr4ngler requests login via Gateway
+    2. Gateway redirects to the customer IdP's OIDC authorization endpoint
+    3. Customer IdP authenticates against AD, returns authorization code
+    4. Gateway exchanges code for OIDC tokens at the IdP token endpoint
+    5. Gateway presents the ID token to Signal Clearance /auth/federated
+    6. Signal Clearance validates the ID token against the IdP's JWKS,
+       maps the identity to a Wr4ngler record and clearance level,
+       and issues SETI's own short-lived JWT
+    7. SETI JWT carries wrangler_id and clearance_level — downstream
+       Jobs see SETI credentials, never the IdP token
+
+    CLEARANCE MAPPING:
+    AD group membership maps to SETI clearance levels. The Sec Wr4ngler
+    configures the group-to-clearance mapping in Signal Clearance.
+    A Wr4ngler's clearance level in SETI is determined by their AD
+    group at login time — it is not stored permanently and may change
+    between sessions if their AD group membership changes.
+
+    Wr4ngler records in SETI are created automatically on first
+    federated login if the Wr4ngler's AD identity maps to a known
+    clearance level. Wr4nglers whose AD identity maps to no configured
+    clearance level are denied access — no manual pre-registration
+    required for known groups.
+
+    CLEARANCE LEVELS:
+    Clearances are defined and administered by the Sec Wr4ngler.
+    Clearances determine which signal feeds a Wr4ngler can subscribe
+    to. Feed Wr4ngler calls Signal Clearance on every feed provisioning
+    request to validate the Wr4ngler's current clearance for the
+    requested scope.
+
+    The SETI JWT carries the clearance level so Feed Wr4ngler can make
+    fast routing decisions without re-calling Signal Clearance on every
+    message published to a feed — only on feed provisioning.
+
+    Internal service — mTLS only, not externally exposed. All Wr4ngler
+    traffic reaches Signal Clearance through the Gateway.
+  version: 0.2.0
+
+x-tca-security:
+  transport: mtls
+  tls-min-version: "1.3"
+  client-cert-required: true
+  reject-without-client-cert: true
+  ca-cert: /certs/ca.crt
+  service-cert: /certs/signal-clearance.crt
+  service-key: /certs/signal-clearance.key
+  implementation:
+    server:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      require-and-verify-client-cert: true
+    client:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      verify-server-cert: true
+  notes: >
+    Every inbound connection must present a certificate signed by the
+    SETI CA. Connections without a valid client certificate must be
+    rejected. Authorized callers: Gateway (all Wr4ngler-facing
+    operations), Feed Wr4ngler (clearance validation on feed
+    provisioning), Policy Job (clearance definition reads).
+    Signal Clearance holds identity and clearance data — it is a
+    high-value target. Unknown caller certificates are rejected and
+    logged as security events.
+
+x-tca-observability:
+  report-outbound-calls: true
+  endpoint: https://seti-observability:4011/event
+  pattern: fire-and-forget
+  caller-name: "signal-clearance"
+  required-fields:
+    - caller
+    - callee
+    - method
+    - path
+    - status_code
+    - latency_ms
+    - protocol
+  implementation:
+    timing: wrap-every-outbound-http-call
+    non-blocking: true
+    on-failure: log-and-drop
+    do-not-instrument:
+      - seti-observability
+  notes: >
+    Report all outbound HTTP calls. Signal Clearance outbound HTTP
+    calls include the IdP JWKS endpoint (on startup and key rotation),
+    and the IdP userinfo endpoint (on refresh when introspection is
+    enabled). Redis session management is not HTTP and is instrumented
+    via structured logging only.
+
+servers:
+  - url: https://signal-clearance:4001
+    description: Internal SETI network (mTLS enforced)
+
+tags:
+  - name: auth
+    description: Federated authentication flow
+  - name: identity
+    description: Wr4ngler record management
+  - name: clearance
+    description: Clearance level management and validation
+  - name: federation
+    description: IdP configuration and AD group mapping
+  - name: session
+    description: Session management
+  - name: health
+    description: Service health
+
+paths:
+
+  # ---------------------------------------------------------------------------
+  # FEDERATED AUTHENTICATION
+  # ---------------------------------------------------------------------------
+
+  /auth/federated:
+    post:
+      tags: [auth]
+      summary: Complete federated login with IdP ID token
+      description: |
+        Called by the Gateway after exchanging an authorization code
+        for tokens at the customer IdP. The Gateway presents the
+        ID token here for validation and SETI JWT issuance.
+
+        Signal Clearance:
+        1. Validates the ID token signature against the IdP JWKS
+        2. Checks token expiry, issuer, and audience claims
+        3. Extracts identity and group membership claims
+        4. Maps group membership to a SETI clearance level
+        5. Creates or updates the Wr4ngler record
+        6. Issues a SETI JWT (15-minute TTL) carrying wrangler_id
+           and clearance_level
+        7. Issues a Redis-backed refresh token (7-day inactivity TTL)
+
+        If the identity maps to no configured clearance level: 403.
+        The Wr4ngler exists in AD but has not been granted SETI access
+        via group membership.
+
+        If no Wr4ngler record exists for this identity, one is created
+        automatically. No manual pre-registration required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FederatedAuthRequest'
+      responses:
+        '200':
+          description: Authentication successful. SETI JWT issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResult'
+        '401':
+          description: ID token invalid, expired, or failed signature validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: >
+            Identity authenticated but maps to no configured SETI
+            clearance level. Wr4ngler is not authorized for SETI access.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: >
+            IdP JWKS endpoint unreachable — cannot validate token
+            signature. Retry after IdP connectivity is restored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/refresh:
+    post:
+      tags: [session]
+      summary: Refresh an expired SETI JWT
+      description: |
+        Exchanges a valid refresh token for a new SETI JWT and
+        refresh token pair. Refresh tokens are single-use.
+
+        On refresh, Signal Clearance re-evaluates the Wr4ngler's
+        current AD group membership via the IdP userinfo endpoint
+        if introspection is enabled. If group membership has changed,
+        the new JWT reflects the updated clearance level. Clearance
+        changes in AD propagate to SETI without requiring a full
+        re-login.
+
+        If introspection is not configured, the clearance level from
+        the last successful federated login is carried forward.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: New token pair issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResult'
+        '401':
+          description: Invalid or expired refresh token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: >
+            Wr4ngler's AD group membership no longer maps to any
+            SETI clearance level. Access revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/logout:
+    post:
+      tags: [session]
+      summary: Invalidate current SETI session
+      description: |
+        Immediately invalidates the current refresh token in Redis.
+        The SETI JWT remains valid until its 15-minute TTL expires.
+        Feed Wr4ngler channel subscriptions are invalidated immediately.
+
+        Does not trigger IdP logout — the Wr4ngler's AD session is
+        unaffected. SETI session only.
+      responses:
+        '200':
+          description: Session invalidated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogoutResult'
+        '401':
+          description: No active session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # IDENTITY
+  # ---------------------------------------------------------------------------
+
+  /wranglers:
+    get:
+      tags: [identity]
+      summary: List Wr4ngler records
+      description: Admin clearance required.
+      responses:
+        '200':
+          description: Wr4ngler list returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WranglerList'
+        '403':
+          description: Insufficient clearance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /wranglers/{wrangler_id}:
+    get:
+      tags: [identity]
+      summary: Get a Wr4ngler record
+      description: |
+        Admin clearance required to view other Wr4nglers.
+        Wr4nglers may view their own record with any clearance level.
+      parameters:
+        - name: wrangler_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Wr4ngler record returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WranglerRecord'
+        '403':
+          description: Insufficient clearance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Wr4ngler not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    delete:
+      tags: [identity]
+      summary: Revoke a Wr4ngler's SETI access
+      description: |
+        Admin clearance required. Immediately invalidates all active
+        SETI sessions. Record is retained for audit. Hard deletion
+        not supported.
+
+        Note: Revokes SETI access only. To permanently prevent
+        re-access, also remove the Wr4ngler from mapped AD groups.
+      parameters:
+        - name: wrangler_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Wr4ngler SETI access revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevocationResult'
+        '403':
+          description: Insufficient clearance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Wr4ngler not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # CLEARANCE
+  # ---------------------------------------------------------------------------
+
+  /clearance/levels:
+    get:
+      tags: [clearance]
+      summary: List defined clearance levels
+      responses:
+        '200':
+          description: Clearance levels returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClearanceLevelList'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    post:
+      tags: [clearance]
+      summary: Define a new clearance level
+      description: Admin clearance required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClearanceLevelDefinition'
+      responses:
+        '201':
+          description: Clearance level defined
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClearanceLevel'
+        '400':
+          description: Invalid clearance level definition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Insufficient clearance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Clearance level name already defined
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /clearance/validate:
+    post:
+      tags: [clearance]
+      summary: Validate a Wr4ngler's clearance for a specific feed request
+      description: |
+        Called by Feed Wr4ngler on every feed provisioning request.
+        Hot path — response must be fast.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClearanceValidationRequest'
+      responses:
+        '200':
+          description: Clearance validated. Scoped token issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClearanceValidationResult'
+        '403':
+          description: Insufficient clearance for requested scope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClearanceDenial'
+        '404':
+          description: Wr4ngler not found or revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # FEDERATION CONFIGURATION
+  # ---------------------------------------------------------------------------
+
+  /federation/config:
+    get:
+      tags: [federation]
+      summary: Get current IdP federation configuration
+      description: |
+        Admin clearance required. Sensitive fields (client_secret)
+        are redacted in responses.
+      responses:
+        '200':
+          description: Federation configuration returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FederationConfig'
+        '403':
+          description: Insufficient clearance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    put:
+      tags: [federation]
+      summary: Update IdP federation configuration
+      description: |
+        Admin clearance required. Changes take effect on next
+        authentication attempt. Changing the OIDC discovery endpoint
+        triggers a JWKS refresh.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FederationConfigUpdate'
+      responses:
+        '200':
+          description: Federation configuration updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FederationConfig'
+        '400':
+          description: Invalid configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Insufficient clearance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /federation/groups:
+    get:
+      tags: [federation]
+      summary: List AD group to clearance level mappings
+      description: Admin clearance required.
+      responses:
+        '200':
+          description: Group mappings returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupMappingList'
+        '403':
+          description: Insufficient clearance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    post:
+      tags: [federation]
+      summary: Add an AD group to clearance level mapping
+      description: |
+        Admin clearance required. A Wr4ngler in multiple mapped
+        groups receives the highest clearance level among their
+        groups. Takes effect on next login or refresh.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupMapping'
+      responses:
+        '201':
+          description: Group mapping created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupMapping'
+        '400':
+          description: Invalid mapping
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Insufficient clearance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Mapping for this AD group already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /federation/groups/{group_id}:
+    delete:
+      tags: [federation]
+      summary: Remove an AD group mapping
+      description: Admin clearance required.
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+      responses:
+        '200':
+          description: Group mapping removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupMappingRemovalResult'
+        '403':
+          description: Insufficient clearance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Group mapping not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /federation/jwks/refresh:
+    post:
+      tags: [federation]
+      summary: Force a JWKS refresh from the IdP
+      description: |
+        Admin clearance required. Forces re-fetch of the IdP's
+        JSON Web Key Set. Use after an IdP key rotation that has
+        not yet propagated via the normal refresh cycle.
+      responses:
+        '200':
+          description: JWKS refreshed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JWKSRefreshResult'
+        '403':
+          description: Insufficient clearance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: IdP JWKS endpoint unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      tags: [health]
+      summary: Service health check
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  schemas:
+
+    FederatedAuthRequest:
+      type: object
+      required:
+        - id_token
+      properties:
+        id_token:
+          type: string
+          description: >
+            OIDC ID token received from the customer IdP after
+            successful authorization code exchange.
+        idp_config_id:
+          type: string
+          description: >
+            IdP configuration to validate against. Required when
+            multiple IdP configurations are registered. If only
+            one IdP is configured this field may be omitted.
+          example: "idp-primary"
+        access_token:
+          type: string
+          description: >
+            Optional. IdP access token. If provided and introspection
+            is enabled, Signal Clearance fetches current group
+            membership from the IdP userinfo endpoint.
+
+    AuthResult:
+      type: object
+      required:
+        - jwt
+        - refresh_token
+        - jwt_expires_at
+        - refresh_expires_at
+        - wrangler_id
+        - clearance_level
+        - identity_source
+      properties:
+        jwt:
+          type: string
+          description: >
+            SETI JWT. 15-minute TTL. Carries wrangler_id and
+            clearance_level. Downstream Jobs see only SETI
+            credentials — the IdP token is never forwarded.
+        refresh_token:
+          type: string
+        jwt_expires_at:
+          type: string
+          format: date-time
+        refresh_expires_at:
+          type: string
+          format: date-time
+        wrangler_id:
+          type: string
+          example: "wrnglr-a1b2c3d4"
+        clearance_level:
+          type: string
+          example: "connie-wrangler"
+        identity_source:
+          type: string
+          description: Which IdP configuration authenticated this Wr4ngler
+          example: "idp-primary"
+        clearance_source:
+          type: string
+          description: AD group that produced the clearance level
+          example: "seti-connie-wranglers"
+
+    RefreshRequest:
+      type: object
+      required:
+        - refresh_token
+      properties:
+        refresh_token:
+          type: string
+
+    LogoutResult:
+      type: object
+      required:
+        - wrangler_id
+        - sessions_invalidated
+        - logged_out_at
+      properties:
+        wrangler_id:
+          type: string
+        sessions_invalidated:
+          type: integer
+        logged_out_at:
+          type: string
+          format: date-time
+
+    WranglerRecord:
+      type: object
+      required:
+        - wrangler_id
+        - display_name
+        - ad_identity
+        - clearance_level
+        - wrangler_type
+        - status
+        - first_login_at
+        - last_login_at
+        - updated_at
+      properties:
+        wrangler_id:
+          type: string
+        display_name:
+          type: string
+          description: From IdP name claim. Updated on each login.
+          example: "Michael E. Shaffer"
+        ad_identity:
+          type: string
+          description: >
+            Stable identity claim from the IdP. Typically UPN or
+            object ID. Used to correlate returning Wr4nglers.
+          example: "michael@customer.com"
+        clearance_level:
+          type: string
+        clearance_source:
+          type: string
+          description: AD group that produced this clearance level
+        wrangler_type:
+          type: string
+          enum:
+            - connie_wrangler
+            - project_wrangler
+            - sec_wrangler
+            - ops_wrangler
+            - show_wrangler
+            - admin
+        status:
+          type: string
+          enum: [active, revoked]
+        identity_source:
+          type: string
+        first_login_at:
+          type: string
+          format: date-time
+        last_login_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    WranglerList:
+      type: object
+      required:
+        - wranglers
+        - total
+      properties:
+        wranglers:
+          type: array
+          items:
+            $ref: '#/components/schemas/WranglerRecord'
+        total:
+          type: integer
+
+    RevocationResult:
+      type: object
+      required:
+        - wrangler_id
+        - sessions_invalidated
+        - feed_subscriptions_closed
+        - revoked_at
+        - note
+      properties:
+        wrangler_id:
+          type: string
+        sessions_invalidated:
+          type: integer
+        feed_subscriptions_closed:
+          type: integer
+        revoked_at:
+          type: string
+          format: date-time
+        note:
+          type: string
+          example: >
+            SETI access revoked. Wr4ngler will regain access on next
+            login if AD group membership still maps to a SETI clearance
+            level. To permanently revoke access, remove the Wr4ngler
+            from all mapped AD groups.
+
+    SignalScope:
+      type: object
+      properties:
+        application_ids:
+          type: array
+          items:
+            type: string
+        test_tiers:
+          type: array
+          items:
+            type: string
+            enum: [contract, plot, both, "*"]
+        environments:
+          type: array
+          items:
+            type: string
+            enum: [production, staging, development, "*"]
+        feed_types:
+          type: array
+          items:
+            type: string
+            enum: [results, failures, trends, anomalies, cluster, "*"]
+
+    ClearanceLevelDefinition:
+      type: object
+      required:
+        - name
+        - description
+        - scope
+      properties:
+        name:
+          type: string
+          example: "connie-wrangler"
+        description:
+          type: string
+        scope:
+          $ref: '#/components/schemas/SignalScope'
+
+    ClearanceLevel:
+      type: object
+      required:
+        - name
+        - description
+        - scope
+        - created_at
+        - updated_at
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        scope:
+          $ref: '#/components/schemas/SignalScope'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    ClearanceLevelList:
+      type: object
+      required:
+        - levels
+        - total
+      properties:
+        levels:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClearanceLevel'
+        total:
+          type: integer
+
+    ClearanceValidationRequest:
+      type: object
+      required:
+        - wrangler_id
+        - requested_scope
+      properties:
+        wrangler_id:
+          type: string
+        requested_scope:
+          $ref: '#/components/schemas/SignalScope'
+
+    ClearanceValidationResult:
+      type: object
+      required:
+        - wrangler_id
+        - clearance_token
+        - granted_scope
+        - token_expires_at
+      properties:
+        wrangler_id:
+          type: string
+        clearance_token:
+          type: string
+          description: Short-lived token for Feed Wr4ngler channel provisioning. 5-minute TTL.
+        granted_scope:
+          $ref: '#/components/schemas/SignalScope'
+        token_expires_at:
+          type: string
+          format: date-time
+
+    ClearanceDenial:
+      type: object
+      required:
+        - wrangler_id
+        - wrangler_clearance_level
+        - requested_scope
+        - denied_dimensions
+      properties:
+        wrangler_id:
+          type: string
+        wrangler_clearance_level:
+          type: string
+        requested_scope:
+          $ref: '#/components/schemas/SignalScope'
+        denied_dimensions:
+          type: array
+          items:
+            type: string
+          example: ["feed_types: anomalies requires elevated clearance"]
+
+    FederationConfig:
+      type: object
+      required:
+        - config_id
+        - display_name
+        - oidc_discovery_url
+        - client_id
+        - audience
+        - groups_claim
+        - jwks_last_refreshed_at
+        - introspection_enabled
+      properties:
+        config_id:
+          type: string
+          example: "idp-primary"
+        display_name:
+          type: string
+          example: "Contoso Azure Entra ID"
+        oidc_discovery_url:
+          type: string
+          example: "https://login.microsoftonline.com/{tenant-id}/v2.0/.well-known/openid-configuration"
+        client_id:
+          type: string
+          example: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+        client_secret:
+          type: string
+          description: Always redacted in responses
+          example: "[REDACTED]"
+        audience:
+          type: string
+          example: "api://seti"
+        groups_claim:
+          type: string
+          description: ID token claim containing group membership
+          example: "groups"
+        name_claim:
+          type: string
+          description: ID token claim for Wr4ngler display name
+          example: "name"
+        identity_claim:
+          type: string
+          description: Stable ID token claim for Wr4ngler identification
+          example: "oid"
+        introspection_enabled:
+          type: boolean
+          description: Whether group membership is re-checked on token refresh
+        jwks_last_refreshed_at:
+          type: string
+          format: date-time
+        jwks_refresh_interval_minutes:
+          type: integer
+          example: 60
+
+    FederationConfigUpdate:
+      type: object
+      properties:
+        display_name:
+          type: string
+        oidc_discovery_url:
+          type: string
+        client_id:
+          type: string
+        client_secret:
+          type: string
+          description: Include only when rotating. Omit to leave unchanged.
+        audience:
+          type: string
+        groups_claim:
+          type: string
+        name_claim:
+          type: string
+        identity_claim:
+          type: string
+        introspection_enabled:
+          type: boolean
+        jwks_refresh_interval_minutes:
+          type: integer
+          minimum: 15
+          maximum: 1440
+
+    GroupMapping:
+      type: object
+      required:
+        - group_id
+        - group_display_name
+        - clearance_level
+      properties:
+        group_id:
+          type: string
+          description: >
+            AD group identifier as it appears in the ID token groups
+            claim. For Azure Entra ID this is the group object ID.
+          example: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+        group_display_name:
+          type: string
+          example: "SETI-Connie-Wranglers"
+        clearance_level:
+          type: string
+          example: "connie-wrangler"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    GroupMappingList:
+      type: object
+      required:
+        - mappings
+        - total
+      properties:
+        mappings:
+          type: array
+          items:
+            $ref: '#/components/schemas/GroupMapping'
+        total:
+          type: integer
+
+    GroupMappingRemovalResult:
+      type: object
+      required:
+        - group_id
+        - clearance_level_was
+        - affected_wranglers
+        - removed_at
+      properties:
+        group_id:
+          type: string
+        clearance_level_was:
+          type: string
+        affected_wranglers:
+          type: integer
+          description: >
+            Wr4nglers whose only mapped group was this one.
+            They will lose SETI access on next login or refresh.
+        removed_at:
+          type: string
+          format: date-time
+
+    JWKSRefreshResult:
+      type: object
+      required:
+        - config_id
+        - keys_loaded
+        - refreshed_at
+      properties:
+        config_id:
+          type: string
+        keys_loaded:
+          type: integer
+        refreshed_at:
+          type: string
+          format: date-time
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - idp_configs
+        - wranglers_active
+        - wranglers_revoked
+        - active_sessions
+        - clearance_levels_defined
+        - group_mappings
+        - uptime_seconds
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+          description: >
+            degraded when Redis or any IdP JWKS endpoint is unreachable.
+        idp_configs:
+          type: array
+          items:
+            type: object
+            required:
+              - config_id
+              - display_name
+              - jwks_reachable
+              - last_successful_auth
+            properties:
+              config_id:
+                type: string
+              display_name:
+                type: string
+              jwks_reachable:
+                type: boolean
+              last_successful_auth:
+                type: string
+                format: date-time
+        wranglers_active:
+          type: integer
+        wranglers_revoked:
+          type: integer
+        active_sessions:
+          type: integer
+        clearance_levels_defined:
+          type: integer
+        group_mappings:
+          type: integer
+        uptime_seconds:
+          type: integer
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          example: "NO_CLEARANCE_MAPPING"
+        message:
+          type: string
+          example: "Authenticated identity maps to no configured SETI clearance level"

@@ -1,0 +1,31 @@
+{
+  "ca": {
+    "common_name": "seti-ca",
+    "organization": "SETI",
+    "country": "US",
+    "key_bits": 4096,
+    "valid_days": 3650,
+    "backdate_minutes": 5
+  },
+  "services": [
+    { "name": "gateway",          "sans": ["gateway", "localhost"] },
+    { "name": "seti-observability", "sans": ["seti-observability", "localhost"] },
+    { "name": "signal-clearance", "sans": ["signal-clearance", "localhost"] },
+    { "name": "ui",               "sans": ["ui", "localhost"] },
+    { "name": "augur-canis",      "sans": ["augur-canis", "localhost"] },
+    { "name": "policy",           "sans": ["policy", "localhost"] },
+    { "name": "contract-test",    "sans": ["contract-test", "localhost"] },
+    { "name": "results",          "sans": ["results", "localhost"] },
+    { "name": "signal-aggregator","sans": ["signal-aggregator", "localhost"] },
+    { "name": "plot-store",       "sans": ["plot-store", "localhost"] },
+    { "name": "plot-test",        "sans": ["plot-test", "localhost"] },
+    { "name": "interactions",     "sans": ["interactions", "localhost"] },
+    { "name": "feed-wrangler",    "sans": ["feed-wrangler", "localhost"] },
+    { "name": "integration",      "sans": ["integration", "localhost"] },
+    { "name": "ai-lien",          "sans": ["ai-lien", "localhost"] },
+    { "name": "star-gazer",       "sans": ["star-gazer", "localhost"] }
+  ],
+  "output_dir": "/certs",
+  "key_bits": 2048,
+  "valid_days": 3650
+}

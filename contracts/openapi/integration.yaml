@@ -1,0 +1,889 @@
+openapi: 3.1.0
+
+info:
+  title: SETI - Integration Job
+  description: |
+    Read-only API layer for external consumption of SETI data by
+    customer tooling. Enables customers to pull SETI results, trends,
+    and health signals into their existing infrastructure — Grafana
+    dashboards, Splunk pipelines, internal reporting systems, NOC
+    displays — without requiring those systems to understand SETI's
+    internal architecture.
+
+    SCOPE:
+    External to SETI but internal to the customer network. The
+    Integration Job sits behind the Gateway and requires a valid
+    SETI JWT like any other authenticated endpoint. The difference
+    is the audience — these endpoints are designed for programmatic
+    consumption by systems, not by Wr4ngler browsers.
+
+    READ-ONLY: The Integration Job exposes no write operations.
+    It is a structured window into Results Job data, clearance-scoped
+    to the credentials of the caller.
+
+    SERVICE ACCOUNTS:
+    Customer tooling authenticates using service account credentials
+    rather than interactive AD login. A service account is an AD
+    identity with a configured clearance level — the same federated
+    auth flow as any Wr4ngler, but non-interactive. The customer
+    configures their tools with a client credential that Signal
+    Clearance validates via the IdP's client credentials grant.
+
+    VERSIONED API:
+    All Integration Job endpoints are versioned under /v1/. When
+    breaking changes are required, /v2/ is introduced alongside /v1/
+    with a defined deprecation window. Customer tooling is not broken
+    by SETI upgrades without advance notice.
+
+    RESPONSE FORMAT:
+    All responses use a consistent envelope for easy parsing by
+    automated consumers. Timestamps are always ISO 8601 UTC.
+    Financial values are always strings. Pagination is consistent
+    across all list endpoints.
+
+    Internal service — mTLS only, not externally exposed directly.
+    All Integration Job traffic enters via the Gateway.
+  version: 0.1.0
+
+x-tca-security:
+  transport: mtls
+  tls-min-version: "1.3"
+  client-cert-required: true
+  reject-without-client-cert: true
+  ca-cert: /certs/ca.crt
+  service-cert: /certs/integration.crt
+  service-key: /certs/integration.key
+  implementation:
+    server:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      require-and-verify-client-cert: true
+    client:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      verify-server-cert: true
+  notes: >
+    Every inbound connection must present a certificate signed by the
+    SETI CA. Connections without a valid client certificate must be
+    rejected. Authorized callers: Gateway only. All JWT validation
+    happens at the Gateway before requests reach this Job. The
+    Integration Job trusts the Gateway's JWT validation and the
+    clearance level passed in the X-Wrangler-Clearance header.
+
+x-tca-observability:
+  report-outbound-calls: true
+  endpoint: https://seti-observability:4011/event
+  pattern: fire-and-forget
+  caller-name: "integration"
+  required-fields:
+    - caller
+    - callee
+    - method
+    - path
+    - status_code
+    - latency_ms
+    - protocol
+  implementation:
+    timing: wrap-every-outbound-http-call
+    non-blocking: true
+    on-failure: log-and-drop
+    do-not-instrument:
+      - seti-observability
+  notes: >
+    Report all outbound HTTP calls. Integration Job's outbound calls
+    are to Results Job for data retrieval. These calls are the primary
+    signal in the observability stream for monitoring Integration Job
+    usage patterns — which applications are being queried, at what
+    frequency, by which service accounts.
+
+servers:
+  - url: https://integration:4013
+    description: Internal SETI network (mTLS enforced)
+
+tags:
+  - name: v1-applications
+    description: Application registry and health data
+  - name: v1-results
+    description: Test result queries
+  - name: v1-trends
+    description: Trend and aggregate data
+  - name: v1-cluster
+    description: Cluster-level data (elevated clearance)
+  - name: health
+    description: Service health
+
+paths:
+
+  # ---------------------------------------------------------------------------
+  # V1 — APPLICATIONS
+  # ---------------------------------------------------------------------------
+
+  /v1/applications:
+    get:
+      tags: [v1-applications]
+      summary: List applications visible to the caller
+      description: |
+        Returns applications the caller's clearance level grants
+        access to. Applications outside the caller's clearance scope
+        are not returned — they are not acknowledged to exist.
+        Useful for service accounts that need to discover which
+        applications they are authorized to query.
+      responses:
+        '200':
+          description: Application list returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationListResponse'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/applications/{application_id}/health:
+    get:
+      tags: [v1-applications]
+      summary: Get current health summary for an application
+      description: |
+        Returns the most recent Contract Test and Plot Test run
+        results for an application, plus pass rate trends.
+        Designed for consumption by monitoring systems that poll
+        for health status — Grafana, custom NOC displays, etc.
+
+        Returns 403 if the caller's clearance does not cover
+        this application.
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "app-tca-vox-prod"
+      responses:
+        '200':
+          description: Application health summary returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationHealthResponse'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Insufficient clearance for this application
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Application not found or not visible at this clearance level
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # V1 — RESULTS
+  # ---------------------------------------------------------------------------
+
+  /v1/applications/{application_id}/results/contract:
+    get:
+      tags: [v1-results]
+      summary: Query Contract Test results for an application
+      description: |
+        Returns paginated Contract Test results. Suitable for
+        consumption by log aggregators and SIEM tools that ingest
+        structured JSON events.
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: environment
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [production, staging, development]
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [passed, failed, error, timeout]
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: ISO 8601 UTC — results from this time forward
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Contract Test results returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContractResultsResponse'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Insufficient clearance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Application not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/applications/{application_id}/results/plot:
+    get:
+      tags: [v1-results]
+      summary: Query Plot Test results for an application
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: environment
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [production, staging, development]
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [passed, failed, error, timeout]
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Plot Test results returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlotResultsResponse'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Insufficient clearance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Application not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # V1 — TRENDS
+  # ---------------------------------------------------------------------------
+
+  /v1/applications/{application_id}/trends:
+    get:
+      tags: [v1-trends]
+      summary: Get test result trends for an application
+      description: |
+        Returns aggregated pass/fail rates over the specified window.
+        Designed for time-series ingestion by tools like Grafana,
+        Datadog, or custom dashboards. Pass rate is expressed as a
+        decimal string for consistent precision.
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: window
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [24h, 7d, 30d, 90d]
+            default: "24h"
+        - name: environment
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [production, staging, development]
+      responses:
+        '200':
+          description: Trend data returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrendsResponse'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Insufficient clearance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Application not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # V1 — CLUSTER (elevated clearance)
+  # ---------------------------------------------------------------------------
+
+  /v1/cluster/health:
+    get:
+      tags: [v1-cluster]
+      summary: Get cluster-wide health summary
+      description: |
+        Elevated clearance required. Returns aggregate health data
+        across all applications in the cluster. The cross-application
+        view — designed for NOC-level monitoring and executive
+        dashboards where per-application detail is less important
+        than overall cluster health posture.
+      responses:
+        '200':
+          description: Cluster health summary returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterHealthResponse'
+        '401':
+          description: Invalid or missing JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Elevated clearance required for cluster-level data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      tags: [health]
+      summary: Integration Job health check
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  schemas:
+
+    IntegrationEnvelope:
+      type: object
+      description: >
+        Standard response envelope for all Integration Job responses.
+        Consistent structure regardless of endpoint — automated
+        consumers can parse the envelope first, then the data.
+      required:
+        - api_version
+        - generated_at
+        - data
+      properties:
+        api_version:
+          type: string
+          description: API version that produced this response
+          example: "v1"
+        generated_at:
+          type: string
+          format: date-time
+          description: When this response was generated (ISO 8601 UTC)
+        data:
+          type: object
+          description: Endpoint-specific data payload
+
+    ApplicationSummary:
+      type: object
+      required:
+        - application_id
+        - display_name
+        - environments
+      properties:
+        application_id:
+          type: string
+          example: "app-tca-vox-prod"
+        display_name:
+          type: string
+          example: "TCA Vox (Production)"
+        environments:
+          type: array
+          items:
+            type: string
+            enum: [production, staging, development]
+        status:
+          type: string
+          enum: [active, paused, error]
+
+    ApplicationListResponse:
+      allOf:
+        - $ref: '#/components/schemas/IntegrationEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required:
+                - applications
+                - total
+              properties:
+                applications:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/ApplicationSummary'
+                total:
+                  type: integer
+
+    ApplicationHealthResponse:
+      allOf:
+        - $ref: '#/components/schemas/IntegrationEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required:
+                - application_id
+                - contract_tests
+                - plot_tests
+              properties:
+                application_id:
+                  type: string
+                contract_tests:
+                  type: object
+                  required:
+                    - last_run_status
+                    - last_run_at
+                    - pass_rate_24h
+                  properties:
+                    last_run_status:
+                      type: string
+                      enum: [passed, failed, error, timeout, never_run]
+                    last_run_at:
+                      type: string
+                      format: date-time
+                    last_run_failures:
+                      type: integer
+                      description: Failure count from most recent run
+                    pass_rate_24h:
+                      type: string
+                      description: Pass rate over last 24 hours as decimal string
+                      example: "0.97"
+                    consecutive_failures:
+                      type: integer
+                plot_tests:
+                  type: object
+                  required:
+                    - last_run_status
+                    - last_run_at
+                    - pass_rate_7d
+                  properties:
+                    last_run_status:
+                      type: string
+                      enum: [passed, failed, error, timeout, never_run]
+                    last_run_at:
+                      type: string
+                      format: date-time
+                    last_run_failures:
+                      type: integer
+                    pass_rate_7d:
+                      type: string
+                      description: Pass rate over last 7 days as decimal string
+                      example: "1.00"
+                    stale_plots:
+                      type: integer
+                      description: Plots flagged needs_regeneration
+
+    ContractResultsResponse:
+      allOf:
+        - $ref: '#/components/schemas/IntegrationEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required:
+                - results
+                - total
+                - limit
+                - offset
+              properties:
+                results:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - run_id
+                      - application_id
+                      - environment
+                      - status
+                      - started_at
+                      - completed_at
+                      - duration_ms
+                      - total_tests
+                      - passed
+                      - failed
+                    properties:
+                      run_id:
+                        type: string
+                      application_id:
+                        type: string
+                      environment:
+                        type: string
+                      triggered_by:
+                        type: string
+                      status:
+                        type: string
+                        enum: [passed, failed, error, timeout]
+                      started_at:
+                        type: string
+                        format: date-time
+                      completed_at:
+                        type: string
+                        format: date-time
+                      duration_ms:
+                        type: integer
+                      total_tests:
+                        type: integer
+                      passed:
+                        type: integer
+                      failed:
+                        type: integer
+                      failing_jobs:
+                        type: array
+                        items:
+                          type: string
+                        description: Job names with failures in this run
+                total:
+                  type: integer
+                limit:
+                  type: integer
+                offset:
+                  type: integer
+
+    PlotResultsResponse:
+      allOf:
+        - $ref: '#/components/schemas/IntegrationEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required:
+                - results
+                - total
+                - limit
+                - offset
+              properties:
+                results:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - run_id
+                      - application_id
+                      - environment
+                      - status
+                      - started_at
+                      - completed_at
+                      - duration_ms
+                      - total_plots
+                      - passed
+                      - failed
+                    properties:
+                      run_id:
+                        type: string
+                      application_id:
+                        type: string
+                      environment:
+                        type: string
+                      triggered_by:
+                        type: string
+                      status:
+                        type: string
+                        enum: [passed, failed, error, timeout]
+                      started_at:
+                        type: string
+                        format: date-time
+                      completed_at:
+                        type: string
+                        format: date-time
+                      duration_ms:
+                        type: integer
+                      total_plots:
+                        type: integer
+                      passed:
+                        type: integer
+                      failed:
+                        type: integer
+                      call_chains_verified:
+                        type: integer
+                      call_chains_failed:
+                        type: integer
+                total:
+                  type: integer
+                limit:
+                  type: integer
+                offset:
+                  type: integer
+
+    TrendsResponse:
+      allOf:
+        - $ref: '#/components/schemas/IntegrationEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required:
+                - application_id
+                - window
+                - contract_tests
+                - plot_tests
+              properties:
+                application_id:
+                  type: string
+                window:
+                  type: string
+                  enum: [24h, 7d, 30d, 90d]
+                contract_tests:
+                  type: object
+                  required:
+                    - total_runs
+                    - pass_rate
+                    - failure_rate
+                  properties:
+                    total_runs:
+                      type: integer
+                    pass_rate:
+                      type: string
+                      example: "0.97"
+                    failure_rate:
+                      type: string
+                      example: "0.03"
+                    most_failing_job:
+                      type: string
+                    consecutive_failures:
+                      type: integer
+                plot_tests:
+                  type: object
+                  required:
+                    - total_runs
+                    - pass_rate
+                    - failure_rate
+                  properties:
+                    total_runs:
+                      type: integer
+                    pass_rate:
+                      type: string
+                    failure_rate:
+                      type: string
+                    most_failing_plot:
+                      type: string
+                    consecutive_failures:
+                      type: integer
+
+    ClusterHealthResponse:
+      allOf:
+        - $ref: '#/components/schemas/IntegrationEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required:
+                - applications_monitored
+                - applications_healthy
+                - applications_failing
+                - applications_paused
+                - cluster_contract_pass_rate
+                - cluster_plot_pass_rate
+              properties:
+                applications_monitored:
+                  type: integer
+                applications_healthy:
+                  type: integer
+                  description: Applications with passing Contract Tests in last run
+                applications_failing:
+                  type: integer
+                  description: Applications with failures in last Contract Test run
+                applications_paused:
+                  type: integer
+                cluster_contract_pass_rate:
+                  type: string
+                  description: Aggregate contract test pass rate — 24h window
+                  example: "0.96"
+                cluster_plot_pass_rate:
+                  type: string
+                  description: Aggregate plot test pass rate — 7d window
+                  example: "0.98"
+                applications_with_recent_failures:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - application_id
+                      - last_failure_at
+                      - consecutive_failures
+                    properties:
+                      application_id:
+                        type: string
+                      last_failure_at:
+                        type: string
+                        format: date-time
+                      consecutive_failures:
+                        type: integer
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - api_version
+        - results_job_reachable
+        - requests_served
+        - uptime_seconds
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+          description: degraded when Results Job is unreachable
+        api_version:
+          type: string
+          example: "v1"
+        results_job_reachable:
+          type: boolean
+        requests_served:
+          type: integer
+          description: Total requests served since last restart
+        uptime_seconds:
+          type: integer
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+        - api_version
+      properties:
+        code:
+          type: string
+          example: "INSUFFICIENT_CLEARANCE"
+        message:
+          type: string
+          example: "Caller clearance level does not grant access to this application"
+        api_version:
+          type: string
+          example: "v1"

@@ -1,0 +1,395 @@
+openapi: 3.1.0
+
+info:
+  title: SETI - Interactions Job (Stub)
+  description: |
+    Receives structured failure escalations from Contract Test Job and
+    Plot Test Job when policy requires action beyond logging. Routes
+    escalations to the appropriate response channel based on the
+    policy action specified in the escalation request.
+
+    STUB STATUS: Alert delivery via notification channels is
+    implemented. Human-in-the-loop and AI diagnostic paths via
+    AI-lien are stubbed — the interfaces are defined and correct,
+    the implementations are deferred.
+
+    Stub behavior:
+    - alert: IMPLEMENTED — delivers to configured notification channels
+    - rollback: STUB — logs "STUB: would trigger rollback for
+      {application_id} Job {job_name} in {environment}"
+    - ai_diagnostic: STUB — logs "STUB: would call AI-lien for
+      diagnostic analysis of {failure_type} in {application_id}"
+    - human_escalation: STUB — logs "STUB: would page on-call for
+      {application_id} with severity {severity}"
+
+    When stubs are replaced, no caller changes. The escalation request
+    shape and the acknowledgment response shape are locked. Internal
+    routing logic is the only thing that changes.
+
+    The Interactions Job also handles Connie Wr4ngler notifications
+    when Plots are flagged for regeneration. This is a distinct
+    concern from failure escalation — it is an advisory notification,
+    not a failure response.
+
+    Internal service — mTLS only, not externally exposed.
+  version: 0.1.0
+
+x-tca-security:
+  transport: mtls
+  tls-min-version: "1.3"
+  client-cert-required: true
+  reject-without-client-cert: true
+  ca-cert: /certs/ca.crt
+  service-cert: /certs/interactions.crt
+  service-key: /certs/interactions.key
+  implementation:
+    server:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      require-and-verify-client-cert: true
+    client:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      verify-server-cert: true
+  notes: >
+    Every inbound connection must present a certificate signed by the
+    SETI CA. Connections without a valid client certificate must be
+    rejected. Authorized callers: Contract Test Job, Plot Test Job,
+    Plot Store Job (regeneration notifications), Policy Job
+    (configuration reads).
+
+x-tca-observability:
+  report-outbound-calls: true
+  endpoint: https://seti-observability:4011/event
+  pattern: fire-and-forget
+  caller-name: "interactions"
+  required-fields:
+    - caller
+    - callee
+    - method
+    - path
+    - status_code
+    - latency_ms
+    - protocol
+  implementation:
+    timing: wrap-every-outbound-http-call
+    non-blocking: true
+    on-failure: log-and-drop
+    do-not-instrument:
+      - seti-observability
+  notes: >
+    Report all outbound HTTP calls. Interactions Job outbound calls
+    include notification channel webhooks (implemented), AI-lien
+    diagnostic calls (stubbed), and external on-call platform APIs
+    (stubbed). All must be reported when implemented.
+
+servers:
+  - url: https://interactions:4009
+    description: Internal SETI network (mTLS enforced)
+
+tags:
+  - name: escalations
+    description: Failure escalation handling
+  - name: notifications
+    description: Advisory notifications (regeneration, status changes)
+  - name: health
+    description: Service health
+
+paths:
+
+  /escalate:
+    post:
+      tags: [escalations]
+      summary: Route a test failure escalation
+      description: |
+        Called by Contract Test Job and Plot Test Job when a test
+        run failure requires action per the policy lookup result.
+
+        The policy_action field determines routing:
+        - alert: notify configured channels (IMPLEMENTED)
+        - rollback: trigger deployment rollback (STUB)
+        - alert_and_rollback: both (alert IMPLEMENTED, rollback STUB)
+        - escalate: AI diagnostic or human escalation (STUB)
+
+        Always returns 202 — escalation is accepted and processed
+        asynchronously. Callers do not wait for delivery confirmation.
+        The test run result is already stored in Results Job before
+        this call is made.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EscalationRequest'
+            example:
+              application_id: "app-tca-vox-prod"
+              environment: "production"
+              test_tier: "contract"
+              run_id: "run-a1b2c3d4"
+              policy_action: "alert"
+              severity: "high"
+              failure_summary:
+                total_failures: 2
+                failing_jobs: ["vote-handler", "poll-builder"]
+                first_failure_at: "2026-03-27T14:00:06Z"
+              notification_channels: ["slack-ops"]
+      responses:
+        '202':
+          description: Escalation accepted for processing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EscalationAcknowledgment'
+        '400':
+          description: Invalid escalation request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /notify/regeneration:
+    post:
+      tags: [notifications]
+      summary: Notify Connie Wr4ngler that Plots need regeneration
+      description: |
+        Called by Plot Store Job when Plots are flagged for regeneration
+        after a contract version change. Sends an advisory notification
+        to the Connie Wr4ngler registered as owner of the affected
+        application.
+
+        Advisory only — does not trigger any automated action. The
+        Connie Wr4ngler decides when to regenerate the Plots.
+
+        IMPLEMENTED — notification delivery to configured channels.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegenerationNotificationRequest'
+      responses:
+        '202':
+          description: Notification accepted for delivery
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationAcknowledgment'
+        '400':
+          description: Invalid notification request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      tags: [health]
+      summary: Service health check
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  schemas:
+
+    EscalationRequest:
+      type: object
+      required:
+        - application_id
+        - environment
+        - test_tier
+        - run_id
+        - policy_action
+        - severity
+        - failure_summary
+      properties:
+        application_id:
+          type: string
+        environment:
+          type: string
+          enum: [production, staging, development]
+        test_tier:
+          type: string
+          enum: [contract, plot]
+        run_id:
+          type: string
+          description: Run ID from Results Job for full failure detail retrieval
+        policy_action:
+          type: string
+          enum: [alert, rollback, alert_and_rollback, escalate]
+        severity:
+          type: string
+          enum: [critical, high, medium, low]
+        failure_summary:
+          type: object
+          required:
+            - total_failures
+            - failing_jobs
+            - first_failure_at
+          properties:
+            total_failures:
+              type: integer
+            failing_jobs:
+              type: array
+              items:
+                type: string
+            first_failure_at:
+              type: string
+              format: date-time
+            consecutive_failure_count:
+              type: integer
+              description: How many consecutive runs have failed
+        notification_channels:
+          type: array
+          items:
+            type: string
+          description: >
+            Channel identifiers from the policy rule. Required when
+            policy_action includes alert.
+          example: ["slack-ops", "pagerduty-critical"]
+        rollback_target:
+          type: object
+          description: >
+            Present when policy_action includes rollback (STUB).
+            Deployment target information for rollback execution.
+          properties:
+            job_name:
+              type: string
+            current_version:
+              type: string
+            rollback_to_version:
+              type: string
+
+    EscalationAcknowledgment:
+      type: object
+      required:
+        - escalation_id
+        - policy_action
+        - stub_actions
+        - accepted_at
+      properties:
+        escalation_id:
+          type: string
+          description: Unique identifier for this escalation event
+          example: "esc-a1b2c3d4"
+        policy_action:
+          type: string
+        stub_actions:
+          type: array
+          items:
+            type: string
+          description: >
+            Actions that were stubbed rather than executed.
+            Empty when all actions in the policy_action are implemented.
+          example: ["rollback — STUB: would trigger rollback for app-tca-vox-prod"]
+        accepted_at:
+          type: string
+          format: date-time
+
+    RegenerationNotificationRequest:
+      type: object
+      required:
+        - application_id
+        - plots_flagged
+        - contract_changes
+      properties:
+        application_id:
+          type: string
+        plots_flagged:
+          type: integer
+          description: Number of Plots flagged for regeneration
+        contract_changes:
+          type: array
+          items:
+            type: object
+            required:
+              - job_name
+              - previous_version
+              - new_version
+            properties:
+              job_name:
+                type: string
+              previous_version:
+                type: string
+              new_version:
+                type: string
+          description: Contract version changes that triggered the flags
+        notification_channels:
+          type: array
+          items:
+            type: string
+          description: >
+            Channels to notify. Defaults to application's configured
+            Connie Wr4ngler notification channels if omitted.
+
+    NotificationAcknowledgment:
+      type: object
+      required:
+        - notification_id
+        - accepted_at
+      properties:
+        notification_id:
+          type: string
+        accepted_at:
+          type: string
+          format: date-time
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - escalations_processed
+        - alerts_delivered
+        - stub_actions_logged
+        - notifications_delivered
+        - uptime_seconds
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+        escalations_processed:
+          type: integer
+        alerts_delivered:
+          type: integer
+        stub_actions_logged:
+          type: integer
+          description: >
+            Count of stub action log entries. Non-zero is expected
+            until stubs are replaced. Useful for confirming stubs
+            are being triggered correctly during development.
+        notifications_delivered:
+          type: integer
+          description: Regeneration and advisory notifications delivered
+        uptime_seconds:
+          type: integer
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          example: "INVALID_ESCALATION"
+        message:
+          type: string
+          example: "policy_action 'rollback' requires rollback_target to be present"

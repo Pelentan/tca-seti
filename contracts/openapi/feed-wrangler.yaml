@@ -1,0 +1,559 @@
+openapi: 3.1.0
+
+info:
+  title: SETI - Feed Wr4ngler Job
+  description: |
+    Coordinates authorized signal delivery to Wr4nglers. The Feed
+    Wr4ngler is the ring boss of SETI's external delivery layer —
+    it coordinates without owning business logic, routes without
+    making policy decisions, and delivers without determining what
+    gets delivered.
+
+    Feed Wr4ngler handles three distinct concerns:
+
+    1. FEED PROVISIONING — receives a feed request from the Gateway
+       carrying a clearance token from Signal Clearance. Provisions
+       a scoped Redis pub/sub channel keyed to the Wr4ngler's
+       authorized scope. Returns the channel identifier to the
+       Gateway for SSE delivery.
+
+    2. EVENT ROUTING — subscribes to Signal Aggregator event streams
+       for each active feed's scope. When events arrive that match
+       a feed's scope, Feed Wr4ngler publishes them to the
+       appropriate scoped channel. A Wr4ngler subscribed to
+       production failures for app-tca-vox only receives events
+       that match both dimensions — the routing happens here.
+
+    3. FEED LIFECYCLE — manages connection state for all active feeds.
+       Handles idle timeouts, JWT expiry-driven closes, and explicit
+       close requests. When a feed closes, its Redis pub/sub channel
+       is cleaned up immediately.
+
+    Feed Wr4ngler is built in Elixir for the same reason TCA Blackjack's
+    Chat Service is Elixir — OTP supervision trees mean a crashed feed
+    process restarts in isolation without affecting other feeds. Under
+    high feed count or noisy event streams, individual feed processes
+    that crash do not cascade. Each feed is an isolated OTP process.
+
+    Internal service — mTLS only, not externally exposed.
+    All Wr4ngler interaction reaches Feed Wr4ngler through the Gateway.
+  version: 0.1.0
+
+x-tca-security:
+  transport: mtls
+  tls-min-version: "1.3"
+  client-cert-required: true
+  reject-without-client-cert: true
+  ca-cert: /certs/ca.crt
+  service-cert: /certs/feed-wrangler.crt
+  service-key: /certs/feed-wrangler.key
+  implementation:
+    server:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      require-and-verify-client-cert: true
+    client:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      verify-server-cert: true
+  notes: >
+    Every inbound connection must present a certificate signed by the
+    SETI CA. Connections without a valid client certificate must be
+    rejected. Authorized callers: Gateway (feed provisioning and
+    close requests), Signal Aggregator (event forwarding to active
+    feeds). Feed Wr4ngler never calls Signal Clearance directly —
+    the Gateway handles clearance validation before calling Feed
+    Wr4ngler. The clearance token arrives in the provisioning request
+    already validated.
+
+x-tca-observability:
+  report-outbound-calls: true
+  endpoint: https://seti-observability:4011/event
+  pattern: fire-and-forget
+  caller-name: "feed-wrangler"
+  required-fields:
+    - caller
+    - callee
+    - method
+    - path
+    - status_code
+    - latency_ms
+    - protocol
+  implementation:
+    timing: wrap-every-outbound-http-call
+    non-blocking: true
+    on-failure: log-and-drop
+    do-not-instrument:
+      - seti-observability
+  notes: >
+    Report all outbound HTTP calls. Feed Wr4ngler's primary outbound
+    HTTP calls are to Signal Aggregator for event stream subscription
+    management. Redis pub/sub operations are not HTTP and are
+    instrumented via structured logging only.
+
+servers:
+  - url: https://feed-wrangler:4007
+    description: Internal SETI network (mTLS enforced)
+
+tags:
+  - name: feeds
+    description: Feed provisioning and lifecycle management
+  - name: health
+    description: Service health and active feed statistics
+
+paths:
+
+  /feeds:
+    post:
+      tags: [feeds]
+      summary: Provision a new signal feed
+      description: |
+        Called by the Gateway after Signal Clearance validates the
+        Wr4ngler's clearance for the requested scope. The clearance
+        token from Signal Clearance is included in the request —
+        Feed Wr4ngler verifies the token before provisioning.
+
+        On provisioning, Feed Wr4ngler:
+        1. Verifies the clearance token (signature and TTL)
+        2. Creates an OTP process for this feed
+        3. Provisions a scoped Redis pub/sub channel
+        4. Registers the feed's scope with Signal Aggregator
+           for event routing
+        5. Returns the feed_id and channel details to the Gateway
+
+        The feed is immediately ready for SSE connection. The
+        30-second idle timeout begins from provisioning, not from
+        SSE connection. Connect promptly.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FeedProvisionRequest'
+      responses:
+        '201':
+          description: Feed provisioned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeedRecord'
+        '400':
+          description: Invalid provisioning request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Invalid or expired clearance token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      tags: [feeds]
+      summary: List active feeds
+      description: |
+        Returns all currently active feeds. Used for operational
+        monitoring — high feed count or stale feeds (open but
+        inactive) are signals worth watching.
+      responses:
+        '200':
+          description: Active feeds returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeedList'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /feeds/{feed_id}:
+    get:
+      tags: [feeds]
+      summary: Get a specific feed's state
+      parameters:
+        - name: feed_id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "feed-a1b2c3d4"
+      responses:
+        '200':
+          description: Feed record returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeedRecord'
+        '404':
+          description: Feed not found or already closed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    delete:
+      tags: [feeds]
+      summary: Close a feed
+      description: |
+        Closes the feed's OTP process, unsubscribes from Signal
+        Aggregator event routing, and releases the Redis pub/sub
+        channel. Called by the Gateway on explicit Wr4ngler close
+        request, JWT expiry, or idle timeout.
+      parameters:
+        - name: feed_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FeedCloseRequest'
+      responses:
+        '200':
+          description: Feed closed and resources released
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeedCloseResult'
+        '404':
+          description: Feed not found or already closed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /feeds/{feed_id}/publish:
+    post:
+      tags: [feeds]
+      summary: Publish an event to a feed
+      description: |
+        Called by the Signal Aggregator when it receives an event
+        matching a feed's scope. Feed Wr4ngler publishes the event
+        to the feed's Redis pub/sub channel for SSE delivery.
+
+        This is a high-frequency endpoint under active monitoring
+        conditions. Must be fast. The OTP process for the target
+        feed handles the publish — if the feed process has crashed
+        and not yet restarted, the event is dropped and logged.
+        Events are not buffered pending feed process restart.
+      parameters:
+        - name: feed_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventPublishRequest'
+      responses:
+        '202':
+          description: Event accepted for delivery
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublishResult'
+        '404':
+          description: Feed not found — event dropped
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      tags: [health]
+      summary: Service health and feed statistics
+      responses:
+        '200':
+          description: Health status returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  schemas:
+
+    SignalScope:
+      type: object
+      description: The scope of signals this feed delivers
+      properties:
+        application_ids:
+          type: array
+          items:
+            type: string
+          example: ["app-tca-vox-prod"]
+        test_tiers:
+          type: array
+          items:
+            type: string
+            enum: [contract, plot]
+        environments:
+          type: array
+          items:
+            type: string
+            enum: [production, staging, development]
+        feed_types:
+          type: array
+          items:
+            type: string
+            enum: [results, failures, trends, anomalies, cluster]
+
+    FeedProvisionRequest:
+      type: object
+      required:
+        - wrangler_id
+        - clearance_token
+        - granted_scope
+        - jwt_expires_at
+      properties:
+        wrangler_id:
+          type: string
+          description: Wr4ngler requesting the feed
+          example: "wrnglr-a1b2c3d4"
+        clearance_token:
+          type: string
+          description: >
+            Short-lived token from Signal Clearance authorizing
+            this feed provisioning. Feed Wr4ngler verifies before
+            proceeding. 5-minute TTL — must arrive promptly after
+            Signal Clearance issues it.
+        granted_scope:
+          $ref: '#/components/schemas/SignalScope'
+        jwt_expires_at:
+          type: string
+          format: date-time
+          description: >
+            Expiry of the Wr4ngler's current JWT. Feed Wr4ngler
+            uses this to schedule automatic feed closure when the
+            JWT expires — the Wr4ngler must refresh and re-provision.
+
+    FeedRecord:
+      type: object
+      required:
+        - feed_id
+        - wrangler_id
+        - scope
+        - status
+        - provisioned_at
+        - expires_at
+        - events_delivered
+      properties:
+        feed_id:
+          type: string
+          example: "feed-a1b2c3d4"
+        wrangler_id:
+          type: string
+        scope:
+          $ref: '#/components/schemas/SignalScope'
+        status:
+          type: string
+          enum: [active, idle, closing]
+          description: >
+            active — SSE connection open, events flowing.
+            idle — provisioned but no SSE connection yet, or
+            connection dropped. Closes after idle_timeout_seconds.
+            closing — close in progress.
+        provisioned_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: Tied to JWT expiry
+        idle_since:
+          type: string
+          format: date-time
+          description: Present when status is idle
+        events_delivered:
+          type: integer
+          description: Total events published to this feed since provisioning
+        last_event_at:
+          type: string
+          format: date-time
+
+    FeedList:
+      type: object
+      required:
+        - feeds
+        - total
+        - active
+        - idle
+      properties:
+        feeds:
+          type: array
+          items:
+            $ref: '#/components/schemas/FeedRecord'
+        total:
+          type: integer
+        active:
+          type: integer
+        idle:
+          type: integer
+
+    FeedCloseRequest:
+      type: object
+      required:
+        - reason
+      properties:
+        reason:
+          type: string
+          enum: [explicit, jwt_expired, idle_timeout, gateway_shutdown]
+          description: Why the feed is being closed
+        reason_detail:
+          type: string
+          description: Optional human-readable detail
+
+    FeedCloseResult:
+      type: object
+      required:
+        - feed_id
+        - events_delivered
+        - closed_at
+        - reason
+      properties:
+        feed_id:
+          type: string
+        events_delivered:
+          type: integer
+        closed_at:
+          type: string
+          format: date-time
+        reason:
+          type: string
+
+    EventPublishRequest:
+      type: object
+      required:
+        - event_type
+        - application_id
+        - payload
+        - source_timestamp
+      properties:
+        event_type:
+          type: string
+          enum:
+            - contract_test_result
+            - plot_test_result
+            - contract_test_failure
+            - plot_test_failure
+            - anomaly_detected
+            - plot_needs_regeneration
+            - application_status_change
+        application_id:
+          type: string
+        environment:
+          type: string
+        payload:
+          type: object
+          description: Event-specific data from the originating Job
+        source_timestamp:
+          type: string
+          format: date-time
+          description: When the originating event occurred
+
+    PublishResult:
+      type: object
+      required:
+        - feed_id
+        - delivered
+        - published_at
+      properties:
+        feed_id:
+          type: string
+        delivered:
+          type: boolean
+          description: >
+            True when the event was published to the Redis channel.
+            False when the feed process was unavailable — event dropped.
+        published_at:
+          type: string
+          format: date-time
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - feeds_active
+        - feeds_idle
+        - events_delivered_total
+        - events_dropped_total
+        - uptime_seconds
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+          description: >
+            degraded when Redis pub/sub is unreachable or
+            event drop rate exceeds threshold.
+        feeds_active:
+          type: integer
+        feeds_idle:
+          type: integer
+        events_delivered_total:
+          type: integer
+          description: Total events delivered across all feeds since restart
+        events_dropped_total:
+          type: integer
+          description: >
+            Events dropped due to feed process unavailability.
+            Non-zero is expected under rapid feed churn.
+            Growing without bound warrants investigation.
+        drop_rate:
+          type: string
+          description: >
+            Ratio of dropped to total events as decimal string.
+            Above 0.01 is worth investigating.
+          example: "0.002"
+        uptime_seconds:
+          type: integer
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          example: "FEED_NOT_FOUND"
+        message:
+          type: string
+          example: "Feed 'feed-a1b2c3d4' not found or already closed"

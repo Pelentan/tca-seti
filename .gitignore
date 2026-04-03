@@ -1,0 +1,183 @@
+# =============================================================================
+# SETI — Search for Erroneous Tessellated Interactions
+# .gitignore for full polyglot stack
+# Go · TypeScript · Python · Elixir
+# =============================================================================
+
+# =============================================================================
+# SECRETS AND CREDENTIALS — NEVER COMMITTED
+# =============================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+/certs/
+secrets/
+**/secrets/
+*secret*
+*credential*
+*password*
+
+# =============================================================================
+# TCA CERTIFICATES (generated at runtime by cert-init)
+# =============================================================================
+certs/
+/certs/
+**/certs/ca.crt
+**/certs/*.crt
+**/certs/*.key
+
+# =============================================================================
+# GO
+# =============================================================================
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build output
+bin/
+dist/
+build/
+
+# Test artifacts
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Module cache (not the go.sum — that IS committed)
+vendor/
+
+# =============================================================================
+# TYPESCRIPT / NODE.JS
+# =============================================================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Build output
+dist/
+build/
+.next/
+out/
+
+# Coverage
+coverage/
+*.lcov
+.nyc_output/
+
+# Type cache
+*.tsbuildinfo
+
+# =============================================================================
+# PYTHON
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.Python
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+*.egg
+MANIFEST
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.tox/
+
+# =============================================================================
+# ELIXIR / ERLANG
+# =============================================================================
+/_build/
+/cover/
+/deps/
+/doc/
+/.fetch
+erl_crash.dump
+*.ez
+*.beam
+/config/*.secret.exs
+.elixir_ls/
+
+# =============================================================================
+# DATABASE FILES (dev/test only — never production data)
+# =============================================================================
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# =============================================================================
+# DOCKER
+# =============================================================================
+.docker/
+docker-compose.override.yml
+
+# =============================================================================
+# IDE AND EDITOR
+# =============================================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+
+# =============================================================================
+# OS
+# =============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V500
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# =============================================================================
+# LOGS
+# =============================================================================
+*.log
+logs/
+log/
+
+# =============================================================================
+# TEMPORARY FILES
+# =============================================================================
+tmp/
+temp/
+.tmp/
+*.tmp
+*.bak
+*.backup
+*.orig

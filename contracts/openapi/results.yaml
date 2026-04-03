@@ -1,0 +1,852 @@
+openapi: 3.1.0
+
+info:
+  title: SETI - Results Job
+  description: |
+    Owns the historical test results database for the SETI constellation.
+    Stores Contract Test and Plot Test outcomes for all monitored
+    applications across all environments.
+
+    Results Job is the institutional memory of SETI. Every test run
+    outcome — pass, fail, error, timeout — is persisted here. Results
+    feed trend analysis, cross-application correlation, and the
+    Feed Wr4ngler's authorized signal delivery to Wr4nglers.
+
+    In the demo environment, Results Job manages its own PostgreSQL
+    database instance. In production, the underlying database is
+    managed by the infrastructure team. Results Job owns the surface.
+    The DB team owns what is behind it. This boundary is intentional
+    and must be maintained through the three-year lifecycle.
+
+    Results Job does not make policy decisions. It stores and retrieves.
+    Callers decide what to do with the data.
+
+    Internal service — mTLS only, not externally exposed.
+  version: 0.1.0
+
+x-tca-security:
+  transport: mtls
+  tls-min-version: "1.3"
+  client-cert-required: true
+  reject-without-client-cert: true
+  ca-cert: /certs/ca.crt
+  service-cert: /certs/results.crt
+  service-key: /certs/results.key
+  implementation:
+    server:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      require-and-verify-client-cert: true
+    client:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      verify-server-cert: true
+  notes: >
+    Every inbound connection must present a certificate signed by the SETI CA.
+    Connections without a valid client certificate must be rejected.
+    Authorized callers: Contract Test Job (write), Plot Test Job (write),
+    Feed Wr4ngler (read), Signal Aggregator (read for correlation),
+    Gateway (read for admin queries).
+
+x-tca-observability:
+  report-outbound-calls: true
+  endpoint: https://seti-observability:4011/event
+  pattern: fire-and-forget
+  caller-name: "results"
+  required-fields:
+    - caller
+    - callee
+    - method
+    - path
+    - status_code
+    - latency_ms
+    - protocol
+  implementation:
+    timing: wrap-every-outbound-http-call
+    non-blocking: true
+    on-failure: log-and-drop
+    do-not-instrument:
+      - seti-observability
+  notes: >
+    Report all outbound HTTP calls to the SETI Observability Job.
+    Results Job's primary traffic is inbound writes from test Jobs
+    and outbound reads for Feed Wr4ngler and Signal Aggregator.
+
+servers:
+  - url: https://results:4008
+    description: Internal SETI network (mTLS enforced)
+
+tags:
+  - name: contract-results
+    description: Contract Test run result storage and retrieval
+  - name: plot-results
+    description: Plot Test run result storage and retrieval
+  - name: trends
+    description: Trend and summary queries across result history
+  - name: health
+    description: Service health
+
+paths:
+
+  # ---------------------------------------------------------------------------
+  # CONTRACT TEST RESULTS
+  # ---------------------------------------------------------------------------
+
+  /contract-results:
+    post:
+      tags: [contract-results]
+      summary: Store a Contract Test run result
+      description: |
+        Persists a completed Contract Test run result. Called by the
+        Contract Test Job immediately after each run completes,
+        regardless of pass or fail status.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContractResultWrite'
+      responses:
+        '201':
+          description: Result stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StorageConfirmation'
+        '400':
+          description: Invalid result payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      tags: [contract-results]
+      summary: Query Contract Test results
+      description: |
+        Returns Contract Test results matching the specified filters.
+        Results are returned in reverse chronological order (newest first).
+        Used by Feed Wr4ngler when building authorized signal feeds.
+      parameters:
+        - name: application_id
+          in: query
+          required: false
+          schema:
+            type: string
+          example: "app-tca-vox-prod"
+        - name: environment
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [production, staging, development]
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [passed, failed, error, timeout]
+        - name: job_name
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter to results containing failures for this Job
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Results from this timestamp forward (ISO 8601 UTC)
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Results up to this timestamp (ISO 8601 UTC)
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Results returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContractResultPage'
+        '400':
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /contract-results/{run_id}:
+    get:
+      tags: [contract-results]
+      summary: Get a specific Contract Test result by run ID
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "run-a1b2c3d4"
+      responses:
+        '200':
+          description: Result found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContractResultRecord'
+        '404':
+          description: Result not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # PLOT TEST RESULTS
+  # ---------------------------------------------------------------------------
+
+  /plot-results:
+    post:
+      tags: [plot-results]
+      summary: Store a Plot Test run result
+      description: |
+        Persists a completed Plot Test run result. Called by the
+        Plot Test Job immediately after each run completes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlotResultWrite'
+      responses:
+        '201':
+          description: Result stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StorageConfirmation'
+        '400':
+          description: Invalid result payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      tags: [plot-results]
+      summary: Query Plot Test results
+      parameters:
+        - name: application_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: environment
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [production, staging, development]
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [passed, failed, error, timeout]
+        - name: plot_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter to results for a specific Plot
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Results returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlotResultPage'
+        '400':
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /plot-results/{run_id}:
+    get:
+      tags: [plot-results]
+      summary: Get a specific Plot Test result by run ID
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Result found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlotResultRecord'
+        '404':
+          description: Result not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # TRENDS
+  # ---------------------------------------------------------------------------
+
+  /trends/{application_id}:
+    get:
+      tags: [trends]
+      summary: Get test result trends for an application
+      description: |
+        Returns aggregated pass/fail rates and failure patterns for an
+        application over a specified time window. Used by the Feed
+        Wr4ngler to populate Wr4ngler dashboards and by the Signal
+        Aggregator for cross-application correlation analysis.
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: window
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [24h, 7d, 30d, 90d]
+            default: "24h"
+          description: Time window for trend calculation
+        - name: environment
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [production, staging, development]
+      responses:
+        '200':
+          description: Trends returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationTrends'
+        '404':
+          description: Application not found or no results in window
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /trends/cluster:
+    get:
+      tags: [trends]
+      summary: Get cluster-wide test result trends
+      description: |
+        Returns aggregated trends across all registered applications.
+        The cross-application view. Used by the Signal Aggregator for
+        anomaly detection and by admin feeds.
+      parameters:
+        - name: window
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [24h, 7d, 30d, 90d]
+            default: "24h"
+        - name: environment
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [production, staging, development]
+      responses:
+        '200':
+          description: Cluster trends returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterTrends'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      tags: [health]
+      summary: Service health check
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  schemas:
+
+    ContractResultWrite:
+      type: object
+      required:
+        - run_id
+        - application_id
+        - environment
+        - triggered_by
+        - status
+        - started_at
+        - completed_at
+        - duration_ms
+        - summary
+        - cache_status
+      properties:
+        run_id:
+          type: string
+          example: "run-a1b2c3d4"
+        application_id:
+          type: string
+          example: "app-tca-vox-prod"
+        environment:
+          type: string
+          enum: [production, staging, development]
+        triggered_by:
+          type: string
+          enum: [scheduler, deployment, manual, seti-self]
+        status:
+          type: string
+          enum: [passed, failed, error, timeout]
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+        duration_ms:
+          type: integer
+        summary:
+          type: object
+          required: [total, passed, failed, skipped]
+          properties:
+            total:
+              type: integer
+            passed:
+              type: integer
+            failed:
+              type: integer
+            skipped:
+              type: integer
+        failures:
+          type: array
+          items:
+            type: object
+            required: [job_name, endpoint, test_type, detail]
+            properties:
+              job_name:
+                type: string
+              endpoint:
+                type: string
+              test_type:
+                type: string
+              expected_status:
+                type: integer
+              actual_status:
+                type: integer
+              expected_field:
+                type: string
+              detail:
+                type: string
+        policy_action:
+          type: string
+          enum: [none, alert, rollback, alert_and_rollback, escalate]
+        cache_status:
+          type: string
+          enum: [cache_hit, cache_miss, cache_refreshed, cache_unavailable]
+        cache_refresh_reason:
+          type: string
+
+    ContractResultRecord:
+      allOf:
+        - $ref: '#/components/schemas/ContractResultWrite'
+        - type: object
+          required:
+            - stored_at
+          properties:
+            stored_at:
+              type: string
+              format: date-time
+
+    ContractResultPage:
+      type: object
+      required:
+        - results
+        - total
+        - limit
+        - offset
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContractResultRecord'
+        total:
+          type: integer
+          description: Total matching results (before pagination)
+        limit:
+          type: integer
+        offset:
+          type: integer
+
+    PlotResultWrite:
+      type: object
+      required:
+        - run_id
+        - application_id
+        - environment
+        - triggered_by
+        - status
+        - started_at
+        - completed_at
+        - duration_ms
+        - summary
+      properties:
+        run_id:
+          type: string
+        application_id:
+          type: string
+        environment:
+          type: string
+          enum: [production, staging, development]
+        triggered_by:
+          type: string
+          enum: [scheduler, deployment, manual, seti-self]
+        status:
+          type: string
+          enum: [passed, failed, error, timeout]
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+        duration_ms:
+          type: integer
+        summary:
+          type: object
+          required: [total_plots, passed, failed, skipped, stale_plots_run]
+          properties:
+            total_plots:
+              type: integer
+            passed:
+              type: integer
+            failed:
+              type: integer
+            skipped:
+              type: integer
+            stale_plots_run:
+              type: integer
+              description: >
+                Plots with needs_regeneration status that were run anyway.
+                Results for these are tagged as potentially stale.
+        plot_results:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlotRunResult'
+
+    PlotRunResult:
+      type: object
+      required:
+        - plot_id
+        - plot_name
+        - status
+        - duration_ms
+        - stale
+      properties:
+        plot_id:
+          type: string
+        plot_name:
+          type: string
+        status:
+          type: string
+          enum: [passed, failed, error]
+        duration_ms:
+          type: integer
+        stale:
+          type: boolean
+          description: True when plot had needs_regeneration status at run time
+        failed_step:
+          type: integer
+          description: Step number where failure occurred (present when failed)
+        failure_detail:
+          type: string
+          description: >
+            Human-readable failure description. Includes both response
+            assertion failures and call chain verification failures.
+        call_chain_verified:
+          type: boolean
+          description: >
+            Whether the expected inter-service call chain was confirmed
+            in the Signal Aggregator event stream.
+
+    PlotResultRecord:
+      allOf:
+        - $ref: '#/components/schemas/PlotResultWrite'
+        - type: object
+          required:
+            - stored_at
+          properties:
+            stored_at:
+              type: string
+              format: date-time
+
+    PlotResultPage:
+      type: object
+      required:
+        - results
+        - total
+        - limit
+        - offset
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlotResultRecord'
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+
+    StorageConfirmation:
+      type: object
+      required:
+        - run_id
+        - stored_at
+      properties:
+        run_id:
+          type: string
+        stored_at:
+          type: string
+          format: date-time
+
+    ApplicationTrends:
+      type: object
+      required:
+        - application_id
+        - window
+        - contract_tests
+        - plot_tests
+        - generated_at
+      properties:
+        application_id:
+          type: string
+        window:
+          type: string
+          enum: [24h, 7d, 30d, 90d]
+        contract_tests:
+          $ref: '#/components/schemas/TierTrends'
+        plot_tests:
+          $ref: '#/components/schemas/TierTrends'
+        generated_at:
+          type: string
+          format: date-time
+
+    TierTrends:
+      type: object
+      required:
+        - total_runs
+        - pass_rate
+        - most_failing_job
+        - most_failing_endpoint
+      properties:
+        total_runs:
+          type: integer
+        pass_rate:
+          type: string
+          description: Pass rate as decimal string e.g. "0.97"
+        failure_rate:
+          type: string
+          description: Failure rate as decimal string e.g. "0.03"
+        most_failing_job:
+          type: string
+          description: Job name with highest failure count in window. Null if no failures.
+        most_failing_endpoint:
+          type: string
+          description: Endpoint with highest failure count. Null if no failures.
+        consecutive_failures:
+          type: integer
+          description: Current run of consecutive failures. 0 if last run passed.
+
+    ClusterTrends:
+      type: object
+      required:
+        - window
+        - applications_monitored
+        - cluster_contract_pass_rate
+        - cluster_plot_pass_rate
+        - applications_with_failures
+        - generated_at
+      properties:
+        window:
+          type: string
+          enum: [24h, 7d, 30d, 90d]
+        applications_monitored:
+          type: integer
+        cluster_contract_pass_rate:
+          type: string
+          description: Aggregate contract test pass rate across all applications
+        cluster_plot_pass_rate:
+          type: string
+          description: Aggregate plot test pass rate across all applications
+        applications_with_failures:
+          type: array
+          items:
+            type: object
+            required:
+              - application_id
+              - failure_count
+              - last_failure_at
+            properties:
+              application_id:
+                type: string
+              failure_count:
+                type: integer
+              last_failure_at:
+                type: string
+                format: date-time
+        generated_at:
+          type: string
+          format: date-time
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - contract_results_stored
+        - plot_results_stored
+        - uptime_seconds
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+          description: >
+            degraded when database connection is unhealthy.
+        contract_results_stored:
+          type: integer
+          description: Total contract test results in database
+        plot_results_stored:
+          type: integer
+          description: Total plot test results in database
+        uptime_seconds:
+          type: integer
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          example: "RESULT_NOT_FOUND"
+        message:
+          type: string
+          example: "Run 'run-a1b2c3d4' not found"

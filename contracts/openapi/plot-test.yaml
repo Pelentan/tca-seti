@@ -1,0 +1,571 @@
+openapi: 3.1.0
+
+info:
+  title: SETI - Plot Test Job
+  description: |
+    Executes AI-generated Plot scenarios against registered TCA
+    applications. The tier-two testing Job in the SETI constellation.
+
+    Where the Contract Test Job validates that a Job's surface is
+    technically correct, the Plot Test Job validates that the
+    constellation navigates correctly — stateful sequences work,
+    semantic assertions hold, and inter-service call chains match
+    what the Connie Wr4ngler documented when building the application.
+
+    A Plot Test run for an application:
+    1. Loads all current and needs_regeneration Plots from Plot Store
+    2. Executes each Plot's steps in sequence against the application
+       gateway
+    3. After each step, queries Signal Aggregator to verify the
+       expected call chain occurred in the observability stream
+    4. Evaluates semantic assertions on each step's response
+    5. Reports per-Plot results and the overall run outcome to
+       the Results Job
+    6. On failure, looks up policy from the Policy Job and routes
+       to the Interactions Job accordingly
+
+    Plots with needs_regeneration status are executed but their results
+    are tagged as potentially stale. The Connie Wr4ngler is notified
+    via the Interactions Job that regeneration is needed.
+
+    Plot Test runs are triggered two ways:
+    - Scheduled: daily per application (configurable in Policy Job)
+    - Deployment: when the Policy Job detects a deployment event
+      for a registered application
+
+    Plot Test runs are longer and more resource-intensive than
+    Contract Test runs. They are not designed for production-frequency
+    execution. Timeout is configurable per application — default
+    5 minutes for the full suite.
+
+    Internal service — mTLS only, not externally exposed.
+  version: 0.1.0
+
+x-tca-security:
+  transport: mtls
+  tls-min-version: "1.3"
+  client-cert-required: true
+  reject-without-client-cert: true
+  ca-cert: /certs/ca.crt
+  service-cert: /certs/plot-test.crt
+  service-key: /certs/plot-test.key
+  implementation:
+    server:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      require-and-verify-client-cert: true
+    client:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      verify-server-cert: true
+  notes: >
+    Every inbound connection must present a certificate signed by the
+    SETI CA. Connections without a valid client certificate must be
+    rejected. Authorized callers: Gateway (manual run triggers),
+    Policy Job (scheduled and deployment-triggered runs).
+    Plot Test Job makes outbound calls to: Plot Store (load Plots),
+    Signal Aggregator (call chain verification), Policy Job (policy
+    lookup on failure), Results Job (store results), Interactions Job
+    (escalation routing), and the target application's gateway
+    (executing Plot steps). All outbound calls use mTLS.
+
+x-tca-observability:
+  report-outbound-calls: true
+  endpoint: https://seti-observability:4011/event
+  pattern: fire-and-forget
+  caller-name: "plot-test"
+  required-fields:
+    - caller
+    - callee
+    - method
+    - path
+    - status_code
+    - latency_ms
+    - protocol
+  implementation:
+    timing: wrap-every-outbound-http-call
+    non-blocking: true
+    on-failure: log-and-drop
+    do-not-instrument:
+      - seti-observability
+  notes: >
+    Report all outbound HTTP calls. Plot Test Job has the highest
+    outbound call diversity in the constellation — it calls Plot Store,
+    Signal Aggregator, Policy Job, Results Job, Interactions Job, and
+    the target application gateway. All must be reported. The target
+    application gateway calls are especially valuable in the
+    observability stream — they show which Plots are executing and
+    how the target application responds.
+
+servers:
+  - url: https://plot-test:4004
+    description: Internal SETI network (mTLS enforced)
+
+tags:
+  - name: runs
+    description: Plot test run lifecycle
+  - name: health
+    description: Service health
+
+paths:
+
+  /run:
+    post:
+      tags: [runs]
+      summary: Execute a Plot test run for a registered application
+      description: |
+        Triggers a full Plot test run for the specified application.
+        Loads all current Plots from Plot Store, executes them in
+        sequence, verifies call chains against Signal Aggregator,
+        and reports results to the Results Job.
+
+        Run is synchronous — response is returned when all Plots
+        have executed or the run times out. Default timeout: 5 minutes.
+
+        Individual Plot execution failures do not abort the run —
+        all Plots are attempted regardless of prior failures. This
+        ensures a single broken Plot does not mask other failures.
+
+        On completion, if any Plots failed, the policy lookup and
+        Interactions Job routing happen after all Plots have run,
+        not after each individual failure. The overall run result
+        is the input to the policy decision.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlotRunRequest'
+            example:
+              application_id: "app-tca-vox-prod"
+              environment: "production"
+              triggered_by: "scheduler"
+      responses:
+        '200':
+          description: Run completed — results available (pass or fail)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlotRunResult'
+        '400':
+          description: Invalid run request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Application not found in registry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '408':
+          description: Run timed out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlotRunTimeoutError'
+        '500':
+          description: Internal error — run could not be executed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /run/{run_id}:
+    get:
+      tags: [runs]
+      summary: Retrieve a completed Plot test run result
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "prun-a1b2c3d4"
+      responses:
+        '200':
+          description: Run result found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlotRunResult'
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      tags: [health]
+      summary: Service health check
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  schemas:
+
+    PlotRunRequest:
+      type: object
+      required:
+        - application_id
+        - environment
+        - triggered_by
+      properties:
+        application_id:
+          type: string
+          example: "app-tca-vox-prod"
+        environment:
+          type: string
+          enum: [production, staging, development]
+        triggered_by:
+          type: string
+          enum: [scheduler, deployment, manual, seti-self]
+        plot_filter:
+          type: array
+          items:
+            type: string
+          description: >
+            Optional. If provided, only execute the specified Plot IDs.
+            If omitted, all current and needs_regeneration Plots run.
+          example: ["plot-a1b2c3d4", "plot-b2c3d4e5"]
+        timeout_override_seconds:
+          type: integer
+          minimum: 60
+          maximum: 600
+          description: >
+            Override the application's configured timeout for this run.
+            Use when manually triggering a run with known slow Plots.
+
+    StepResult:
+      type: object
+      required:
+        - step_number
+        - description
+        - status
+        - duration_ms
+        - call_chain_verified
+      properties:
+        step_number:
+          type: integer
+        description:
+          type: string
+        status:
+          type: string
+          enum: [passed, failed, skipped]
+          description: >
+            skipped when a prior step failed and subsequent steps
+            depend on captured values from it.
+        duration_ms:
+          type: integer
+        actual_status_code:
+          type: integer
+          description: HTTP status code received from the application
+        expected_status_code:
+          type: integer
+        call_chain_verified:
+          type: boolean
+          description: >
+            Whether the expected inter-service call chain was confirmed
+            in the Signal Aggregator event stream for this step.
+        call_chain_detail:
+          $ref: '#/components/schemas/CallChainDetail'
+        assertion_results:
+          type: array
+          items:
+            $ref: '#/components/schemas/AssertionResult'
+        failure_reason:
+          type: string
+          description: >
+            Present when status is failed. Human-readable description
+            of what failed and what was expected.
+          example: >
+            Expected field 'balance' to equal '100.00' but received '0.00'.
+            Vote submission appears to have succeeded but balance was not
+            updated. Possible sync gap between vote-handler and bank-service.
+
+    CallChainDetail:
+      type: object
+      required:
+        - expected_calls
+        - verification_window_ms
+        - verified
+      properties:
+        expected_calls:
+          type: integer
+          description: Number of calls in the expected chain for this step
+        observed_calls:
+          type: integer
+          description: Number of expected calls found in the event stream
+        verification_window_ms:
+          type: integer
+          description: Time window used for Signal Aggregator verification query
+        verified:
+          type: boolean
+        missing_calls:
+          type: array
+          items:
+            type: object
+            properties:
+              caller:
+                type: string
+              callee:
+                type: string
+              path_pattern:
+                type: string
+          description: Expected calls not found in the event stream
+        latency_exceeded_calls:
+          type: array
+          items:
+            type: object
+            properties:
+              caller:
+                type: string
+              callee:
+                type: string
+              expected_max_ms:
+                type: integer
+              observed_ms:
+                type: integer
+          description: Calls found but exceeding configured max latency
+
+    AssertionResult:
+      type: object
+      required:
+        - field
+        - operator
+        - passed
+      properties:
+        field:
+          type: string
+          example: "balance"
+        operator:
+          type: string
+        expected_value:
+          description: The value the assertion expected
+        actual_value:
+          description: The value actually present in the response
+        passed:
+          type: boolean
+
+    PlotResult:
+      type: object
+      required:
+        - plot_id
+        - plot_name
+        - status
+        - stale
+        - duration_ms
+        - steps_total
+        - steps_passed
+        - steps_failed
+        - steps_skipped
+        - call_chains_verified
+        - step_results
+      properties:
+        plot_id:
+          type: string
+        plot_name:
+          type: string
+        status:
+          type: string
+          enum: [passed, failed, error]
+          description: >
+            passed — all steps passed and all call chains verified.
+            failed — one or more steps failed or call chain unverified.
+            error — Plot could not be executed (infrastructure issue).
+        stale:
+          type: boolean
+          description: >
+            True when the Plot had needs_regeneration status at
+            run time. Results are valid but may not reflect the
+            current contract version.
+        duration_ms:
+          type: integer
+        steps_total:
+          type: integer
+        steps_passed:
+          type: integer
+        steps_failed:
+          type: integer
+        steps_skipped:
+          type: integer
+        call_chains_verified:
+          type: integer
+          description: Number of steps where call chain verification passed
+        call_chains_failed:
+          type: integer
+          description: Number of steps where call chain verification failed
+        step_results:
+          type: array
+          items:
+            $ref: '#/components/schemas/StepResult'
+
+    PlotRunResult:
+      type: object
+      required:
+        - run_id
+        - application_id
+        - environment
+        - triggered_by
+        - status
+        - started_at
+        - completed_at
+        - duration_ms
+        - summary
+        - plot_results
+      properties:
+        run_id:
+          type: string
+          example: "prun-a1b2c3d4"
+        application_id:
+          type: string
+        environment:
+          type: string
+          enum: [production, staging, development]
+        triggered_by:
+          type: string
+          enum: [scheduler, deployment, manual, seti-self]
+        status:
+          type: string
+          enum: [passed, failed, error, timeout]
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+        duration_ms:
+          type: integer
+        summary:
+          type: object
+          required:
+            - total_plots
+            - passed
+            - failed
+            - errored
+            - stale_plots_run
+            - call_chains_verified
+            - call_chains_failed
+          properties:
+            total_plots:
+              type: integer
+            passed:
+              type: integer
+            failed:
+              type: integer
+            errored:
+              type: integer
+            stale_plots_run:
+              type: integer
+              description: Plots flagged needs_regeneration that were executed
+            call_chains_verified:
+              type: integer
+              description: Total step-level call chain verifications that passed
+            call_chains_failed:
+              type: integer
+        plot_results:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlotResult'
+        policy_action:
+          type: string
+          enum: [none, alert, rollback, alert_and_rollback, escalate]
+          description: Action taken per policy lookup. none when status is passed.
+
+    PlotRunTimeoutError:
+      type: object
+      required:
+        - run_id
+        - application_id
+        - timed_out_at_seconds
+        - plots_completed
+        - plots_pending
+        - partial_results
+      properties:
+        run_id:
+          type: string
+        application_id:
+          type: string
+        timed_out_at_seconds:
+          type: integer
+        plots_completed:
+          type: array
+          items:
+            type: string
+          description: Plot IDs that completed before timeout
+        plots_pending:
+          type: array
+          items:
+            type: string
+          description: Plot IDs that had not started when timeout occurred
+        partial_results:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlotResult'
+          description: Results for completed Plots — preserved for diagnostic use
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - runs_completed
+        - runs_failed
+        - runs_errored
+        - plots_executed_total
+        - call_chains_verified_total
+        - call_chains_failed_total
+        - uptime_seconds
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+          description: >
+            degraded when Plot Store, Signal Aggregator, Results Job,
+            or Policy Job are unreachable.
+        runs_completed:
+          type: integer
+        runs_failed:
+          type: integer
+        runs_errored:
+          type: integer
+        plots_executed_total:
+          type: integer
+        call_chains_verified_total:
+          type: integer
+        call_chains_failed_total:
+          type: integer
+          description: >
+            Growing call chain failure count without corresponding
+            contract test failures may indicate observability stream
+            gaps rather than application failures.
+        uptime_seconds:
+          type: integer
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          example: "APPLICATION_NOT_FOUND"
+        message:
+          type: string
+          example: "Application 'app-tca-vox-prod' not found in registry"

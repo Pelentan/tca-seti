@@ -1,0 +1,302 @@
+openapi: 3.1.0
+
+info:
+  title: SETI - UI Job
+  description: |
+    Serves the SETI monitoring dashboard. A functional, no-frills
+    single-page application that gives Wr4nglers real-time visibility
+    into constellation health, test results, and the SETI observability
+    event stream.
+
+    Design philosophy: correct and fast over pretty. The dashboard
+    exists to surface signal clearly — not to impress. Wr4nglers
+    using this are looking for problems. Everything in the UI serves
+    that purpose or it does not belong.
+
+    The UI Job serves static assets and a thin API proxy layer. It
+    does not contain business logic. All data comes from the Gateway's
+    authenticated endpoints. The UI authenticates via the federated
+    AD login flow — it redirects to the customer IdP and handles
+    the OIDC callback, then stores the SETI JWT for subsequent
+    Gateway calls.
+
+    INITIAL SCOPE:
+    - Landing page: live SETI observability event stream (seti:events)
+    - Application health summary: Contract Test pass rates per application
+    - Recent failures panel: last N contract and plot test failures
+    - Wr4ngler identity display: who is logged in, clearance level
+
+    The observability feed is the centerpiece. Wr4nglers land on a
+    live view of what SETI is seeing across all applications they
+    are cleared to observe. The feed auto-connects on login using
+    the Wr4ngler's clearance-appropriate scope.
+
+    TypeScript/React. Served by a lightweight Go static file server
+    with OIDC callback handling. The Go layer handles the auth
+    redirect and callback — the React layer handles everything
+    after the SETI JWT is issued.
+
+    Externally exposed via the Gateway on port 4000. The UI is the
+    only Job whose assets cross the external boundary to a browser.
+  version: 0.1.0
+
+x-tca-security:
+  external-transport: tls
+  internal-transport: mtls
+  notes: >
+    The UI Job has a split security posture identical to the Gateway.
+    External (browser-facing): standard TLS. Serves static assets and
+    handles the OIDC redirect/callback. No JWT required for the login
+    flow or static asset delivery.
+    Internal (service-to-service): UI Job acts as mTLS client when
+    calling Gateway API endpoints from its server-side proxy layer.
+    The browser never calls internal Jobs directly — all API calls
+    go through the Gateway.
+  internal-client:
+    load-ca-cert: /certs/ca.crt
+    load-service-cert: /certs/ui.crt
+    load-service-key: /certs/ui.key
+    verify-server-cert: true
+
+x-tca-observability:
+  report-outbound-calls: true
+  endpoint: https://seti-observability:4011/event
+  pattern: fire-and-forget
+  caller-name: "ui"
+  required-fields:
+    - caller
+    - callee
+    - method
+    - path
+    - status_code
+    - latency_ms
+    - protocol
+  implementation:
+    timing: wrap-every-outbound-http-call
+    non-blocking: true
+    on-failure: log-and-drop
+    do-not-instrument:
+      - seti-observability
+  notes: >
+    Report outbound HTTP calls from the UI Job's server-side layer —
+    specifically the OIDC token exchange call to the IdP and any
+    server-side Gateway proxy calls. Browser-to-Gateway calls are
+    not reported here — the Gateway reports those from its own
+    observability instrumentation.
+
+servers:
+  - url: https://seti.cluster.internal
+    description: UI served via Gateway external port (TLS)
+
+tags:
+  - name: auth
+    description: OIDC authentication redirect and callback
+  - name: assets
+    description: Static asset delivery
+  - name: health
+    description: Service health
+
+paths:
+
+  /login:
+    get:
+      tags: [auth]
+      summary: Initiate federated login
+      description: |
+        Entry point for Wr4ngler authentication. Redirects the
+        browser to the customer IdP's OIDC authorization endpoint.
+        No JWT required — this is the unauthenticated entry point.
+
+        Generates a state parameter and PKCE code challenge, stores
+        them in a short-lived server-side session, and redirects.
+        The state parameter prevents CSRF on the callback.
+      responses:
+        '302':
+          description: Redirect to customer IdP authorization endpoint
+          headers:
+            Location:
+              schema:
+                type: string
+              description: IdP authorization URL with OIDC parameters
+        '503':
+          description: IdP configuration not available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/callback:
+    get:
+      tags: [auth]
+      summary: Handle OIDC authorization callback
+      description: |
+        Receives the authorization code from the customer IdP after
+        successful authentication. The UI Job:
+        1. Validates the state parameter against the stored value
+        2. Exchanges the authorization code for tokens at the IdP
+        3. Presents the ID token to Signal Clearance via the Gateway
+        4. Receives the SETI JWT and refresh token
+        5. Stores the refresh token in an httpOnly cookie
+        6. Redirects the browser to the dashboard with the JWT
+
+        On any failure, redirects to /login with an error indicator.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Authorization code from the IdP
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+          description: State parameter for CSRF validation
+        - name: error
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Error code if the IdP denied the request
+        - name: error_description
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '302':
+          description: >
+            Redirect to dashboard on success, or to /login with
+            error indicator on failure.
+          headers:
+            Location:
+              schema:
+                type: string
+            Set-Cookie:
+              schema:
+                type: string
+              description: >
+                httpOnly refresh token cookie on success.
+                Secure, SameSite=Strict.
+        '500':
+          description: Internal error during token exchange
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /:
+    get:
+      tags: [assets]
+      summary: Serve the dashboard SPA
+      description: |
+        Serves the React SPA entry point. JWT required in Authorization
+        header or httpOnly cookie. If no valid JWT is present, redirects
+        to /login.
+
+        The SPA handles all routing client-side after initial load.
+        All /app/* paths serve the same index.html — React Router
+        handles the rest.
+      responses:
+        '200':
+          description: Dashboard HTML returned
+          content:
+            text/html:
+              schema:
+                type: string
+        '302':
+          description: Redirect to /login — no valid JWT present
+          headers:
+            Location:
+              schema:
+                type: string
+              example: "/login"
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /assets/{path}:
+    get:
+      tags: [assets]
+      summary: Serve static assets
+      description: |
+        Serves compiled React assets — JavaScript bundles, CSS,
+        fonts, and icons. No authentication required for static assets.
+        Cache headers set for long-term caching with content-hash
+        filenames.
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Asset returned
+        '404':
+          description: Asset not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      tags: [health]
+      summary: UI Job health check
+      description: No authentication required.
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  schemas:
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - gateway_reachable
+        - idp_configured
+        - uptime_seconds
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+          description: >
+            degraded when Gateway is unreachable or IdP
+            configuration is missing.
+        gateway_reachable:
+          type: boolean
+        idp_configured:
+          type: boolean
+          description: Whether OIDC configuration is present and valid
+        uptime_seconds:
+          type: integer
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          example: "IDP_UNAVAILABLE"
+        message:
+          type: string
+          example: "Customer IdP is not reachable — login unavailable"

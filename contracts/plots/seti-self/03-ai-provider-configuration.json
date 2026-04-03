@@ -1,0 +1,37 @@
+{
+  "name": "AI Provider Configuration",
+  "description": "Registers an AI provider with Policy and verifies it is retrievable. Does not attempt to refresh models (Ollama may not be running in all environments) — that step is exercised manually via the Admin panel. Tests the configuration storage pathway.",
+  "application_id": "seti-self",
+  "author": "seti-self",
+  "version": "1.0.0",
+  "tags": ["policy", "ai-lien", "configuration"],
+  "steps": [
+    {
+      "step_number": 1,
+      "description": "Register a test AI provider with Policy",
+      "method": "POST",
+      "path": "/ai-providers",
+      "body": {
+        "name": "Plot Test Provider",
+        "ollama_url": "http://host.docker.internal:11434",
+        "description": "Created by the AI Provider Configuration plot test"
+      },
+      "expected_status": 201,
+      "expected_chain": [
+        { "caller": "gateway", "callee": "policy", "method": "POST", "path": "/ai-providers" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 2,
+      "description": "Verify the provider list includes the registered provider",
+      "method": "GET",
+      "path": "/ai-providers",
+      "expected_status": 200,
+      "expected_chain": [
+        { "caller": "gateway", "callee": "policy", "method": "GET", "path": "/ai-providers" }
+      ],
+      "verify_within_seconds": 10
+    }
+  ]
+}

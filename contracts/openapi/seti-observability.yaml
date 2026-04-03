@@ -1,0 +1,223 @@
+openapi: 3.1.0
+info:
+  title: SETI - seti-observability
+  description: |
+    Inter-service event collector and publisher. Go · Scratch container.
+
+    Receives event reports from all Jobs (contract obligation: x-tca-observability).
+    Validates caller against allowlist. Sanitizes sensitive data from paths.
+    Publishes clean events to Redis seti:events pub/sub channel.
+    Gateway subscribes to seti:events and fans to SSE clients.
+
+    Fire-and-forget from callers — Observability Job always returns 202.
+    Never on the critical path.
+
+    The Observability Job itself does not report outbound calls —
+    doing so would create a reporting loop. The absence of x-tca-observability
+    in this contract is intentional and must not be added.
+
+    Scratch container: no shell, no package manager, no OS utilities beyond
+    the static binary. Minimal attack surface — this service receives traffic
+    from every other Job in the constellation.
+
+    Known callers (SETI constellation):
+      gateway, signal-clearance, policy, contract-test, plot-test, plot-store,
+      signal-aggregator, feed-wrangler, results, interactions, augur-canis, ai-lien,
+      integration
+
+    Internal service — mTLS only. Not externally exposed.
+    Ported from TCA Vox with SETI allowlist.
+  version: 0.1.0
+
+x-tca-security:
+  transport: mtls
+  tls-min-version: "1.3"
+  client-cert-required: true
+  reject-without-client-cert: true
+  ca-cert: /certs/ca.crt
+  service-cert: /certs/seti-observability.crt
+  service-key: /certs/seti-observability.key
+  implementation:
+    server:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      require-and-verify-client-cert: true
+    client:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      verify-server-cert: true
+  notes: >
+    Every inbound connection must present a certificate signed by the TCA CA.
+    Connections without a valid client certificate must be rejected — not
+    downgraded to unauthenticated.
+
+servers:
+  - url: https://seti-observability:4011
+    description: Internal Docker network (mTLS enforced)
+
+tags:
+  - name: events
+    description: Event ingestion
+  - name: debug
+    description: Development and debugging endpoints
+  - name: health
+    description: Service health
+
+paths:
+  /health:
+    get:
+      summary: Service health
+      tags: [health]
+      responses:
+        '200':
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /event:
+    post:
+      summary: Receive an inter-service event report
+      description: |
+        Always returns 202 — even if the event is dropped due to allowlist
+        failure or sanitization. Callers see a uniform response. This is
+        consistent with fire-and-forget: callers are not equipped to handle
+        differentiated responses.
+
+        id and timestamp are assigned here — callers do not generate them.
+
+        Allowlist (SETI constellation):
+          gateway, signal-clearance, policy, contract-test, plot-test, plot-store,
+          signal-aggregator, feed-wrangler, results, interactions, augur-canis, ai-lien,
+          integration
+
+        Unknown callers or callees are dropped silently. Caller receives 202.
+        Silent drop prevents allowlist probing by a compromised service.
+
+        Path sanitization before Redis publish:
+          - JWT tokens (eyJ...) → [token]
+          - IPv4/IPv6 addresses → [ip]
+          - UUIDs → [id]
+          - Query string values → key=[redacted]
+      tags: [events]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventReport'
+            example:
+              caller: poll-wr4ngler
+              callee: redis-handler
+              method: POST
+              path: /vote
+              status_code: 202
+              latency_ms: 3
+              protocol: mtls
+      responses:
+        '202':
+          description: Event received (accepted or silently dropped)
+
+  /rules:
+    get:
+      summary: Return active allowlist and sanitization rules
+      description: |
+        Development and debugging endpoint. Returns the active
+        caller/callee allowlist and sanitization patterns.
+        Internal only — not for external exposure.
+        If inter-service traffic is missing from the dashboard,
+        check here first to verify service names are registered.
+      tags: [debug]
+      responses:
+        '200':
+          description: Active filter configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RulesResponse'
+
+components:
+  schemas:
+    EventReport:
+      type: object
+      required: [caller, callee, method, path, status_code, latency_ms, protocol]
+      properties:
+        caller:
+          type: string
+          description: Reporting service name — must match allowlist exactly
+          enum:
+            - gateway
+            - signal-clearance
+            - policy
+            - contract-test
+            - plot-test
+            - plot-store
+            - signal-aggregator
+            - feed-wrangler
+            - results
+            - interactions
+            - augur-canis
+            - ai-lien
+            - integration
+        callee:
+          type: string
+          description: Name of the service that was called
+        method:
+          type: string
+          enum: [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]
+        path:
+          type: string
+          description: Request path — sanitized by this service before publishing
+        status_code:
+          type: integer
+        latency_ms:
+          type: integer
+        protocol:
+          type: string
+          enum: [http, https, mtls, sse, websocket]
+
+    RulesResponse:
+      type: object
+      properties:
+        knownCallers:
+          type: array
+          items:
+            type: string
+        knownCallees:
+          type: array
+          items:
+            type: string
+        sanitizationPatterns:
+          type: array
+          items:
+            type: object
+            properties:
+              pattern:
+                type: string
+              replacement:
+                type: string
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy]
+        service:
+          type: string
+          example: seti-observability
+        language:
+          type: string
+          example: Go
+        redis:
+          type: string
+          enum: [connected, disconnected]
+        eventsReceived:
+          type: integer
+        eventsPublished:
+          type: integer
+        eventsDropped:
+          type: integer
