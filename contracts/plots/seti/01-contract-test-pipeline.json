@@ -1,8 +1,8 @@
 {
   "name": "Contract Test Pipeline",
   "description": "Triggers a contract test run and verifies results are stored. Tests the complete contract testing pipeline from trigger through policy token issuance through results storage.",
-  "application_id": "seti-self",
-  "author": "seti-self",
+  "application_id": "seti",
+  "author": "seti",
   "version": "1.0.0",
   "tags": ["pipeline", "contract-test", "core"],
   "steps": [
@@ -11,7 +11,7 @@
       "description": "Trigger a contract test run via the gateway",
       "method": "POST",
       "path": "/run-contract-test",
-      "body": { "application_id": "seti-self" },
+      "body": { "application_id": "seti" },
       "expected_status": 200,
       "expected_chain": [
         { "caller": "gateway", "callee": "contract-test", "method": "POST", "path": "/run" }

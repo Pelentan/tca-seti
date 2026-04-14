@@ -1,21 +1,57 @@
 services:
 
   # ---------------------------------------------------------------------------
-  # cert-forge — TCA certificate authority init tool.
-  # Stdlib-only Go binary. No external dependencies. Runs once and exits.
+  # cert-forge — TCA PKI abstraction layer.
+  # Persistent service. Generates CA, issues instance certs, holds all key
+  # material, performs all signing operations. Stdlib only, scratch container.
   # ---------------------------------------------------------------------------
-  cert-init:
+  cert-forge:
     build:
       context: .
       dockerfile: cert-forge/Dockerfile
-    container_name: seti-cert-init
+    container_name: seti-cert-forge
+    environment:
+      PORT: "4014"
+      ENROLLMENT_PORT: "4015"
+      PUBLIC_PORT: "4016"
+      SERVICE_NAME: "cert-forge"
+      REDIS_URL: "redis:6379"
+      CERTS_DIR: "/certs"
     volumes:
       - certs:/certs
-    restart: "no"
     networks:
       - seti-internal
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   # ---------------------------------------------------------------------------
+  # PostgreSQL — persistent store for Lore (institutional memory)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: seti-postgres
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-seti}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB:-lore}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - seti-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-seti} -d ${POSTGRES_DB:-lore}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
   # Redis — session store, pub/sub, and Augur Canis coordination channels
   # ---------------------------------------------------------------------------
   redis:
@@ -45,6 +81,11 @@ services:
       PORT: "4010"
       REDIS_URL: "redis:6379"
       SERVICE_NAME: "augur-canis"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
       OBSERVABILITY_URL: "https://seti-observability:4011"
       CONSTELLATION: "tca-seti"
       CONSTELLATION_ID: "tca-seti"
@@ -54,14 +95,17 @@ services:
       REMINDER_INTERVAL_SECONDS: "30"
       MAX_INITIAL_BARKS: "3"
       STAR_GAZER_CERT: "/certs/star-gazer.crt"
+      AC_UI_PORT: "4666"  # ⚠ Dev UI — plain HTTP, NO AUTH — remove before production
+    ports:
+      - "4666:4666"  # ⚠ Dev UI only — remove or comment out before production
     volumes:
       - certs:/certs:ro
     networks:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
@@ -83,14 +127,20 @@ services:
       PORT: "4011"
       REDIS_URL: "redis:6379"
       SERVICE_NAME: "seti-observability"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
     volumes:
       - certs:/certs:ro
     networks:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
@@ -110,6 +160,12 @@ services:
       PORT: "4001"
       REDIS_URL: "redis:6379"
       SERVICE_NAME: "signal-clearance"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
       OBSERVABILITY_URL: "https://seti-observability:4011"
       JWT_SECRET: "${JWT_SECRET}"
       AUTH_MODE: "${AUTH_MODE:-dev}"
@@ -120,8 +176,8 @@ services:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       redis:
         condition: service_healthy
       seti-observability:
@@ -149,6 +205,12 @@ services:
       OBSERVABILITY_URL: "https://seti-observability:4011"
       REDIS_URL: "redis:6379"
       SERVICE_NAME: "gateway"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
       JWT_SECRET: "${JWT_SECRET}"
       AUTH_MODE: "${AUTH_MODE:-dev}"
       UI_URL: "https://ui:4020"
@@ -166,8 +228,8 @@ services:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       seti-observability:
         condition: service_healthy
       signal-clearance:
@@ -197,14 +259,20 @@ services:
       GATEWAY_URL: "https://gateway:4000"
       REDIS_URL: "redis:6379"
       SERVICE_NAME: "ui"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
     volumes:
       - certs:/certs:ro
     networks:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       augur-canis:
         condition: service_healthy
     healthcheck:
@@ -227,20 +295,29 @@ services:
       PORT: "4002"
       REDIS_URL: "redis:6379"
       SERVICE_NAME: "policy"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
       OBSERVABILITY_URL: "https://seti-observability:4011"
       JWT_SECRET: "${JWT_SECRET}"
       CONTRACTS_PATH: "/contracts/openapi"
       SELF_GATEWAY_URL: "https://gateway:4000"
       AUGUR_CANIS_URL: "https://augur-canis:4010"
+      PLOT_STORE_URL: "https://plot-store:4005"
+      SIGNAL_AGGREGATOR_URL: "https://signal-aggregator:4006"
+      REMOTE_APPS_PATH: "/etc/seti/remote-apps.json"
     volumes:
       - certs:/certs:ro
       - ./contracts:/contracts:ro
+      - ./remote-apps.json:/etc/seti/remote-apps.json:ro
     networks:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       seti-observability:
         condition: service_healthy
       augur-canis:
@@ -264,6 +341,12 @@ services:
       PORT: "4003"
       REDIS_URL: "redis:6379"
       SERVICE_NAME: "contract-test"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
       OBSERVABILITY_URL: "https://seti-observability:4011"
       POLICY_URL: "https://policy:4002"
       RESULTS_URL: "https://results:4008"
@@ -275,8 +358,8 @@ services:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       seti-observability:
         condition: service_healthy
       policy:
@@ -302,6 +385,12 @@ services:
       PORT: "4008"
       REDIS_URL: "redis:6379"
       SERVICE_NAME: "results"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
       OBSERVABILITY_URL: "https://seti-observability:4011"
     volumes:
       - certs:/certs:ro
@@ -309,8 +398,8 @@ services:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       seti-observability:
         condition: service_healthy
       augur-canis:
@@ -335,6 +424,11 @@ services:
       PORT: "4006"
       REDIS_URL: "redis:6379"
       SERVICE_NAME: "signal-aggregator"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
       OBSERVABILITY_URL: "https://seti-observability:4011"
       POLICY_URL: "https://policy:4002"
       SETI_INSTANCE_ID: "tca-seti-primary"
@@ -348,8 +442,8 @@ services:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       redis:
         condition: service_healthy
       seti-observability:
@@ -375,6 +469,12 @@ services:
       PORT: "4005"
       REDIS_URL: "redis:6379"
       SERVICE_NAME: "plot-store"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
       OBSERVABILITY_URL: "https://seti-observability:4011"
       PLOTS_PATH: "/contracts/plots"
     volumes:
@@ -384,8 +484,8 @@ services:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       seti-observability:
         condition: service_healthy
       augur-canis:
@@ -409,6 +509,12 @@ services:
       PORT: "4004"
       REDIS_URL: "redis:6379"
       SERVICE_NAME: "plot-test"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
       OBSERVABILITY_URL: "https://seti-observability:4011"
       PLOT_STORE_URL: "https://plot-store:4005"
       SIGNAL_AGGREGATOR_URL: "https://signal-aggregator:4006"
@@ -421,8 +527,8 @@ services:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       seti-observability:
         condition: service_healthy
       plot-store:
@@ -451,17 +557,29 @@ services:
     environment:
       PORT: "4009"
       SERVICE_NAME: "interactions"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
       REDIS_URL: "redis:6379"
       OBSERVABILITY_URL: "https://seti-observability:4011"
       AI_LIEN_URL: "https://ai-lien:4252"
+      NOTIFIER_URL: "https://notifier:4300"
+      LORE_URL: "https://lore:4110"
+      RESULTS_URL: "https://results:4008"
+      # Triage thresholds — change requires code review and rebuild by design
+      # CRITICAL_FAILURE_THRESHOLD: default 0.5 (50% of tests failing = immediate escalation)
+      # SILENCE_THRESHOLD_HOURS: default 168 (7 days clean history = silence single failures)
     volumes:
       - certs:/certs:ro
     networks:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       seti-observability:
         condition: service_healthy
       augur-canis:
@@ -485,14 +603,20 @@ services:
       PORT: "4007"
       REDIS_URL: "redis:6379"
       SERVICE_NAME: "feed-wrangler"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
     volumes:
       - certs:/certs:ro
     networks:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       redis:
         condition: service_healthy
       seti-observability:
@@ -519,6 +643,12 @@ services:
       PORT: "4013"
       REDIS_URL: "redis:6379"
       SERVICE_NAME: "integration"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
       OBSERVABILITY_URL: "https://seti-observability:4011"
       POLICY_URL: "https://policy:4002"
       RESULTS_URL: "https://results:4008"
@@ -529,8 +659,8 @@ services:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       seti-observability:
         condition: service_healthy
       policy:
@@ -556,17 +686,24 @@ services:
       PORT: "4252"
       REDIS_URL: "redis:6379"
       SERVICE_NAME: "ai-lien"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
       OBSERVABILITY_URL: "https://seti-observability:4011"
       POLICY_URL: "https://policy:4002"
       RESULTS_URL: "https://results:4008"
+      LORE_URL: "https://lore:4110"
     volumes:
       - certs:/certs:ro
     networks:
       - seti-internal
       - ac-net
     depends_on:
-      cert-init:
-        condition: service_completed_successfully
+      cert-forge:
+        condition: service_healthy
       seti-observability:
         condition: service_healthy
       policy:
@@ -578,11 +715,90 @@ services:
       retries: 3
       start_period: 30s
 
+  # ---------------------------------------------------------------------------
+  # lore — SETI institutional memory (PostgreSQL-backed)
+  # Trend points, baselines, incidents, patterns
+  # ---------------------------------------------------------------------------
+  lore:
+    build:
+      context: .
+      dockerfile: lore/Dockerfile
+    container_name: seti-lore
+    environment:
+      PORT: "4110"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-seti}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lore}?sslmode=disable"
+      SERVICE_NAME: "lore"
+      REDIS_URL: "redis:6379"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
+      OBSERVABILITY_URL: "https://seti-observability:4011"
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-forge:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      seti-observability:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # notifier — permanent stub: wakes a human. Implement for your environment.
+  # See contracts/openapi/notifier.yaml and notifier/main.go for guidance.
+  # ---------------------------------------------------------------------------
+  notifier:
+    build:
+      context: .
+      dockerfile: notifier/Dockerfile
+    container_name: seti-notifier
+    environment:
+      PORT: "4300"
+      SERVICE_NAME: "notifier"
+      REDIS_URL: "redis:6379"
+      PUBLIC_PORT: "4016"
+      ENROLLMENT_CERT: "/certs/enrollment.crt"
+      ENROLLMENT_KEY: "/certs/enrollment.key"
+      ENROLLMENT_CA: "/certs/enrollment-ca.crt"
+      CERT_FORGE_URL: "https://cert-forge:4014"
+      AUGUR_CANIS_URL: "https://augur-canis:4010"
+      OBSERVABILITY_URL: "https://seti-observability:4011"
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - seti-internal
+      - ac-net
+    depends_on:
+      cert-forge:
+        condition: service_healthy
+      seti-observability:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
 # ---------------------------------------------------------------------------
 # Volumes
 # ---------------------------------------------------------------------------
 volumes:
   certs:
+    driver: local
+  postgres_data:
     driver: local
 
 # ---------------------------------------------------------------------------

@@ -2,10 +2,13 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 import { useEventStream, SETIEvent } from '../hooks/useEventStream';
+import { useConstellation } from '../hooks/useConstellation';
+import ConstellationNav from '../components/ConstellationNav';
 
 export default function Dashboard() {
-  const { jwt, wranglerId, clearanceLevel, logout, getFreshJWT } = useAuth();
+  const { jwt, wranglerId, clearanceLevel, logout, getFreshJWT, getJWTWithRefresh } = useAuth();
   const { events, connected, eventCount, clearEvents } = useEventStream(jwt);
+  const { active, constellations, setConstellation } = useConstellation(jwt);
   const [filter, setFilter] = useState('');
   const [paused, setPaused] = useState(false);
   const [hideChecks, setHideChecks] = useState(false);
@@ -17,18 +20,18 @@ export default function Dashboard() {
     setTesting(true);
     setLastTestStatus(null);
     try {
-      const freshJwt = await getFreshJWT();
+      const freshJwt = await getJWTWithRefresh();
       if (!freshJwt) {
         setLastTestStatus('error');
         return;
       }
-      const res = await fetch(`${import.meta.env.VITE_GATEWAY_URL || ''}/run-contract-test`, {
+      const res = await fetch(`${import.meta.env.VITE_GATEWAY_URL || ''}/augur-canis/run-contract-tests`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${freshJwt}`,
         },
-        body: JSON.stringify({ application_id: 'seti-self' }),
+        body: JSON.stringify({ application_id: active.id }),
       });
       setLastTestStatus(res.ok ? 'accepted' : 'error');
     } catch {
@@ -59,6 +62,9 @@ export default function Dashboard() {
         </div>
         <div style={styles.headerRight}>
           <Link to="/plots" style={styles.navLink('#58a6ff', '#1f6feb')}>Plots</Link>
+          {(clearanceLevel === 'sec-wr4ngler' || clearanceLevel === 'admin') && (
+            <Link to="/ring" style={styles.navLink('#e3b341', '#e3b341')}>Ring</Link>
+          )}
           {(clearanceLevel === 'sec_wrangler' || clearanceLevel === 'admin') && (
             <Link to="/admin" style={styles.navLink('#e3b341', '#e3b341')}>Admin</Link>
           )}
@@ -66,6 +72,13 @@ export default function Dashboard() {
           <button style={styles.logoutBtn} onClick={logout}>Sign out</button>
         </div>
       </div>
+
+      {/* Constellation selector */}
+      <ConstellationNav
+        constellations={constellations}
+        active={active}
+        onSelect={setConstellation}
+      />
 
       {/* Controls */}
       <div style={styles.controls}>
@@ -76,6 +89,11 @@ export default function Dashboard() {
           <span style={styles.statItem}>
             <span style={styles.statValue}>{displayEvents.length}</span> displayed
           </span>
+          {!active.isSelf && (
+            <span style={styles.statItem}>
+              watching <span style={styles.statValue}>{active.label}</span>
+            </span>
+          )}
         </div>
         <div style={styles.controlActions}>
           <input
@@ -135,7 +153,7 @@ export default function Dashboard() {
 
       {/* Event detail modal */}
       {selectedEvent && (
-        <EventModal event={selectedEvent} jwt={jwt} onClose={() => setSelectedEvent(null)} />
+        <EventModal event={selectedEvent} getFreshJWT={getFreshJWT} onClose={() => setSelectedEvent(null)} />
       )}
     </div>
   );
@@ -210,7 +228,7 @@ interface ContractRun {
   }>;
 }
 
-function EventModal({ event, jwt, onClose }: { event: SETIEvent; jwt: string | null; onClose: () => void }) {
+function EventModal({ event, getFreshJWT, onClose }: { event: SETIEvent; getFreshJWT: () => Promise<string | null>; onClose: () => void }) {
   const [contractRuns, setContractRuns] = useState<ContractRun[]>([]);
   const [loadingRuns, setLoadingRuns] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -262,29 +280,28 @@ function EventModal({ event, jwt, onClose }: { event: SETIEvent; jwt: string | n
 
   // Fetch full contract run details when a contract test event is opened
   const fetchedRef = useState(false);
-  if (isContractTest && jwt && !fetchedRef[0]) {
+  if (isContractTest && !fetchedRef[0]) {
     fetchedRef[1](true);
     setLoadingRuns(true);
     const gw = import.meta.env.VITE_GATEWAY_URL || '';
-    // Use jwt directly here — modal opens immediately after a test run so token is fresh
-    const modalJwt = jwt;
-    // First get the list to find the most recent run IDs
-    fetch(`${gw}/contract-results`, { headers: { Authorization: `Bearer ${modalJwt}` } })
-      .then(r => r.ok ? r.json() : null)
-      .then(async (data) => {
-        if (!data?.runs?.length) return;
-        // Fetch full details for the 3 most recent runs (includes individual test results)
-        const details = await Promise.all(
-          data.runs.slice(0, 3).map((run: { run_id: string }) =>
-            fetch(`${gw}/contract-results/${run.run_id}`, {
-              headers: { Authorization: `Bearer ${jwt}` },
-            }).then(r => r.ok ? r.json() : null)
+    getFreshJWT().then(async (freshJwt) => {
+      if (!freshJwt) return;
+      const res = await fetch(`${gw}/contract-results`, { headers: { Authorization: `Bearer ${freshJwt}` } });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data?.runs?.length) return;
+      const details = await Promise.all(
+        data.runs.slice(0, 3).map((run: { run_id: string }) =>
+          getFreshJWT().then(t => t
+            ? fetch(`${gw}/contract-results/${run.run_id}`, {
+                headers: { Authorization: `Bearer ${t}` },
+              }).then(r => r.ok ? r.json() : null)
+            : null
           )
-        );
-        setContractRuns(details.filter(Boolean));
-      })
-      .catch(() => {})
-      .finally(() => setLoadingRuns(false));
+        )
+      );
+      setContractRuns(details.filter(Boolean));
+    }).catch(() => {}).finally(() => setLoadingRuns(false));
   }
 
   return (

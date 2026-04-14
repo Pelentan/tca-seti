@@ -1,8 +1,8 @@
 {
   "name": "AI Provider Configuration",
   "description": "Registers an AI provider with Policy and verifies it is retrievable. Does not attempt to refresh models (Ollama may not be running in all environments) — that step is exercised manually via the Admin panel. Tests the configuration storage pathway.",
-  "application_id": "seti-self",
-  "author": "seti-self",
+  "application_id": "seti",
+  "author": "seti",
   "version": "1.0.0",
   "tags": ["policy", "ai-lien", "configuration"],
   "steps": [

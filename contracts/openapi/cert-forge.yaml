@@ -1,0 +1,323 @@
+openapi: 3.1.0
+
+info:
+  title: TCA SETI - cert-forge
+  description: |
+    PKI abstraction layer for the TCA constellation. Every Job that needs
+    cryptographic material — instance certificates, CA trust anchors, signed
+    payloads — obtains it through cert-forge. No Job reads from the certs
+    volume directly or performs cryptographic operations independently.
+
+    This boundary means swapping the underlying PKI implementation (from
+    self-generated to Vault, an enterprise CA, or any other provider) requires
+    changes only to cert-forge. All other Jobs are unchanged.
+
+    cert-forge starts by generating its own certificate, brings up this API,
+    then generates the CA and any static certs required by the constellation.
+    Services call this API on startup to obtain their instance certificate.
+
+    cert-forge holds all private key material. Services never receive or
+    store private keys — they call POST /sign when a signature is needed.
+    When the signing algorithm changes, only cert-forge changes.
+
+    Health verification is handled by Augur Canis via the Redis pub/sub
+    healthcheck mechanism — no open HTTP health endpoint. AC's canned query
+    for cert-forge is GET /ca, which confirms cert-forge is alive and the
+    CA is initialized.
+
+    Internal service — mTLS on all endpoints. /ca is the one exception:
+    it is unauthenticated because services must retrieve the CA cert before
+    they have an instance cert to present.
+  version: 1.0.0
+
+x-tca-security:
+  transport: mtls
+  tls-min-version: "1.3"
+  client-cert-required: true
+  reject-without-client-cert: true
+  ca-cert: /certs/ca.crt
+  service-cert: /certs/cert-forge.crt
+  service-key: /certs/cert-forge.key
+  unauthenticated-paths:
+    - /ca
+  notes: >
+    /ca is intentionally unauthenticated. Services must retrieve the CA public
+    cert before they have an instance cert to present — it is needed to build
+    the trust pool for all subsequent mTLS calls. The CA cert is public material;
+    exposing it unauthenticated is correct and intentional.
+
+    All other endpoints require a valid client certificate signed by the
+    constellation CA. Connections without a valid client certificate are
+    rejected — not downgraded.
+
+    cert-forge generates its own certificate on first startup before the HTTP
+    server comes up. The bootstrap sequence is: generate own cert in memory →
+    start mTLS server using that cert → generate CA → write CA to volume →
+    generate static certs (star-gazer, etc.) → ready.
+
+x-tca-observability:
+  report-outbound-calls: false
+  notes: >
+    cert-forge makes no outbound calls. It is a pure responder.
+    The x-tca-observability block is present but inactive — cert-forge
+    has nothing to report to the Observability Job.
+
+servers:
+  - url: https://cert-forge:4014
+    description: Internal Docker network (mTLS on all endpoints except /ca)
+
+tags:
+  - name: trust
+    description: CA trust material
+  - name: instance
+    description: Instance certificate issuance
+  - name: signing
+    description: Payload signing on behalf of a service instance
+
+paths:
+  /ca:
+    get:
+      tags: [trust]
+      summary: Return the constellation CA public certificate
+      description: |
+        Returns the CA public certificate in PEM format. Unauthenticated —
+        services call this before they have an instance cert, to build
+        their mTLS trust pool.
+
+        Returns only the public certificate. The CA private key is never
+        exposed through any API endpoint under any circumstances.
+
+        When the underlying PKI transitions to an enterprise CA, this endpoint
+        returns that CA's public certificate. All callers are unaffected.
+
+        This endpoint also serves as Augur Canis's canned query for cert-forge
+        health verification — if this returns 200, cert-forge is alive and
+        the CA is initialized.
+      responses:
+        '200':
+          description: CA certificate PEM
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CACertResponse'
+        '503':
+          description: CA not yet initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /instance-cert:
+    post:
+      tags: [instance]
+      summary: Issue an instance certificate for a service
+      description: |
+        Generates a certificate for a specific service instance and returns
+        it to the caller. cert-forge retains the private key — the caller
+        receives only the public certificate and fingerprint.
+
+        The certificate CN is {service_name}-{instance_id}, making each
+        container instance cryptographically distinct. SANs include both
+        the service name (for service-level routing) and the full instance
+        CN (for instance-level audit).
+
+        The private key is held in cert-forge's memory only. It is never
+        written to disk and never returned to the caller. When the container
+        exits, the key is gone. A restarting container calls this endpoint
+        again and receives a new cert backed by a new key.
+
+        mTLS required. On first startup, the calling service presents the
+        bootstrap cert issued during cert-forge's static cert generation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InstanceCertRequest'
+      responses:
+        '200':
+          description: Instance certificate issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InstanceCertResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: CA not yet initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /sign:
+    post:
+      tags: [signing]
+      summary: Sign a payload on behalf of a service instance
+      description: |
+        Signs a payload using the private key cert-forge holds for the
+        specified service instance. The caller never has access to the
+        private key — signing is always delegated to cert-forge.
+
+        This means the signing algorithm is entirely cert-forge's concern.
+        When cryptographic requirements change (SHA256 → SHA512, RSA → ECDSA,
+        or post-quantum algorithms), only cert-forge changes. No other Job
+        is affected.
+
+        The payload is base64-encoded by the caller. cert-forge decodes it,
+        signs it using the instance's held key and current algorithm
+        configuration, and returns the base64-encoded signature.
+
+        mTLS required. The client certificate presented must correspond to
+        the service_name and instance_id in the request body — cert-forge
+        verifies that the caller is who they claim to be before signing.
+
+        Returns the fingerprint of the signing cert alongside the signature
+        so the verifier can confirm which cert was used.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignRequest'
+      responses:
+        '200':
+          description: Payload signed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignResponse'
+        '400':
+          description: Invalid request or malformed payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Client cert does not match claimed service/instance identity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No key on record for this service/instance combination
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: CA not yet initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  schemas:
+    CACertResponse:
+      type: object
+      required: [ca_cert, common_name]
+      properties:
+        ca_cert:
+          type: string
+          description: CA public certificate in PEM format
+        common_name:
+          type: string
+          description: CA common name — for logging and diagnostics
+
+    InstanceCertRequest:
+      type: object
+      required: [service_name, instance_id]
+      properties:
+        service_name:
+          type: string
+          description: >
+            The service's name as it appears in the constellation.
+            Must match the service's Docker Compose service name.
+            Example: "gateway"
+        instance_id:
+          type: string
+          description: >
+            Unique identifier for this specific container instance.
+            Use $HOSTNAME — Docker sets this to the container ID,
+            providing a stable unique identity for each container.
+            Example: "a3f2c1d8e4b7"
+
+    InstanceCertResponse:
+      type: object
+      required: [cert, key, fingerprint, instance_cn, valid_until]
+      properties:
+        cert:
+          type: string
+          description: >
+            Instance certificate in PEM format. CN is
+            {service_name}-{instance_id}. SANs include service_name
+            and the full instance CN. Signed by the constellation CA.
+        key:
+          type: string
+          description: >
+            RSA private key in PEM format. Delivered over the encrypted
+            enrollment mTLS connection — never written to disk, never on
+            the shared volume. The service holds this in memory only for
+            the duration of its lifetime. When the container exits, the
+            key is gone. cert-forge retains a copy for /sign operations.
+        fingerprint:
+          type: string
+          description: >
+            SHA-256 fingerprint of the certificate in hex with no colons.
+            Used in self-registration payloads sent to Augur Canis.
+        instance_cn:
+          type: string
+          description: The CN assigned to this instance — service_name-instance_id
+        valid_until:
+          type: string
+          format: date-time
+          description: Certificate expiry timestamp
+
+    SignRequest:
+      type: object
+      required: [service_name, instance_id, payload]
+      properties:
+        service_name:
+          type: string
+          description: Service name — must match the caller's mTLS client cert
+        instance_id:
+          type: string
+          description: Instance ID — must match the caller's mTLS client cert
+        payload:
+          type: string
+          description: Base64-encoded bytes to sign
+
+    SignResponse:
+      type: object
+      required: [signature, fingerprint, algorithm]
+      properties:
+        signature:
+          type: string
+          description: >
+            Base64-encoded signature over the decoded payload.
+            Algorithm is determined by cert-forge configuration —
+            callers do not specify or need to know the algorithm.
+        fingerprint:
+          type: string
+          description: >
+            Fingerprint of the cert whose key produced this signature.
+            The verifier uses this to look up the correct public cert.
+        algorithm:
+          type: string
+          description: >
+            Human-readable algorithm identifier for logging and diagnostics.
+            Example: "RSASSA-PKCS1-v1_5-SHA256". Callers should log this
+            but must not depend on a specific value — it will change when
+            cryptographic requirements change, which is the point.
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string

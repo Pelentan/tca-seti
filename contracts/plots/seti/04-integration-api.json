@@ -1,8 +1,8 @@
 {
   "name": "Integration API",
   "description": "Verifies the versioned read-only API surface is reachable and returning data. This is the customer tooling integration point — if this plot fails, external tools cannot query SETI results.",
-  "application_id": "seti-self",
-  "author": "seti-self",
+  "application_id": "seti",
+  "author": "seti",
   "version": "1.0.0",
   "tags": ["integration", "external-api", "core"],
   "steps": [

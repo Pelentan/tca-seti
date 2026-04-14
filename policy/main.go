@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -112,7 +111,7 @@ func issueServiceAccountJWT(account *ServiceAccount) (string, error) {
 		AccountID:      account.AccountID,
 		ApplicationID:  account.ApplicationID,
 		Role:           account.Role,
-		ClearanceLevel: "sec-wrangler", // Service accounts get sec-wrangler clearance
+		ClearanceLevel: "sec-wr4ngler", // Service accounts get sec-wr4ngler clearance
 		WranglerID:     account.AccountID,
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt:  jwt.NewNumericDate(now),
@@ -152,7 +151,7 @@ func connectRedis() {
 // ---------------------------------------------------------------------------
 // Register constellation Jobs with Augur Canis
 // AC needs to know each Job's network endpoint to route contract test requests.
-// Called after selfRegister() during startup.
+// Called after go selfRegisterWithAC(certMat, "https://policy:4002") during startup.
 // ---------------------------------------------------------------------------
 
 var acURL = envOr("AUGUR_CANIS_URL", "https://augur-canis:4010")
@@ -214,11 +213,11 @@ func registerJobsWithAC() {
 	log.Printf("[policy] AC job registration complete: %d/%d jobs registered", registered, len(jobs))
 }
 
-func selfRegister() {
+func registerSelfApplication() {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if _, exists := applications["seti-self"]; exists {
+	if _, exists := applications["seti"]; exists {
 		return
 	}
 
@@ -227,37 +226,37 @@ func selfRegister() {
 	selfRedisURL := envOr("REDIS_URL", "redis:6379")
 
 	app := &Application{
-		ApplicationID:  "seti-self",
+		ApplicationID:  "seti",
 		DisplayName:    "SETI (Self)",
 		Description:    "SETI monitoring its own constellation. True mastery starts with oneself.",
 		Environment:    "development",
 		GatewayURL:     gatewayURL,
 		RedisURL:       selfRedisURL,
 		ContractsPath:  contractsPath,
-		ServiceAccount: "svc-seti-self",
+		ServiceAccount: "svc-seti",
 		TestSchedule: &TestSchedule{
 			ContractTestIntervalMinutes: 15,
-			PlotTestEnabled:             false,
+			PlotTestEnabled:             true,
 			Enabled:                     true,
 		},
 		Status:       "active",
 		RegisteredAt: time.Now().UTC().Format(time.RFC3339),
 	}
-	applications["seti-self"] = app
+	applications["seti"] = app
 
 	// Create service account for SETI's own constellation
 	account := &ServiceAccount{
-		AccountID:     "svc-seti-self",
-		ApplicationID: "seti-self",
+		AccountID:     "svc-seti",
+		ApplicationID: "seti",
 		Role:          "contract-test",
 		Description:   "SETI self-monitoring service account",
 		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
 	}
-	accounts["svc-seti-self"] = account
+	accounts["svc-seti"] = account
 
-	log.Printf("[policy] Self-registered SETI constellation (seti-self)")
+	log.Printf("[policy] Self-registered SETI constellation (seti)")
 	log.Printf("[policy] Contracts path: %s", contractsPath)
-	log.Printf("[policy] Service account: svc-seti-self")
+	log.Printf("[policy] Service account: svc-seti")
 }
 
 // ---------------------------------------------------------------------------
@@ -288,34 +287,13 @@ var (
 var upstreamClient *http.Client
 
 func buildUpstreamClient() {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Printf("[policy] CA cert not found — upstream calls will fail: %v", err)
-		upstreamClient = http.DefaultClient
-		return
-	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-
-	cert, err := tls.LoadX509KeyPair("/certs/policy.crt", "/certs/policy.key")
-	if err != nil {
-		log.Printf("[policy] Service cert not found: %v", err)
-		upstreamClient = http.DefaultClient
-		return
-	}
-
 	upstreamClient = &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				RootCAs:      caPool,
-				Certificates: []tls.Certificate{cert},
-				MinVersion:   tls.VersionTLS13,
-			},
+			TLSClientConfig: buildClientTLS(certMat),
 		},
-		Timeout: 30 * time.Second,
 	}
-	log.Printf("[policy] mTLS upstream client ready")
 }
+
 
 // ---------------------------------------------------------------------------
 // Observability reporting
@@ -353,6 +331,14 @@ func reportEvent(callee, method, path string, status int, latencyMs int64) {
 
 func handleApplications(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(map[string]string{
+			"code":    "METHOD_NOT_ALLOWED",
+			"message": "use POST /applications/register to register an application",
+		})
+		return
+	}
 	mu.RLock()
 	apps := make([]*Application, 0, len(applications))
 	for _, a := range applications {
@@ -384,6 +370,15 @@ func handleRegisterApplication(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_REQUEST", "message": err.Error()})
+		return
+	}
+
+	if req.DisplayName == "" || req.GatewayURL == "" || req.RedisURL == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"code":    "INVALID_REQUEST",
+			"message": "display_name, gateway_url, and redis_url are required",
+		})
 		return
 	}
 
@@ -502,7 +497,7 @@ func handleIssueToken(w http.ResponseWriter, r *http.Request) {
 		"application_id": account.ApplicationID,
 		"jwt":            token,
 		"expires_at":     time.Now().Add(15 * time.Minute).UTC().Format(time.RFC3339),
-		"clearance_level": "sec-wrangler",
+		"clearance_level": "sec-wr4ngler",
 	})
 }
 
@@ -533,24 +528,7 @@ var startTime = time.Now()
 // ---------------------------------------------------------------------------
 
 func loadTLSConfig() *tls.Config {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Fatalf("[policy] Failed to read CA cert: %v", err)
-	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-
-	cert, err := tls.LoadX509KeyPair("/certs/policy.crt", "/certs/policy.key")
-	if err != nil {
-		log.Fatalf("[policy] Failed to load service cert: %v", err)
-	}
-
-	return &tls.Config{
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    caPool,
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-	}
+	return buildServerTLS(certMat)
 }
 
 // ---------------------------------------------------------------------------
@@ -734,13 +712,376 @@ func handleAIProvider(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
+// Available Applications — remote-apps.json manifest
+// ---------------------------------------------------------------------------
+
+var (
+	plotStoreURL    = envOr("PLOT_STORE_URL", "https://plot-store:4005")
+	remoteAppsPath  = envOr("REMOTE_APPS_PATH", "/etc/seti/remote-apps.json")
+)
+
+type RemoteApp struct {
+	Name           string `json:"name"`
+	Description    string `json:"description"`
+	ACEndpoint     string `json:"ac_endpoint"`
+	RegistryURL    string `json:"registry_url"`
+	RegistryType   string `json:"registry_type"` // github | gitlab | generic
+	RegistryToken  string `json:"registry_token"`
+}
+
+type AvailableAppState struct {
+	RemoteApp
+	Tag                    string `json:"tag"`
+	MonitoringStatus       string `json:"monitoring_status"` // active | inactive
+	ApplicationID          string `json:"application_id,omitempty"`
+	ActivatedAt            string `json:"activated_at,omitempty"`
+	ConnectionLastTestedAt string `json:"connection_last_tested_at,omitempty"`
+	ConnectionLastStatus   string `json:"connection_last_status"` // ok | failed | untested
+}
+
+var (
+	remoteAppsMu    sync.RWMutex
+	remoteApps      = map[string]*RemoteApp{}       // tag → definition from JSON
+	availableStates = map[string]*AvailableAppState{} // tag → live state
+)
+
+func loadRemoteApps() {
+	data, err := os.ReadFile(remoteAppsPath)
+	if err != nil {
+		log.Printf("[policy] remote-apps.json not found at %s — no available applications loaded", remoteAppsPath)
+		return
+	}
+	raw := map[string]RemoteApp{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		log.Printf("[policy] Failed to parse remote-apps.json: %v", err)
+		return
+	}
+	remoteAppsMu.Lock()
+	for tag, app := range raw {
+		a := app
+		remoteApps[tag] = &a
+		if _, exists := availableStates[tag]; !exists {
+			availableStates[tag] = &AvailableAppState{
+				RemoteApp:            a,
+				Tag:                  tag,
+				MonitoringStatus:     "inactive",
+				ConnectionLastStatus: "untested",
+			}
+		}
+	}
+	remoteAppsMu.Unlock()
+	log.Printf("[policy] Loaded %d available applications from remote-apps.json", len(raw))
+}
+
+func registryFetch(app *RemoteApp, path string) ([]byte, error) {
+	url := strings.TrimRight(app.RegistryURL, "/") + "/" + strings.TrimLeft(path, "/")
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	switch app.RegistryType {
+	case "gitlab":
+		req.Header.Set("PRIVATE-TOKEN", app.RegistryToken)
+	default: // github, generic
+		req.Header.Set("Authorization", "Bearer "+app.RegistryToken)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	// Registry calls use plain HTTPS — not mTLS (external service).
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("registry returned %d", resp.StatusCode)
+	}
+	var buf []byte
+	buf = make([]byte, 0)
+	tmp := make([]byte, 4096)
+	for {
+		n, err := resp.Body.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+	return buf, nil
+}
+
+func countYAMLFiles(data []byte) int {
+	// GitHub/GitLab return a JSON array of file objects.
+	var files []struct {
+		Name string `json:"name"`
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &files); err != nil {
+		return 0
+	}
+	count := 0
+	for _, f := range files {
+		if (f.Type == "file" || f.Type == "blob") &&
+			(strings.HasSuffix(f.Name, ".yaml") || strings.HasSuffix(f.Name, ".yml")) {
+			count++
+		}
+	}
+	return count
+}
+
+func handleAvailableApplications(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"code":"METHOD_NOT_ALLOWED"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	remoteAppsMu.RLock()
+	list := make([]*AvailableAppState, 0, len(availableStates))
+	active, inactive := 0, 0
+	for _, s := range availableStates {
+		list = append(list, s)
+		if s.MonitoringStatus == "active" {
+			active++
+		} else {
+			inactive++
+		}
+	}
+	remoteAppsMu.RUnlock()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"applications": list,
+		"total":        len(list),
+		"active_count": active,
+		"inactive_count": inactive,
+	})
+}
+
+func handleAvailableApplication(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Path: /available-applications/{tag}/{action}
+	trimmed := strings.TrimPrefix(r.URL.Path, "/available-applications/")
+	parts := strings.SplitN(trimmed, "/", 2)
+	tag := parts[0]
+	action := ""
+	if len(parts) > 1 {
+		action = parts[1]
+	}
+
+	remoteAppsMu.RLock()
+	state, exists := availableStates[tag]
+	app := remoteApps[tag]
+	remoteAppsMu.RUnlock()
+
+	if !exists {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{
+			"code":    "NOT_FOUND",
+			"message": fmt.Sprintf("tag %q not found in remote-apps.json", tag),
+		})
+		return
+	}
+
+	switch {
+	case r.Method == http.MethodPost && action == "test-connection":
+		now := time.Now().UTC().Format(time.RFC3339)
+		contractsData, err := registryFetch(app, "contracts/openapi")
+		if err != nil {
+			remoteAppsMu.Lock()
+			state.ConnectionLastTestedAt = now
+			state.ConnectionLastStatus = "failed"
+			remoteAppsMu.Unlock()
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"tag":       tag,
+				"success":   false,
+				"error":     err.Error(),
+				"tested_at": now,
+			})
+			return
+		}
+		contractCount := countYAMLFiles(contractsData)
+
+		plotCount := 0
+		if plotsData, err := registryFetch(app, "contracts/plots"); err == nil {
+			plotCount = countYAMLFiles(plotsData)
+		}
+
+		remoteAppsMu.Lock()
+		state.ConnectionLastTestedAt = now
+		state.ConnectionLastStatus = "ok"
+		remoteAppsMu.Unlock()
+
+		reportEvent("registry:"+tag, "GET", "contracts/openapi", 200, 0)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"tag":             tag,
+			"success":         true,
+			"contracts_found": contractCount,
+			"plots_found":     plotCount,
+			"tested_at":       now,
+		})
+
+	case r.Method == http.MethodPost && action == "register":
+		remoteAppsMu.RLock()
+		alreadyActive := state.MonitoringStatus == "active"
+		remoteAppsMu.RUnlock()
+
+		if alreadyActive {
+			json.NewEncoder(w).Encode(state)
+			return
+		}
+
+		// 1. Register in Policy application store
+		now := time.Now().UTC().Format(time.RFC3339)
+		appID := "app-" + tag
+		mu.Lock()
+		if _, exists := applications[appID]; !exists {
+			applications[appID] = &Application{
+				ApplicationID: appID,
+				DisplayName:   app.Name,
+				Description:   app.Description,
+				Environment:   "production",
+				GatewayURL:    app.ACEndpoint, // AC endpoint as proxy for gateway location
+				ContractsPath: app.RegistryURL + "/contracts/openapi",
+				TestSchedule: &TestSchedule{
+					ContractTestIntervalMinutes: 15,
+					PlotTestEnabled:             true,
+					Enabled:                     true,
+				},
+				Status:       "active",
+				RegisteredAt: now,
+			}
+			acctID := "svc-" + tag
+			accounts[acctID] = &ServiceAccount{
+				AccountID:     acctID,
+				ApplicationID: appID,
+				Role:          "contract-test",
+				Description:   fmt.Sprintf("Service account for %s monitoring", app.Name),
+				CreatedAt:     now,
+			}
+		}
+		mu.Unlock()
+
+		// 2. Initiate AC federation via Signal Aggregator
+		fedBody, _ := json.Marshal(map[string]string{
+			"application_id": appID,
+			"ac_endpoint":    app.ACEndpoint,
+		})
+		fedReq, _ := http.NewRequest(http.MethodPost, signalAggURL+"/federation/subscriptions",
+			strings.NewReader(string(fedBody)))
+		if fedReq != nil {
+			fedReq.Header.Set("Content-Type", "application/json")
+			start := time.Now()
+			fedResp, fedErr := upstreamClient.Do(fedReq)
+			latency := time.Since(start).Milliseconds()
+			if fedErr != nil {
+				log.Printf("[policy] Federation request failed for %s: %v", tag, fedErr)
+				reportEvent("signal-aggregator", "POST", "/federation/subscriptions", 0, latency)
+			} else {
+				reportEvent("signal-aggregator", "POST", "/federation/subscriptions", fedResp.StatusCode, latency)
+				fedResp.Body.Close()
+			}
+		}
+
+		// 3. Trigger Plot Store ingest
+		ingestBody, _ := json.Marshal(map[string]string{
+			"registry_url":   app.RegistryURL,
+			"registry_type":  app.RegistryType,
+			"registry_token": app.RegistryToken,
+		})
+		ingestReq, _ := http.NewRequest(http.MethodPost,
+			plotStoreURL+"/ingest/"+tag,
+			strings.NewReader(string(ingestBody)))
+		if ingestReq != nil {
+			ingestReq.Header.Set("Content-Type", "application/json")
+			start := time.Now()
+			ingestResp, ingestErr := upstreamClient.Do(ingestReq)
+			latency := time.Since(start).Milliseconds()
+			if ingestErr != nil {
+				log.Printf("[policy] Plot ingest failed for %s: %v", tag, ingestErr)
+				reportEvent("plot-store", "POST", "/ingest/"+tag, 0, latency)
+			} else {
+				reportEvent("plot-store", "POST", "/ingest/"+tag, ingestResp.StatusCode, latency)
+				ingestResp.Body.Close()
+			}
+		}
+
+		remoteAppsMu.Lock()
+		state.MonitoringStatus = "active"
+		state.ApplicationID = appID
+		state.ActivatedAt = now
+		remoteAppsMu.Unlock()
+
+		log.Printf("[policy] Available application registered: %s (%s)", tag, app.Name)
+		json.NewEncoder(w).Encode(state)
+
+	case r.Method == http.MethodPost && action == "deregister":
+		remoteAppsMu.RLock()
+		alreadyInactive := state.MonitoringStatus == "inactive"
+		remoteAppsMu.RUnlock()
+
+		if alreadyInactive {
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]string{
+				"code":    "NOT_ACTIVE",
+				"message": fmt.Sprintf("application %q is not currently active", tag),
+			})
+			return
+		}
+
+		// Stop AC federation
+		appID := "app-" + tag
+		delReq, _ := http.NewRequest(http.MethodDelete,
+			signalAggURL+"/federation/subscriptions?application_id="+appID, nil)
+		if delReq != nil {
+			start := time.Now()
+			delResp, delErr := upstreamClient.Do(delReq)
+			latency := time.Since(start).Milliseconds()
+			if delErr != nil {
+				log.Printf("[policy] Federation disconnect failed for %s: %v", tag, delErr)
+				reportEvent("signal-aggregator", "DELETE", "/federation/subscriptions", 0, latency)
+			} else {
+				reportEvent("signal-aggregator", "DELETE", "/federation/subscriptions", delResp.StatusCode, latency)
+				delResp.Body.Close()
+			}
+		}
+
+		// Mark inactive in Policy store (keep record, stop scheduling)
+		mu.Lock()
+		if reg, exists := applications[appID]; exists {
+			reg.Status = "suspended"
+		}
+		mu.Unlock()
+
+		remoteAppsMu.Lock()
+		state.MonitoringStatus = "inactive"
+		state.ApplicationID = ""
+		state.ActivatedAt = ""
+		remoteAppsMu.Unlock()
+
+		log.Printf("[policy] Available application deregistered: %s (%s)", tag, app.Name)
+		json.NewEncoder(w).Encode(state)
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
+var certMat *CertMaterial
+
 func main() {
+	certMat = obtainCerts("policy")
 	buildUpstreamClient()
 	connectRedis()
-	selfRegister()
+	loadRemoteApps()
+	registerSelfApplication()
+	selfRegisterWithAC(certMat, "https://policy:4002")
 	go registerJobsWithAC()
 
 	mux := http.NewServeMux()
@@ -751,6 +1092,8 @@ func main() {
 	mux.HandleFunc("/accounts/", handleIssueToken)
 	mux.HandleFunc("/ai-providers", handleAIProviders)
 	mux.HandleFunc("/ai-providers/", handleAIProvider)
+	mux.HandleFunc("/available-applications", handleAvailableApplications)
+	mux.HandleFunc("/available-applications/", handleAvailableApplication)
 
 	server := &http.Server{
 		Addr:      ":" + port,
@@ -759,7 +1102,7 @@ func main() {
 	}
 
 	log.Printf("[policy] Listening on :%s (mTLS, TLS 1.3)", port)
-	log.Printf("[policy] Self-registration: seti-self active")
+	log.Printf("[policy] Self-registration: seti active")
 	log.Printf("[policy] Storage: in-memory (Phase 2 — swap PostgreSQL in Phase 4)")
 
 	if err := server.ListenAndServeTLS("", ""); err != nil {

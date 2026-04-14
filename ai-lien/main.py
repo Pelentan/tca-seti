@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import ssl
+from certforge import obtain_certs, build_client_ssl_context, build_server_ssl_context, self_register_with_ac
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -35,6 +36,7 @@ PORT = int(os.environ.get('PORT', '4252'))
 POLICY_URL = os.environ.get('POLICY_URL', 'https://policy:4002')
 RESULTS_URL = os.environ.get('RESULTS_URL', 'https://results:4008')
 OBSERVABILITY_URL = os.environ.get('OBSERVABILITY_URL', 'https://seti-observability:4011')
+LORE_URL = os.environ.get('LORE_URL', 'https://lore:4110')
 
 _start_time = time.time()
 _analyses_completed = 0
@@ -59,6 +61,24 @@ Failure context:
 {context}
 
 Respond with ONLY the diagnostic prompt text. No preamble, no explanation.""",
+
+    'critical_briefing': """You are constructing an urgent briefing prompt for a critical system failure.
+A human Wr4ngler is already on their way to investigate. Your job is NOT to diagnose —
+it is to assemble everything they need to understand the situation the moment they arrive.
+
+Given this failure context, construct a prompt that will produce:
+1. A concise situation summary (what is failing, how bad, since when)
+2. What has already been tried or detected
+3. The most likely cause based on history and patterns
+4. The exact first three actions the Wr4ngler should take right now
+5. What NOT to do (common mistakes for this failure pattern)
+
+Context includes Lore history — use it. Prior incidents are more valuable than speculation.
+
+Critical failure context:
+{context}
+
+Respond with ONLY the briefing prompt text. No preamble, no explanation.""",
 
     'trend_analysis': """You are constructing an analysis prompt for software test trend data.
 
@@ -102,16 +122,12 @@ DEFAULT_RESPONSE_SCHEMA = {
 
 def _build_ssl_context() -> Optional[ssl.SSLContext]:
     try:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.load_verify_locations('/certs/ca.crt')
-        ctx.load_cert_chain('/certs/ai-lien.crt', '/certs/ai-lien.key')
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-        return ctx
+        return build_client_ssl_context()
     except Exception as e:
-        log.warning(f'Could not load mTLS certs: {e}')
+        log.warning(f'Could not build mTLS context: {e}')
         return None
 
-_ssl_ctx = _build_ssl_context()
+_ssl_ctx = None  # type: Optional[ssl.SSLContext] — initialized after obtain_certs()
 
 def _mtls_get(url: str) -> dict:
     req = URLRequest(url)
@@ -137,8 +153,113 @@ def report_event(callee: str, method: str, path: str, status: int, latency_ms: i
     threading.Thread(target=_send, daemon=True).start()
 
 # ---------------------------------------------------------------------------
-# Active provider — ask Policy every time, never cache
+# Lore integration — read context before analysis, write assessments after
 # ---------------------------------------------------------------------------
+
+def fetch_lore_context(application_id: str, job_name: str = None) -> dict:
+    """
+    Read institutional memory from Lore before analysis.
+    Returns baselines, recent incidents, and known patterns.
+    AI-lien with history is fundamentally different from AI-lien without it.
+    """
+    context = {}
+    since_72h = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                               time.gmtime(time.time() - 72 * 3600))
+
+    # Baseline for this job — what does healthy look like?
+    if job_name:
+        try:
+            baseline = _mtls_get(f'{LORE_URL}/baselines/{application_id}/{job_name}')
+            context['baseline'] = baseline
+            report_event('lore', 'GET', f'/baselines/{application_id}/{job_name}', 200, 0)
+        except Exception:
+            context['baseline'] = None  # No baseline established yet
+
+    # Recent open incidents — what's already known to be wrong?
+    try:
+        incidents = _mtls_get(
+            f'{LORE_URL}/incidents?application_id={application_id}'
+            f'&status=open&since={since_72h}&limit=5'
+        )
+        context['recent_incidents'] = incidents.get('incidents', [])
+        context['open_incident_count'] = incidents.get('open_count', 0)
+        report_event('lore', 'GET', '/incidents', 200, 0)
+    except Exception:
+        context['recent_incidents'] = []
+        context['open_incident_count'] = 0
+
+    # Known patterns — recurring failure signatures
+    try:
+        patterns = _mtls_get(
+            f'{LORE_URL}/patterns?application_id={application_id}&limit=5'
+        )
+        context['known_patterns'] = patterns.get('patterns', [])
+        report_event('lore', 'GET', '/patterns', 200, 0)
+    except Exception:
+        context['known_patterns'] = []
+
+    return context
+
+
+def write_lore_trend_point(application_id: str, job_name: str, run_id: str,
+                            signal_type: str, description: str,
+                            evidence: dict, related_incident_id: str = None) -> str | None:
+    """
+    Write a trend point to Lore after analysis.
+    Returns the trend_point_id if successful, None if not.
+    """
+    body = {
+        'application_id': application_id,
+        'job_name': job_name,
+        'source_job': 'ai-lien',
+        'signal_type': signal_type,
+        'description': description,
+        'evidence': evidence,
+        'run_id': run_id,
+    }
+    if related_incident_id:
+        body['related_incident_id'] = related_incident_id
+
+    try:
+        start = time.time()
+        status, result = _mtls_post(f'{LORE_URL}/trend-points', body)
+        report_event('lore', 'POST', '/trend-points', status,
+                     int((time.time() - start) * 1000))
+        if status == 201:
+            return result.get('trend_point_id')
+    except Exception as e:
+        log.warning(f'Lore trend point write failed: {e}')
+    return None
+
+
+def write_lore_incident(application_id: str, job_name: str, run_id: str,
+                         trigger_type: str, description: str,
+                         ai_assessment: str, ai_recommended_action: str,
+                         related_trend_point_ids: list = None) -> str | None:
+    """
+    Write an incident to Lore when AI-lien determines the failure warrants one.
+    Returns the incident_id if successful, None if not.
+    """
+    try:
+        start = time.time()
+        status, result = _mtls_post(f'{LORE_URL}/incidents', {
+            'application_id': application_id,
+            'job_name': job_name,
+            'source_job': 'ai-lien',
+            'trigger_type': trigger_type,
+            'description': description,
+            'ai_assessment': ai_assessment,
+            'ai_recommended_action': ai_recommended_action,
+            'run_id': run_id,
+            'related_trend_point_ids': related_trend_point_ids or [],
+        })
+        report_event('lore', 'POST', '/incidents', status,
+                     int((time.time() - start) * 1000))
+        if status == 201:
+            return result.get('incident_id')
+    except Exception as e:
+        log.warning(f'Lore incident write failed: {e}')
+    return None
 
 def get_active_provider() -> dict:
     """Ask Policy for the current active AI provider. No caching."""
@@ -248,18 +369,24 @@ class AILienHandler(BaseHTTPRequestHandler):
         pass
 
     def send_json(self, status: int, body: dict):
-        payload = json.dumps(body).encode()
-        self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', len(payload))
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            payload = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(payload))
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Client disconnected before response — not an error
 
     def read_body(self) -> dict:
-        length = int(self.headers.get('Content-Length', 0))
-        if length == 0:
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            if length == 0:
+                return {}
+            return json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, ValueError):
             return {}
-        return json.loads(self.rfile.read(length))
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -267,6 +394,7 @@ class AILienHandler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 'status': 'healthy',
                 'stub_active': False,
+                'lore_enabled': True,
                 'analyses_completed': _analyses_completed,
                 'analyses_failed': _analyses_failed,
                 'uptime_seconds': int(time.time() - _start_time),
@@ -294,6 +422,20 @@ class AILienHandler(BaseHTTPRequestHandler):
 
         start = time.time()
 
+        # Extract application/job identifiers for Lore reads
+        application_id = context.get('application_id', '')
+        job_name = context.get('job_name', context.get('test_tier', ''))
+
+        # Enrich context with Lore institutional memory before analysis.
+        # AI-lien with history is fundamentally different from AI-lien without it.
+        if application_id:
+            log.info(f'Fetching Lore context for {application_id}/{job_name}')
+            lore_context = fetch_lore_context(application_id, job_name or None)
+            context['lore_institutional_memory'] = lore_context
+            open_count = lore_context.get('open_incident_count', 0)
+            pattern_count = len(lore_context.get('known_patterns', []))
+            log.info(f'Lore context loaded: {open_count} open incidents, {pattern_count} known patterns')
+
         try:
             # Get active provider — fresh every time
             provider = get_active_provider()
@@ -311,10 +453,16 @@ class AILienHandler(BaseHTTPRequestHandler):
             latency = int((time.time() - start) * 1000)
             log.info(f'Analysis complete: {latency}ms total (first={result["first_tap_ms"]}ms second={result["second_tap_ms"]}ms)')
 
-            # Store first-tap prompt in Results Job audit trail
+            # Write assessment back to Lore and store audit trail — both async
+            assessment = result.get('assessment', {})
+            threading.Thread(
+                target=self._write_to_lore,
+                args=(application_id, job_name, run_id, analysis_type, assessment),
+                daemon=True,
+            ).start()
             threading.Thread(
                 target=self._store_audit,
-                args=(run_id, analysis_type, result['first_tap_prompt'], result['assessment']),
+                args=(run_id, analysis_type, result['first_tap_prompt'], assessment),
                 daemon=True,
             ).start()
 
@@ -328,6 +476,56 @@ class AILienHandler(BaseHTTPRequestHandler):
                 'message': str(e),
                 'run_id': run_id,
             })
+
+    def _write_to_lore(self, application_id: str, job_name: str, run_id: str,
+                        analysis_type: str, assessment: dict):
+        """Write assessment back to Lore as trend point and/or incident."""
+        if not application_id or not assessment:
+            return
+
+        root_cause = assessment.get('root_cause', 'unknown')
+        confidence = assessment.get('confidence', 'low')
+        category = assessment.get('category', 'unknown')
+        recommended_action = assessment.get('recommended_action', '')
+        severity = assessment.get('severity', 'medium')
+        escalate = assessment.get('escalate_to_wr4ngler', False)
+
+        # Always write a trend point — every analysis is a data point
+        signal_type = f'{analysis_type}_{category}' if category != 'unknown' else analysis_type
+        trend_point_id = write_lore_trend_point(
+            application_id=application_id,
+            job_name=job_name or 'unknown',
+            run_id=run_id,
+            signal_type=signal_type,
+            description=f'{analysis_type}: {root_cause} (confidence={confidence})',
+            evidence={
+                'category': category,
+                'confidence': confidence,
+                'recommended_action': recommended_action,
+                'severity': severity,
+                'escalate_to_wr4ngler': escalate,
+            },
+        )
+
+        # Write incident if AI assessed this as worth escalating or high/critical
+        if escalate or severity in ('critical', 'high'):
+            ai_assessment_str = (
+                f'Category: {category} | Confidence: {confidence} | {root_cause}'
+            )
+            incident_id = write_lore_incident(
+                application_id=application_id,
+                job_name=job_name or 'unknown',
+                run_id=run_id,
+                trigger_type=analysis_type,
+                description=root_cause,
+                ai_assessment=ai_assessment_str,
+                ai_recommended_action=recommended_action,
+                related_trend_point_ids=[trend_point_id] if trend_point_id else [],
+            )
+            if incident_id:
+                log.info(f'Lore incident created: {incident_id} for run {run_id}')
+        else:
+            log.info(f'Lore trend point written: {trend_point_id} for run {run_id}')
 
     def _store_audit(self, run_id: str, analysis_type: str,
                      first_tap_prompt: str, assessment: dict):
@@ -350,7 +548,10 @@ class AILienHandler(BaseHTTPRequestHandler):
 # mTLS server
 # ---------------------------------------------------------------------------
 
-def build_server_ssl_context() -> ssl.SSLContext:
+def _build_server_ssl_context() -> ssl.SSLContext:
+    return build_server_ssl_context()  # from certforge
+
+def _build_server_ssl_context_unused() -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_verify_locations('/certs/ca.crt')
     ctx.load_cert_chain('/certs/ai-lien.crt', '/certs/ai-lien.key')
@@ -358,17 +559,85 @@ def build_server_ssl_context() -> ssl.SSLContext:
     ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     return ctx
 
-if __name__ == '__main__':
-    server = HTTPServer(('', PORT), AILienHandler)
+
+def self_register():
+    """Sign and POST a self-registration request to Augur Canis.
+    Uses openssl subprocess — available in python:slim-bookworm runtime.
+    """
+    import base64, datetime, subprocess
+
+    ac_url = os.environ.get('AUGUR_CANIS_URL', 'https://augur-canis:4010')
+    service_name = 'ai-lien'
+    endpoint = 'https://ai-lien:4252'
+    cert_path = f'/certs/ai-lien.crt'
+    key_path  = f'/certs/ai-lien.key'
+
     try:
-        ssl_ctx = build_server_ssl_context()
+        timestamp = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        r = subprocess.run(
+            ['openssl', 'x509', '-fingerprint', '-sha256', '-noout', '-in', cert_path],
+            capture_output=True, text=True, check=True
+        )
+        fingerprint = r.stdout.strip().split('=')[-1].replace(':', '').lower()
+
+        payload = (service_name + endpoint + fingerprint + timestamp).encode()
+        r = subprocess.run(
+            ['openssl', 'dgst', '-sha256', '-sign', key_path, '-binary'],
+            input=payload, capture_output=True, check=True
+        )
+        signature_b64 = base64.b64encode(r.stdout).decode()
+
+        body = json.dumps({
+            'service_name':     service_name,
+            'network_endpoint': endpoint,
+            'cert_fingerprint': fingerprint,
+            'timestamp':        timestamp,
+            'signature':        signature_b64,
+        }).encode()
+
+        req = URLRequest(
+            f'{ac_url}/services/register',
+            data=body,
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        with urlopen(req, context=_ssl_ctx, timeout=10) as resp:
+            ack = json.loads(resp.read())
+            log.info(f'[ai-lien] selfRegister: registered with AC (status={ack.get("status")})')
+    except Exception as e:
+        log.warning(f'[ai-lien] selfRegister: failed: {e} — AC may not be ready yet')
+
+
+class ResilientHTTPServer(HTTPServer):
+    """HTTPServer that suppresses broken pipe and SSL errors on individual connections.
+    Python's BaseHTTPServer propagates these to stderr and terminates the handler
+    thread, causing the Go mTLS client to see a broken pipe on the write side.
+    """
+    def handle_error(self, request, client_address):
+        import sys
+        exc_type = sys.exc_info()[0]
+        if exc_type in (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+            return  # Expected when mTLS client closes connection early
+        super().handle_error(request, client_address)
+
+
+if __name__ == '__main__':
+    # Must obtain certs FIRST — all SSL contexts depend on cert material
+    obtain_certs('ai-lien')
+    _ssl_ctx = _build_ssl_context()
+    threading.Thread(target=self_register_with_ac, args=('ai-lien', 'https://ai-lien:4252'), daemon=True).start()
+    server = ResilientHTTPServer(('', PORT), AILienHandler)
+    try:
+        ssl_ctx = _build_server_ssl_context()
         server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
         log.info(f'Listening on :{PORT} (mTLS, TLS 1.3)')
     except Exception as e:
         log.error(f'Could not load TLS certs: {e}')
-        log.error('Ensure cert-init completed before ai-lien starts')
         raise SystemExit(1)
     log.info('Double-tap Ollama diagnostic engine')
-    log.info(f'Policy: {POLICY_URL} | Results: {RESULTS_URL}')
+    log.info(f'Policy: {POLICY_URL} | Results: {RESULTS_URL} | Lore: {LORE_URL}')
+    log.info('Lore: reads baselines/incidents before analysis, writes trend points/incidents after')
     log.info('Active provider: fetched from Policy on every request — no local config')
+
     server.serve_forever()

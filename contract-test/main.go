@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -351,34 +350,13 @@ func connectRedis() {
 var upstreamClient *http.Client
 
 func buildUpstreamClient() {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Printf("[contract-test] CA cert not found: %v", err)
-		upstreamClient = http.DefaultClient
-		return
-	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-
-	cert, err := tls.LoadX509KeyPair("/certs/contract-test.crt", "/certs/contract-test.key")
-	if err != nil {
-		log.Printf("[contract-test] Service cert not found: %v", err)
-		upstreamClient = http.DefaultClient
-		return
-	}
-
 	upstreamClient = &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				RootCAs:      caPool,
-				Certificates: []tls.Certificate{cert},
-				MinVersion:   tls.VersionTLS13,
-			},
+			TLSClientConfig: buildClientTLS(certMat),
 		},
-		Timeout: 30 * time.Second,
 	}
-	log.Printf("[contract-test] mTLS upstream client ready")
 }
+
 
 // ---------------------------------------------------------------------------
 // Service account token — obtained from Policy Job
@@ -699,7 +677,12 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 		ApplicationID string `json:"application_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ApplicationID == "" {
-		req.ApplicationID = "seti-self" // Default to self
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"code":    "INVALID_REQUEST",
+			"message": "application_id is required",
+		})
+		return
 	}
 
 	go func() {
@@ -747,33 +730,21 @@ var startTime = time.Now()
 // ---------------------------------------------------------------------------
 
 func loadTLSConfig() *tls.Config {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Fatalf("[contract-test] Failed to read CA cert: %v", err)
-	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-
-	cert, err := tls.LoadX509KeyPair("/certs/contract-test.crt", "/certs/contract-test.key")
-	if err != nil {
-		log.Fatalf("[contract-test] Failed to load service cert: %v", err)
-	}
-
-	return &tls.Config{
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    caPool,
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-	}
+	return buildServerTLS(certMat)
 }
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
+var certMat *CertMaterial
+
 func main() {
+	certMat = obtainCerts("contract-test")
 	buildUpstreamClient()
+	go selfRegisterWithAC(certMat, "https://contract-test:4003")
 	connectRedis()
+	startScheduler()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", handleHealth)
@@ -793,4 +764,161 @@ func main() {
 	if err := server.ListenAndServeTLS("", ""); err != nil {
 		log.Fatalf("[contract-test] Server error: %v", err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler — polls Policy for registered applications and runs contract
+// tests on the configured interval for each application.
+// ---------------------------------------------------------------------------
+
+type scheduledApp struct {
+	applicationID string
+	intervalMins  int
+	ticker        *time.Ticker
+	stop          chan struct{}
+}
+
+var (
+	scheduledApps   = map[string]*scheduledApp{}
+	scheduledAppsMu sync.Mutex
+)
+
+func startScheduler() {
+	log.Printf("[contract-test] Scheduler starting — polling policy every 60s for application list")
+	go func() {
+		// Initial load
+		syncSchedules()
+		// Refresh every 60 seconds to pick up new registrations or interval changes
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			syncSchedules()
+		}
+	}()
+}
+
+func syncSchedules() {
+	apps, err := fetchApplicationsFromPolicy()
+	if err != nil {
+		log.Printf("[contract-test] Scheduler: could not fetch applications: %v", err)
+		return
+	}
+
+	scheduledAppsMu.Lock()
+	defer scheduledAppsMu.Unlock()
+
+	// Start schedulers for new or changed applications
+	for _, app := range apps {
+		if !app.Enabled {
+			continue
+		}
+		interval := app.IntervalMins
+		if interval <= 0 {
+			interval = 15
+		}
+
+		existing, ok := scheduledApps[app.ID]
+		if ok && existing.intervalMins == interval {
+			continue // already scheduled at the right interval
+		}
+
+		// Stop existing if interval changed
+		if ok {
+			close(existing.stop)
+			existing.ticker.Stop()
+			log.Printf("[contract-test] Scheduler: updated interval for %s → %dm", app.ID, interval)
+		}
+
+		sa := &scheduledApp{
+			applicationID: app.ID,
+			intervalMins:  interval,
+			ticker:        time.NewTicker(time.Duration(interval) * time.Minute),
+			stop:          make(chan struct{}),
+		}
+		scheduledApps[app.ID] = sa
+
+		go func(s *scheduledApp) {
+			log.Printf("[contract-test] Scheduler: watching %s every %dm", s.applicationID, s.intervalMins)
+			for {
+				select {
+				case <-s.ticker.C:
+					log.Printf("[contract-test] Scheduler: triggering run for %s", s.applicationID)
+					if _, err := executeRun(s.applicationID); err != nil {
+						log.Printf("[contract-test] Scheduler: run failed for %s: %v", s.applicationID, err)
+					}
+				case <-s.stop:
+					return
+				}
+			}
+		}(sa)
+	}
+
+	// Stop schedulers for removed applications
+	for id, sa := range scheduledApps {
+		found := false
+		for _, app := range apps {
+			if app.ID == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			close(sa.stop)
+			sa.ticker.Stop()
+			delete(scheduledApps, id)
+			log.Printf("[contract-test] Scheduler: stopped watching %s (deregistered)", id)
+		}
+	}
+}
+
+type appScheduleInfo struct {
+	ID           string
+	IntervalMins int
+	Enabled      bool
+}
+
+func fetchApplicationsFromPolicy() ([]appScheduleInfo, error) {
+	start := time.Now()
+	req, err := http.NewRequest(http.MethodGet, policyURL+"/applications", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := upstreamClient.Do(req)
+	reportEvent("policy", "GET", "/applications",
+		func() int {
+			if err != nil || resp == nil { return 0 }
+			return resp.StatusCode
+		}(), time.Since(start).Milliseconds())
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Applications []struct {
+			ApplicationID string `json:"application_id"`
+			Status        string `json:"status"`
+			TestSchedule  *struct {
+				ContractTestIntervalMinutes int  `json:"contract_test_interval_minutes"`
+				Enabled                     bool `json:"enabled"`
+			} `json:"test_schedule"`
+		} `json:"applications"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	var apps []appScheduleInfo
+	for _, a := range result.Applications {
+		if a.Status != "active" {
+			continue
+		}
+		info := appScheduleInfo{ID: a.ApplicationID, IntervalMins: 15, Enabled: true}
+		if a.TestSchedule != nil {
+			info.IntervalMins = a.TestSchedule.ContractTestIntervalMinutes
+			info.Enabled = a.TestSchedule.Enabled
+		}
+		apps = append(apps, info)
+	}
+	return apps, nil
 }

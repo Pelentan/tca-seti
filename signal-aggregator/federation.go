@@ -154,11 +154,11 @@ func initFederationOnStartup() {
 	// Give the rest of the stack a moment to be ready
 	time.Sleep(3 * time.Second)
 
-	// Register with seti-self AC first — proves the mechanism locally
+	// Register with seti AC first — proves the mechanism locally
 	if selfACEndpoint != "" {
-		log.Printf("[federation] Initiating federation with seti-self AC at %s", selfACEndpoint)
-		if err := connectFederatedApp("seti-self", selfACEndpoint, redisURL); err != nil {
-			log.Printf("[federation] seti-self federation failed: %v — will retry on silence detection", err)
+		log.Printf("[federation] Initiating federation with seti AC at %s", selfACEndpoint)
+		if err := connectFederatedApp("seti", selfACEndpoint, redisURL); err != nil {
+			log.Printf("[federation] seti federation failed: %v — will retry on silence detection", err)
 		}
 	}
 
@@ -491,30 +491,131 @@ func reconnectFederatedApp(appID string) error {
 // ---------------------------------------------------------------------------
 
 func handleFederationSubscriptions(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	fedMu.RLock()
-	subs := make([]map[string]interface{}, 0, len(fedApps))
-	for _, app := range fedApps {
-		subs = append(subs, map[string]interface{}{
-			"application_id":   app.AppID,
-			"ac_endpoint":      app.ACEndpoint,
-			"status":           app.Status,
-			"session_cert_id":  app.SessionCertID,
-			"registered_at":    app.RegisteredAt.UTC().Format(time.RFC3339),
-			"last_event_at":    app.LastEventAt.UTC().Format(time.RFC3339),
-			"reconnect_count":  app.ReconnectCount,
-			"events_verified":  app.EventsVerified,
-			"feed_channel":     app.FeedChannel,
-		})
-	}
-	fedMu.RUnlock()
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"subscriptions": subs})
+
+	switch r.Method {
+	case http.MethodGet:
+		fedMu.RLock()
+		subs := make([]map[string]interface{}, 0, len(fedApps))
+		for _, app := range fedApps {
+			subs = append(subs, map[string]interface{}{
+				"application_id":  app.AppID,
+				"ac_endpoint":     app.ACEndpoint,
+				"status":          app.Status,
+				"session_cert_id": app.SessionCertID,
+				"registered_at":   app.RegisteredAt.UTC().Format(time.RFC3339),
+				"last_event_at":   app.LastEventAt.UTC().Format(time.RFC3339),
+				"reconnect_count": app.ReconnectCount,
+				"events_verified": app.EventsVerified,
+				"feed_channel":    app.FeedChannel,
+			})
+		}
+		fedMu.RUnlock()
+		json.NewEncoder(w).Encode(map[string]interface{}{"subscriptions": subs})
+
+	case http.MethodPost:
+		// Triggered by Policy when a Sec Wr4ngler registers an available application.
+		// Closes the TODO in initFederationOnStartup — runtime federation without restart.
+		var req struct {
+			ApplicationID string `json:"application_id"`
+			ACEndpoint    string `json:"ac_endpoint"`
+			FeedRedisURL  string `json:"feed_redis_url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil ||
+			req.ApplicationID == "" || req.ACEndpoint == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"code":    "INVALID_REQUEST",
+				"message": "application_id and ac_endpoint required",
+			})
+			return
+		}
+		feedRedis := req.FeedRedisURL
+		if feedRedis == "" {
+			feedRedis = redisURL // default to SETI's own Redis if not specified
+		}
+
+		if starGazerKey == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{
+				"code":    "FEDERATION_DISABLED",
+				"message": "star-gazer identity not loaded — federation unavailable",
+			})
+			return
+		}
+
+		// Idempotent — if already registered, return current status
+		fedMu.RLock()
+		existing, exists := fedApps[req.ApplicationID]
+		fedMu.RUnlock()
+		if exists && existing.Status == "active" {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"application_id":  existing.AppID,
+				"status":          existing.Status,
+				"session_cert_id": existing.SessionCertID,
+				"reconnect_count": existing.ReconnectCount,
+				"message":         "already federated",
+			})
+			return
+		}
+
+		if err := connectFederatedApp(req.ApplicationID, req.ACEndpoint, feedRedis); err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{
+				"code":    "FEDERATION_FAILED",
+				"message": err.Error(),
+			})
+			return
+		}
+
+		fedMu.RLock()
+		app := fedApps[req.ApplicationID]
+		fedMu.RUnlock()
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"application_id":  app.AppID,
+			"status":          app.Status,
+			"session_cert_id": app.SessionCertID,
+			"feed_channel":    app.FeedChannel,
+		})
+
+	case http.MethodDelete:
+		// Path: DELETE /federation/subscriptions?application_id={id}
+		appID := r.URL.Query().Get("application_id")
+		if appID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"code":    "INVALID_REQUEST",
+				"message": "application_id query parameter required",
+			})
+			return
+		}
+		fedMu.Lock()
+		app, exists := fedApps[appID]
+		if exists {
+			if app.cancelMonitor != nil {
+				app.cancelMonitor()
+			}
+			delete(fedApps, appID)
+		}
+		fedMu.Unlock()
+		if !exists {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{
+				"code":    "NOT_FOUND",
+				"message": fmt.Sprintf("no federation subscription for %s", appID),
+			})
+			return
+		}
+		log.Printf("[federation] Disconnected federation for %s (Sec Wr4ngler deregistration)", appID)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"message": fmt.Sprintf("federation disconnected for %s", appID),
+		})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }
 
 func handleFederationReconnect(w http.ResponseWriter, r *http.Request) {

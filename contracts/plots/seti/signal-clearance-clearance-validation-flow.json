@@ -1,0 +1,56 @@
+{
+  "name": "Signal Clearance Validation",
+  "description": "Validates that signal-clearance correctly issues JWTs and that the issued JWT grants access to protected resources. Session refresh requires the httpOnly seti_refresh cookie which plot-test cannot maintain as a server-side mTLS client — refresh is exercised by the system's own session management.",
+  "application_id": "seti",
+  "author": "claude-sonnet-4-6-session-20260410",
+  "version": "0.5.0",
+  "tags": ["signal-clearance", "auth", "clearance"],
+  "steps": [
+    {
+      "step_number": 1,
+      "description": "Gateway health check confirms SETI is up before exercising auth",
+      "call": { "method": "GET", "path": "/health" },
+      "expect_status": 200,
+      "assertions": [
+        { "field": "status", "operator": "equals", "value": "healthy" }
+      ]
+    },
+    {
+      "step_number": 2,
+      "description": "Dev login issues a sec-wr4ngler JWT — gateway proxies to signal-clearance",
+      "call": {
+        "method": "POST",
+        "path": "/auth/dev/login",
+        "body": { "display_name": "plot-test-sec", "clearance_level": "sec-wr4ngler" }
+      },
+      "expect_status": 200,
+      "capture": [
+        { "name": "sec_jwt", "path": "jwt" }
+      ],
+      "assertions": [
+        { "field": "jwt", "operator": "present" }
+      ],
+      "expect_call_chain": [
+        { "caller": "gateway", "callee": "signal-clearance", "method": "POST", "path": "/auth/dev/login" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 3,
+      "description": "Use JWT on a protected endpoint — confirms clearance grants access to Policy application registry",
+      "call": {
+        "method": "GET",
+        "path": "/applications",
+        "headers": { "Authorization": "Bearer {sec_jwt}" }
+      },
+      "expect_status": 200,
+      "assertions": [
+        { "field": "applications", "operator": "present" }
+      ],
+      "expect_call_chain": [
+        { "caller": "gateway", "callee": "policy", "method": "GET", "path": "/applications" }
+      ],
+      "verify_within_seconds": 10
+    }
+  ]
+}

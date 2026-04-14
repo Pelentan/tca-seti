@@ -1,0 +1,63 @@
+{
+  "name": "Augur Canis Health Cycle",
+  "description": "Validates Augur Canis is running, all SETI Jobs are registered, and the configuration is accessible via the gateway admin routes. Check history and query endpoints are stubs pending full AC implementation — this plot tests what is currently operational.",
+  "application_id": "seti",
+  "author": "claude-sonnet-4-6-session-20260410",
+  "version": "0.4.0",
+  "tags": ["augur-canis", "health", "constellation"],
+  "steps": [
+    {
+      "step_number": 1,
+      "description": "Augur Canis health check via gateway admin route — confirms AC is running and Redis is connected",
+      "call": { "method": "GET", "path": "/augur-canis/health" },
+      "expect_status": 200,
+      "assertions": [
+        { "field": "status", "operator": "equals", "value": "healthy" },
+        { "field": "redis_connected", "operator": "equals", "value": true }
+      ],
+      "expect_call_chain": [
+        { "caller": "gateway", "callee": "augur-canis", "method": "GET", "path": "/health" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 2,
+      "description": "List registered Jobs via gateway admin route — all SETI Jobs should be registered with AC",
+      "call": { "method": "GET", "path": "/augur-canis/jobs" },
+      "expect_status": 200,
+      "assertions": [
+        { "field": "total", "operator": "gte", "value": 15 }
+      ],
+      "expect_call_chain": [
+        { "caller": "gateway", "callee": "augur-canis", "method": "GET", "path": "/jobs" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 3,
+      "description": "AC configuration is readable via gateway — confirms constellation-level settings are accessible",
+      "call": { "method": "GET", "path": "/augur-canis/configuration" },
+      "expect_status": 200,
+      "assertions": [
+        { "field": "check_interval_seconds", "operator": "present" }
+      ],
+      "expect_call_chain": [
+        { "caller": "gateway", "callee": "augur-canis", "method": "GET", "path": "/configuration" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 4,
+      "description": "Active alerts endpoint is accessible — confirms alert pipeline is operational",
+      "call": { "method": "GET", "path": "/augur-canis/alerts" },
+      "expect_status": 200,
+      "assertions": [
+        { "field": "alerts", "operator": "present" }
+      ],
+      "expect_call_chain": [
+        { "caller": "gateway", "callee": "augur-canis", "method": "GET", "path": "/alerts/active" }
+      ],
+      "verify_within_seconds": 10
+    }
+  ]
+}

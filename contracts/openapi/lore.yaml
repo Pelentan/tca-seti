@@ -1,0 +1,1110 @@
+openapi: 3.1.0
+
+info:
+  title: SETI - Lore Job
+  description: |
+    SETI's institutional memory. Lore is the persistent tier of SETI's
+    three-tier event storage model.
+
+    The three tiers:
+    - Tier 1 (Redis, run-scoped): Transient capture values used for
+      step-to-step value passing within a Plot run. TTL tied to run
+      lifetime. Lore has no involvement here.
+    - Tier 2 (Redis, sliding window): The "bad-whiff buffer" — events
+      that passed all tests but carry a smell. 24-hour rolling FIFO.
+      AI-lien reasons against this layer and promotes to Lore when
+      connective tissue emerges. Lore has no involvement here either
+      — it only receives what is deliberately promoted.
+    - Tier 3 (Lore, persistent): What Lore owns. Trend points elevated
+      from the bad-whiff buffer or written directly by AI-lien or Results.
+      Baseline profiles. Incident records with AI assessment and resolution.
+      Wr4ngler corrections. Learned patterns.
+
+    Lore does not reason. It remembers. All analytical decisions are made
+    by AI-lien. Lore provides the institutional context that makes those
+    decisions non-amnesiac.
+
+    Write paths (two active, one stubbed):
+    - AI-lien: primary write path. Writes trend points, incident records,
+      assessments, and corrections after reasoning. May or may not have
+      bad-whiff buffer input.
+    - Results: direct fast path for severe/unambiguous events that warrant
+      immediate Lore entry and human escalation simultaneously. No AI
+      reasoning step required — the signal is self-evident.
+    - Wr4ngler: stubbed. Human-initiated entries and corrections. Endpoint
+      defined, returns 501 until implemented.
+
+    Read paths:
+    - AI-lien: reads baselines and prior incident history before every
+      analysis. This is the primary read path — Lore is AI-lien's memory.
+    - Plot-test: reads baselines to contextualize assertion failures.
+    - Integration: read-only access for external tooling queries.
+    - Gateway: proxies Wr4ngler read/write operations (stubbed).
+
+    Go implementation. PostgreSQL backend. Standard library plus pgx driver
+    (pure Go, no C extensions) — chosen specifically to minimize supply chain
+    surface. SETI requires a pristine security posture; every third-party
+    dependency is evaluated against that requirement.
+
+    Internal service — mTLS only, not externally exposed.
+  version: 0.1.0
+
+x-tca-security:
+  transport: mtls
+  tls-min-version: "1.3"
+  client-cert-required: true
+  reject-without-client-cert: true
+  ca-cert: /certs/ca.crt
+  service-cert: /certs/lore.crt
+  service-key: /certs/lore.key
+  implementation:
+    server:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      require-and-verify-client-cert: true
+    client:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      verify-server-cert: true
+  notes: >
+    Every inbound connection must present a certificate signed by the SETI CA.
+    Connections without a valid client certificate must be rejected.
+    Authorized callers: AI-lien (read/write), Results (write — fast path only),
+    Plot-test (read — baselines only), Integration (read — trend points and
+    patterns only), Gateway (proxies Wr4ngler operations, stubbed).
+
+x-tca-observability:
+  report-outbound-calls: true
+  endpoint: https://seti-observability:4011/event
+  pattern: fire-and-forget
+  caller-name: "lore"
+  required-fields:
+    - caller
+    - callee
+    - method
+    - path
+    - status_code
+    - latency_ms
+    - protocol
+  implementation:
+    timing: wrap-every-outbound-http-call
+    non-blocking: true
+    on-failure: log-and-drop
+    do-not-instrument:
+      - seti-observability
+  notes: >
+    Lore's outbound calls are primarily to its PostgreSQL database.
+    All inbound calls from authorized callers are visible in the
+    observability feed as normal inter-service traffic.
+
+servers:
+  - url: https://lore:4110
+    description: Internal SETI network (mTLS enforced)
+
+tags:
+  - name: trend-points
+    description: Promoted events and AI-identified patterns worth watching
+  - name: baselines
+    description: Normal behavior profiles per Job per application
+  - name: incidents
+    description: Confirmed incident records with AI assessment and resolution
+  - name: patterns
+    description: Learned recurring sequences assigned meaning
+  - name: corrections
+    description: Wr4ngler overrides and corrections to AI assessments
+  - name: health
+    description: Service health
+
+paths:
+
+  # ---------------------------------------------------------------------------
+  # TREND POINTS
+  # ---------------------------------------------------------------------------
+
+  /trend-points:
+    post:
+      tags: [trend-points]
+      summary: Write a trend point to persistent storage
+      description: |
+        Records a promoted event or AI-identified data point worth
+        watching over time. Called by AI-lien after reasoning identifies
+        connective tissue, or by Results on the direct fast path for
+        self-evident signals.
+
+        source_job indicates who wrote this entry — ai-lien, results,
+        or wr4ngler (the last currently stubbed). This field is
+        authoritative for audit purposes and must not be set by the
+        caller to a value other than their own identity.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrendPointWrite'
+      responses:
+        '201':
+          description: Trend point stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrendPoint'
+        '400':
+          description: Invalid payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      tags: [trend-points]
+      summary: Query trend points
+      description: |
+        Returns trend points matching the specified filters, in reverse
+        chronological order. Used by AI-lien when loading context before
+        analysis, and by Integration for external tooling queries.
+      parameters:
+        - name: application_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter by application
+        - name: job_name
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter by Job name within the application
+        - name: source_job
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [ai-lien, results, wr4ngler]
+          description: Filter by who wrote the trend point
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Return only trend points recorded after this time
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+      responses:
+        '200':
+          description: Trend points returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrendPointList'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /trend-points/{trend_point_id}:
+    get:
+      tags: [trend-points]
+      summary: Get a specific trend point
+      parameters:
+        - name: trend_point_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Trend point found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrendPoint'
+        '404':
+          description: Trend point not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # BASELINES
+  # ---------------------------------------------------------------------------
+
+  /baselines/{application_id}/{job_name}:
+    get:
+      tags: [baselines]
+      summary: Get the baseline profile for a Job
+      description: |
+        Returns the current baseline profile for the specified Job within
+        the specified application. AI-lien reads this before every analysis
+        to establish what normal looks like. Plot-test reads this to
+        contextualize assertion failures.
+
+        Returns 404 if no baseline exists yet — callers must handle this
+        gracefully. A missing baseline means SETI has not yet established
+        normal behavior for this Job, not that something is wrong.
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: job_name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Baseline profile found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaselineProfile'
+        '404':
+          description: No baseline established for this Job yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    put:
+      tags: [baselines]
+      summary: Update the baseline profile for a Job
+      description: |
+        Replaces the baseline profile for a Job. Called by AI-lien when
+        it determines the current baseline no longer reflects normal
+        behavior — typically after a verified deployment or after a
+        sustained period of stable operation at new parameters.
+
+        Creates the baseline if it does not exist. This is an upsert,
+        not a create-only operation.
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: job_name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BaselineProfileWrite'
+      responses:
+        '200':
+          description: Baseline updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaselineProfile'
+        '400':
+          description: Invalid baseline payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # INCIDENTS
+  # ---------------------------------------------------------------------------
+
+  /incidents:
+    post:
+      tags: [incidents]
+      summary: Record a confirmed incident
+      description: |
+        Stores an incident record after AI-lien has completed its analysis.
+        An incident is a failure event with attached AI assessment, recommended
+        remediation, and eventual resolution. Incidents are the unit of
+        institutional learning — they are what SETI knows happened, why,
+        and whether its assessment was correct.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncidentWrite'
+      responses:
+        '201':
+          description: Incident recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Incident'
+        '400':
+          description: Invalid payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      tags: [incidents]
+      summary: Query incident history
+      parameters:
+        - name: application_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: job_name
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [open, resolved, unacknowledged_clear]
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        '200':
+          description: Incidents returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentList'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /incidents/{incident_id}:
+    get:
+      tags: [incidents]
+      summary: Get a specific incident record
+      parameters:
+        - name: incident_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Incident found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Incident'
+        '404':
+          description: Incident not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /incidents/{incident_id}/resolve:
+    post:
+      tags: [incidents]
+      summary: Mark an incident as resolved
+      description: |
+        Records the resolution of an incident. Called by AI-lien when
+        it determines the condition that triggered the incident has cleared,
+        or by the Results fast path when a previously failing test passes
+        again. Resolution does not require human acknowledgment — it is
+        condition-driven, not acknowledgment-driven.
+      parameters:
+        - name: incident_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncidentResolution'
+      responses:
+        '200':
+          description: Incident resolved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Incident'
+        '404':
+          description: Incident not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Incident already resolved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # PATTERNS
+  # ---------------------------------------------------------------------------
+
+  /patterns:
+    post:
+      tags: [patterns]
+      summary: Record a learned pattern
+      description: |
+        Stores a recurring event sequence that AI-lien has assigned meaning
+        to through prior analysis. Patterns are the distilled output of
+        incident history — what sequences reliably predict or accompany
+        specific outcomes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatternWrite'
+      responses:
+        '201':
+          description: Pattern recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pattern'
+        '400':
+          description: Invalid payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      tags: [patterns]
+      summary: Query learned patterns
+      parameters:
+        - name: application_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: job_name
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        '200':
+          description: Patterns returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PatternList'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # CORRECTIONS
+  # ---------------------------------------------------------------------------
+
+  /corrections:
+    post:
+      tags: [corrections]
+      summary: Record a Wr4ngler correction to an AI assessment
+      description: |
+        STUB — returns 501. Endpoint defined for contract completeness.
+
+        When implemented: records a human override of an AI-lien assessment.
+        The correction feeds back into future AI reasoning — Lore surfaces
+        it when AI-lien analyzes similar conditions. Over time, corrections
+        train AI-lien's judgment on this specific constellation's behavior.
+
+        Requires sec-wr4ngler clearance — enforced at Gateway.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CorrectionWrite'
+      responses:
+        '501':
+          description: Not yet implemented
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      tags: [corrections]
+      summary: Query Wr4ngler corrections
+      description: STUB — returns 501.
+      responses:
+        '501':
+          description: Not yet implemented
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------------
+  # HEALTH
+  # ---------------------------------------------------------------------------
+
+  /health:
+    get:
+      tags: [health]
+      summary: Service health check
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  schemas:
+
+    # ---------------------------------------------------------------------------
+    # TREND POINTS
+    # ---------------------------------------------------------------------------
+
+    TrendPointWrite:
+      type: object
+      required:
+        - application_id
+        - job_name
+        - source_job
+        - signal_type
+        - description
+        - evidence
+      properties:
+        application_id:
+          type: string
+          description: Application this trend point belongs to
+          example: "seti"
+        job_name:
+          type: string
+          description: Job within the application this trend point concerns
+          example: "contract-test"
+        source_job:
+          type: string
+          enum: [ai-lien, results, wr4ngler]
+          description: >
+            Which Job is writing this trend point. Callers must set this
+            to their own identity — this field is auditable.
+        signal_type:
+          type: string
+          enum: [latency_drift, failure_rate, call_chain_anomaly, assertion_drift, silence, promoted_whiff, direct_escalation]
+          description: >
+            latency_drift — response times moving outside baseline bounds.
+            failure_rate — increasing test failure frequency.
+            call_chain_anomaly — unexpected service calls appearing or expected calls missing.
+            assertion_drift — response body values trending toward boundary conditions.
+            silence — Job stopped appearing in expected feeds.
+            promoted_whiff — elevated from the bad-whiff Redis buffer by AI reasoning.
+            direct_escalation — written directly by Results on the fast path.
+        description:
+          type: string
+          description: >
+            Human-readable description of what this trend point captures
+            and why it was considered significant enough to persist.
+          example: >
+            Contract test latency for seti-observability POST /event has
+            increased from a 2ms baseline to 180ms over the last 6 runs.
+            Not yet alert-threshold but the trajectory is linear and
+            consistent — no noise pattern, pure drift.
+        evidence:
+          type: object
+          description: >
+            Structured evidence supporting this trend point. Shape varies
+            by signal_type. AI-lien populates this from the bad-whiff buffer
+            or current run context. Results populates from the failing run.
+          additionalProperties: true
+        bad_whiff_window_start:
+          type: string
+          format: date-time
+          description: >
+            When the bad-whiff buffer window that contributed to this
+            trend point began. Present when source_job is ai-lien and
+            buffer data was used. Absent for direct Results writes.
+        related_incident_id:
+          type: string
+          description: >
+            If this trend point is associated with an existing incident
+            in Lore, its ID. Links trend observation to incident record.
+        run_id:
+          type: string
+          description: >
+            The test run ID that generated the data behind this trend point,
+            if applicable. Used to cross-reference Results Job records.
+
+    TrendPoint:
+      allOf:
+        - $ref: '#/components/schemas/TrendPointWrite'
+        - type: object
+          required:
+            - trend_point_id
+            - recorded_at
+          properties:
+            trend_point_id:
+              type: string
+              example: "lore-tp-a1b2c3d4"
+            recorded_at:
+              type: string
+              format: date-time
+
+    TrendPointList:
+      type: object
+      required:
+        - trend_points
+        - total
+      properties:
+        trend_points:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrendPoint'
+        total:
+          type: integer
+
+    # ---------------------------------------------------------------------------
+    # BASELINES
+    # ---------------------------------------------------------------------------
+
+    BaselineProfileWrite:
+      type: object
+      required:
+        - established_by
+        - latency_p50_ms
+        - latency_p95_ms
+        - latency_p99_ms
+        - contract_test_pass_rate
+        - sample_size
+        - observation_window_hours
+      properties:
+        established_by:
+          type: string
+          enum: [ai-lien]
+          description: Only AI-lien may establish baselines.
+        latency_p50_ms:
+          type: integer
+          description: Median response latency in milliseconds across observed runs
+        latency_p95_ms:
+          type: integer
+          description: 95th percentile response latency
+        latency_p99_ms:
+          type: integer
+          description: 99th percentile response latency
+        latency_alert_multiplier:
+          type: number
+          description: >
+            Current reading must exceed baseline_p95 * multiplier for
+            K consecutive cycles before AI-lien considers this significant.
+            Default 2.0 if not set.
+          example: 2.0
+        contract_test_pass_rate:
+          type: number
+          description: >
+            Observed contract test pass rate as a decimal between 0 and 1.
+            1.0 means all tests passing in all observed runs.
+          example: 1.0
+        plot_test_pass_rate:
+          type: number
+          description: Observed plot test pass rate. May be absent if no plot tests yet run.
+          example: 1.0
+        sample_size:
+          type: integer
+          description: Number of test runs used to establish this baseline
+          example: 48
+        observation_window_hours:
+          type: integer
+          description: How many hours of data were used
+          example: 168
+        notes:
+          type: string
+          description: >
+            AI-lien's reasoning for this baseline update, if applicable.
+            Useful for understanding why the baseline shifted.
+
+    BaselineProfile:
+      allOf:
+        - $ref: '#/components/schemas/BaselineProfileWrite'
+        - type: object
+          required:
+            - application_id
+            - job_name
+            - established_at
+            - updated_at
+          properties:
+            application_id:
+              type: string
+            job_name:
+              type: string
+            established_at:
+              type: string
+              format: date-time
+              description: When this baseline was first created
+            updated_at:
+              type: string
+              format: date-time
+              description: When this baseline was most recently updated
+
+    # ---------------------------------------------------------------------------
+    # INCIDENTS
+    # ---------------------------------------------------------------------------
+
+    IncidentWrite:
+      type: object
+      required:
+        - application_id
+        - job_name
+        - source_job
+        - trigger_type
+        - description
+        - ai_assessment
+        - ai_recommended_action
+        - run_id
+      properties:
+        application_id:
+          type: string
+        job_name:
+          type: string
+        source_job:
+          type: string
+          enum: [ai-lien, results]
+          description: Who is recording this incident.
+        trigger_type:
+          type: string
+          enum: [contract_test_failure, plot_test_failure, ac_silence, ac_latency_alert, direct_escalation]
+        description:
+          type: string
+          description: Human-readable description of what failed and the context
+        ai_assessment:
+          type: string
+          description: >
+            AI-lien's first-tap assessment: what failed, likely causes,
+            suggested investigation steps. Present for ai-lien source.
+            May be a summary assessment for results source.
+        ai_recommended_action:
+          type: string
+          description: AI-lien's second-tap recommendation for remediation
+        run_id:
+          type: string
+          description: Test run ID that triggered this incident
+        related_trend_point_ids:
+          type: array
+          items:
+            type: string
+          description: Trend points in Lore that contributed to this incident's context
+
+    Incident:
+      allOf:
+        - $ref: '#/components/schemas/IncidentWrite'
+        - type: object
+          required:
+            - incident_id
+            - status
+            - recorded_at
+          properties:
+            incident_id:
+              type: string
+              example: "lore-inc-a1b2c3d4"
+            status:
+              type: string
+              enum: [open, resolved, unacknowledged_clear]
+              description: >
+                open — condition active, no resolution recorded.
+                resolved — condition cleared, resolution recorded.
+                unacknowledged_clear — condition cleared before any
+                human acknowledgment. Flagged for post-mortem review.
+            recorded_at:
+              type: string
+              format: date-time
+            resolved_at:
+              type: string
+              format: date-time
+            resolution_summary:
+              type: string
+              description: Present when status is resolved or unacknowledged_clear
+            ai_assessment_correct:
+              type: boolean
+              description: >
+                Whether the AI assessment was correct, as determined by
+                the Wr4ngler correction (if one was filed) or inferred
+                from resolution. Absent if no correction filed and
+                correctness cannot be determined.
+
+    IncidentList:
+      type: object
+      required:
+        - incidents
+        - total
+        - open_count
+        - resolved_count
+      properties:
+        incidents:
+          type: array
+          items:
+            $ref: '#/components/schemas/Incident'
+        total:
+          type: integer
+        open_count:
+          type: integer
+        resolved_count:
+          type: integer
+
+    IncidentResolution:
+      type: object
+      required:
+        - resolved_by
+        - resolution_summary
+      properties:
+        resolved_by:
+          type: string
+          enum: [ai-lien, results]
+          description: Who is recording the resolution.
+        resolution_summary:
+          type: string
+          description: What cleared the condition
+        ai_assessment_correct:
+          type: boolean
+          description: >
+            Whether the AI assessment proved correct. Set by AI-lien
+            when it can determine this from the resolution context.
+            Absent if indeterminate.
+
+    # ---------------------------------------------------------------------------
+    # PATTERNS
+    # ---------------------------------------------------------------------------
+
+    PatternWrite:
+      type: object
+      required:
+        - application_id
+        - name
+        - description
+        - sequence
+        - observed_count
+        - associated_outcome
+      properties:
+        application_id:
+          type: string
+          description: Application this pattern was observed in
+        job_name:
+          type: string
+          description: >
+            Primary Job this pattern concerns, if it can be attributed
+            to one. Absent for multi-Job patterns.
+        name:
+          type: string
+          description: Short identifier for this pattern
+          example: "pre_failure_latency_spike"
+        description:
+          type: string
+          description: >
+            What this pattern is and what it predicts. Written by AI-lien
+            at the time of pattern identification.
+        sequence:
+          type: array
+          items:
+            type: object
+            required:
+              - signal_type
+              - description
+            properties:
+              signal_type:
+                type: string
+              description:
+                type: string
+              typical_duration_minutes:
+                type: integer
+          description: Ordered sequence of signals that compose this pattern
+        observed_count:
+          type: integer
+          description: Number of times this sequence has been observed
+          example: 3
+        associated_outcome:
+          type: string
+          description: What this pattern has reliably preceded or accompanied
+          example: "contract test failure on POST /event within 2 hours of pattern onset"
+        source_incident_ids:
+          type: array
+          items:
+            type: string
+          description: Incident IDs whose analysis led to this pattern being identified
+
+    Pattern:
+      allOf:
+        - $ref: '#/components/schemas/PatternWrite'
+        - type: object
+          required:
+            - pattern_id
+            - identified_at
+            - updated_at
+          properties:
+            pattern_id:
+              type: string
+              example: "lore-pat-a1b2c3d4"
+            identified_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
+            last_observed_at:
+              type: string
+              format: date-time
+
+    PatternList:
+      type: object
+      required:
+        - patterns
+        - total
+      properties:
+        patterns:
+          type: array
+          items:
+            $ref: '#/components/schemas/Pattern'
+        total:
+          type: integer
+
+    # ---------------------------------------------------------------------------
+    # CORRECTIONS (stubbed)
+    # ---------------------------------------------------------------------------
+
+    CorrectionWrite:
+      type: object
+      required:
+        - incident_id
+        - wrangler_id
+        - correction
+      properties:
+        incident_id:
+          type: string
+          description: The incident whose AI assessment is being corrected
+        wrangler_id:
+          type: string
+          description: The Wr4ngler filing the correction
+        correction:
+          type: string
+          description: What the correct assessment or action should have been
+        ai_was_correct:
+          type: boolean
+          description: >
+            Whether the AI assessment was actually correct despite appearing
+            wrong. Allows a Wr4ngler to confirm an assessment rather than
+            correct it — useful for audit purposes.
+
+    # ---------------------------------------------------------------------------
+    # HEALTH
+    # ---------------------------------------------------------------------------
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - trend_points_stored
+        - baselines_established
+        - incidents_open
+        - incidents_total
+        - patterns_learned
+        - uptime_seconds
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+          description: >
+            degraded when database connectivity is impaired.
+            Lore degraded means AI-lien is operating without institutional
+            memory — a significant operational risk that warrants immediate
+            attention.
+        trend_points_stored:
+          type: integer
+        baselines_established:
+          type: integer
+        incidents_open:
+          type: integer
+        incidents_total:
+          type: integer
+        patterns_learned:
+          type: integer
+        uptime_seconds:
+          type: integer
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          example: "BASELINE_NOT_FOUND"
+        message:
+          type: string
+          example: "No baseline established for job 'contract-test' in application 'seti'"

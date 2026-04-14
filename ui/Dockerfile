@@ -19,7 +19,7 @@ RUN npm run build
 FROM golang:1.22-bookworm AS server-builder
 
 WORKDIR /app
-COPY ui/server/main.go .
+COPY ui/server/*.go .
 RUN go mod init seti-ui-server && \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ui-server .
 

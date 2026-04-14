@@ -8,10 +8,13 @@ Phase 2: in-memory storage.
 Swap point: replace _store dicts with PostgreSQL in Phase 4.
 """
 
+import base64
+import hashlib
 import json
 import logging
 import os
 import ssl
+from certforge import obtain_certs, build_client_ssl_context, build_server_ssl_context, self_register_with_ac
 import threading
 import time
 from datetime import datetime, timezone
@@ -60,16 +63,12 @@ _start_time = time.time()
 
 def _build_ssl_context() -> Optional[ssl.SSLContext]:
     try:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.load_verify_locations('/certs/ca.crt')
-        ctx.load_cert_chain('/certs/results.crt', '/certs/results.key')
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-        return ctx
+        return build_client_ssl_context()
     except Exception as e:
-        log.warning(f'Could not load mTLS certs: {e} — observability reporting disabled')
+        log.warning(f'Could not build mTLS context: {e} — observability reporting disabled')
         return None
 
-_ssl_ctx = _build_ssl_context()
+_ssl_ctx = None  # type: Optional[ssl.SSLContext] — initialized after obtain_certs()
 
 def report_event(callee: str, method: str, path: str, status: int, latency_ms: int):
     """Fire-and-forget observability report."""
@@ -107,18 +106,24 @@ class ResultsHandler(BaseHTTPRequestHandler):
         pass  # Suppress default access log — structured logging only
 
     def send_json(self, status: int, body: dict):
-        payload = json.dumps(body).encode()
-        self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', len(payload))
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            payload = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(payload))
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def read_body(self) -> dict:
-        length = int(self.headers.get('Content-Length', 0))
-        if length == 0:
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            if length == 0:
+                return {}
+            return json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, ValueError):
             return {}
-        return json.loads(self.rfile.read(length))
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -332,21 +337,81 @@ class ResultsHandler(BaseHTTPRequestHandler):
 # mTLS HTTPS server
 # ---------------------------------------------------------------------------
 
-def build_server_ssl_context() -> ssl.SSLContext:
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_verify_locations('/certs/ca.crt')
-    ctx.load_cert_chain('/certs/results.crt', '/certs/results.key')
-    ctx.verify_mode = ssl.CERT_REQUIRED
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-    return ctx
+def _build_server_ssl_context() -> ssl.SSLContext:
+    return build_server_ssl_context()  # from certforge
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+
+def self_register():
+    """Sign and POST a self-registration request to Augur Canis.
+    Uses openssl subprocess — available in python:slim-bookworm runtime.
+    """
+    import base64, datetime, subprocess
+
+    ac_url = os.environ.get('AUGUR_CANIS_URL', 'https://augur-canis:4010')
+    service_name = 'results'
+    endpoint = 'https://results:4008'
+    cert_path = f'/certs/results.crt'
+    key_path  = f'/certs/results.key'
+
+    try:
+        timestamp = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        r = subprocess.run(
+            ['openssl', 'x509', '-fingerprint', '-sha256', '-noout', '-in', cert_path],
+            capture_output=True, text=True, check=True
+        )
+        fingerprint = r.stdout.strip().split('=')[-1].replace(':', '').lower()
+
+        payload = (service_name + endpoint + fingerprint + timestamp).encode()
+        r = subprocess.run(
+            ['openssl', 'dgst', '-sha256', '-sign', key_path, '-binary'],
+            input=payload, capture_output=True, check=True
+        )
+        signature_b64 = base64.b64encode(r.stdout).decode()
+
+        body = json.dumps({
+            'service_name':     service_name,
+            'network_endpoint': endpoint,
+            'cert_fingerprint': fingerprint,
+            'timestamp':        timestamp,
+            'signature':        signature_b64,
+        }).encode()
+
+        req = URLRequest(
+            f'{ac_url}/services/register',
+            data=body,
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        with urlopen(req, context=_ssl_ctx, timeout=10) as resp:
+            ack = json.loads(resp.read())
+            log.info(f'[results] selfRegister: registered with AC (status={ack.get("status")})')
+    except Exception as e:
+        log.warning(f'[results] selfRegister: failed: {e} — AC may not be ready yet')
+
+
+class ResilientHTTPServer(HTTPServer):
+    """Suppresses broken pipe and SSL errors on individual mTLS connections."""
+    def handle_error(self, request, client_address):
+        import sys
+        exc_type = sys.exc_info()[0]
+        if exc_type in (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+            return
+        super().handle_error(request, client_address)
+
+
 if __name__ == '__main__':
-    server = HTTPServer(('', PORT), ResultsHandler)
-    server.socket = build_server_ssl_context().wrap_socket(
+    # Must obtain certs FIRST — all SSL contexts depend on cert material
+    obtain_certs('results')
+    _ssl_ctx = _build_ssl_context()
+    threading.Thread(target=self_register_with_ac, args=('results', 'https://results:4008'), daemon=True).start()
+    server = ResilientHTTPServer(('', PORT), ResultsHandler)
+    ssl_ctx = _build_server_ssl_context()
+    server.socket = ssl_ctx.wrap_socket(
         server.socket,
         server_side=True,
     )

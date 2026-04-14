@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
+import { useConstellation } from '../hooks/useConstellation';
+import ConstellationNav from '../components/ConstellationNav';
 
 const GATEWAY = import.meta.env.VITE_GATEWAY_URL || '';
 
@@ -70,7 +72,8 @@ const METHOD_COLORS: Record<string, string> = {
 };
 
 export default function Plots() {
-  const { jwt, getFreshJWT, wranglerId, clearanceLevel, logout } = useAuth();
+  const { jwt, getFreshJWT, getJWTWithRefresh, wranglerId, clearanceLevel, logout } = useAuth();
+  const { active, constellations, setConstellation } = useConstellation(jwt);
   const [plots, setPlots] = useState<Plot[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -81,6 +84,9 @@ export default function Plots() {
   const [plotResults, setPlotResults] = useState<Record<string, PlotResult[]>>({});
   const [loadingResults, setLoadingResults] = useState<Record<string, boolean>>({});
   const [expandedStep, setExpandedStep] = useState<string | null>(null);
+
+  const [runAll, setRunAll] = useState(false);
+  const [runAllResults, setRunAllResults] = useState<Array<{plot: Plot; result: PlotResult | null; error?: string}> | null>(null);
 
   async function authFetch(path: string, options: RequestInit = {}) {
     const freshJwt = await getFreshJWT();
@@ -96,8 +102,11 @@ export default function Plots() {
   }
 
   async function loadPlots() {
+    setLoading(true);
+    setSelectedPlot(null);
+    setPlotResults({});
     try {
-      const res = await authFetch('/plots');
+      const res = await authFetch(`/plots?application_id=${active.id}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const sorted = (data.plots || []).sort((a: Plot, b: Plot) =>
@@ -139,13 +148,145 @@ export default function Plots() {
     }
   }
 
-  useEffect(() => { if (jwt) loadPlots(); }, [jwt]);
+  async function runAllPlots() {
+    if (plots.length === 0) return;
+    setRunAll(true);
+    setRunAllResults(null);
+    setRunMessage(null);
+
+    const results: Array<{plot: Plot; result: PlotResult | null; error?: string}> = [];
+
+    for (const plot of plots) {
+      try {
+        // Get a fresh JWT once per plot — don't thrash silentRefresh in the poll loop
+        const freshJwt = await getJWTWithRefresh();
+        if (!freshJwt) {
+          results.push({ plot, result: null, error: 'Session expired — re-login required' });
+          continue;
+        }
+
+        const res = await fetch(`${GATEWAY}/run-plot-test`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${freshJwt}` },
+          body: JSON.stringify({ plot_id: plot.plot_id, application_id: plot.application_id }),
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          results.push({ plot, result: null, error: data.message || `HTTP ${res.status}` });
+          continue;
+        }
+
+        // Poll for completion — use the same JWT, only refresh if it expires
+        let runResult: PlotResult | null = null;
+        let pollJwt = freshJwt;
+        for (let i = 0; i < 20; i++) {
+          await new Promise(r => setTimeout(r, 3000));
+          // Refresh JWT if it has been a while (every 5 polls ~15s)
+          if (i > 0 && i % 5 === 0) {
+            const refreshed = await getJWTWithRefresh();
+            if (refreshed) pollJwt = refreshed;
+          }
+          const rRes = await fetch(`${GATEWAY}/plot-results?plot_id=${plot.plot_id}&limit=1`, {
+            headers: { Authorization: `Bearer ${pollJwt}` },
+          });
+          if (rRes.ok) {
+            const data = await rRes.json();
+            const run = (data.runs || [])[0];
+            if (run && run.status !== 'running') {
+              runResult = run;
+              setPlotResults(prev => ({ ...prev, [plot.plot_id]: [run, ...(prev[plot.plot_id] || []).slice(0, 4)] }));
+              break;
+            }
+          }
+        }
+        results.push({ plot, result: runResult });
+      } catch (e: unknown) {
+        results.push({ plot, result: null, error: e instanceof Error ? e.message : 'Unknown error' });
+      }
+    }
+
+    setRunAllResults(results);
+    setRunAll(false);
+  }
+
+  function downloadReport(results: Array<{plot: Plot; result: PlotResult | null; error?: string}>) {
+    const ts = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+    const passed = results.filter(r => r.result?.status === 'passed').length;
+    const total = results.length;
+    const lines: string[] = [];
+
+    lines.push('='.repeat(70));
+    lines.push('  S.E.T.I. — BEHAVIORAL TEST PLOT REPORT');
+    lines.push(`  Generated: ${ts}`);
+    lines.push(`  Summary: ${passed}/${total} plots passed`);
+    lines.push('='.repeat(70));
+    lines.push('');
+
+    for (const { plot, result, error } of results) {
+      const status = result?.status === 'passed' ? 'PASSED' : 'FAILED';
+      const icon = result?.status === 'passed' ? '✓' : '✗';
+      lines.push(`${icon} ${plot.name}  [${status}]`);
+      lines.push(`  application: ${plot.application_id}  version: v${plot.version || '?'}`);
+      if (error) {
+        lines.push(`  ERROR: ${error}`);
+      } else if (result) {
+        lines.push(`  steps: ${result.passed_steps}/${result.total_steps} passed  run: ${result.run_id}`);
+        lines.push(`  started: ${result.started_at ? new Date(result.started_at).toISOString() : 'unknown'}`);
+        if (result.steps && result.steps.length > 0) {
+          lines.push('');
+          lines.push('  STEPS:');
+          for (const step of result.steps) {
+            const stepIcon = step.passed ? '  ✓' : '  ✗';
+            lines.push(`${stepIcon} Step ${step.step_number}: ${step.description}`);
+            lines.push(`       status: ${step.actual_status}/${step.expected_status}  latency: ${step.latency_ms ?? 0}ms  chain: ${step.chain_passed ? 'ok' : 'FAIL'}`);
+            if (!step.passed) {
+              if (step.failure_reason) lines.push(`       reason: ${step.failure_reason}`);
+              if (step.chain_unmatched && step.chain_unmatched.length > 0) {
+                lines.push('       missing calls:');
+                for (const c of step.chain_unmatched) {
+                  lines.push(`         - ${c.caller} → ${c.callee}${c.method ? ' ' + c.method : ''}${c.path ? ' ' + c.path : ''}`);
+                }
+              }
+              if ((step as unknown as {assertion_results?: Array<{field: string; operator: string; passed: boolean; expected_value?: unknown; actual_value?: unknown}>}).assertion_results) {
+                const ar = (step as unknown as {assertion_results: Array<{field: string; operator: string; passed: boolean; expected_value?: unknown; actual_value?: unknown}>}).assertion_results;
+                const failed = ar.filter(a => !a.passed);
+                if (failed.length > 0) {
+                  lines.push('       failed assertions:');
+                  for (const a of failed) {
+                    lines.push(`         - ${a.field} ${a.operator} ${JSON.stringify(a.expected_value)} (got: ${JSON.stringify(a.actual_value)})`);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      lines.push('');
+      lines.push('-'.repeat(70));
+      lines.push('');
+    }
+
+    lines.push(`Report generated by S.E.T.I. — Search for Erroneous Tessellated Interactions`);
+
+    const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const _now = new Date();
+    a.download = `seti-plot-report-${_now.toISOString().slice(0, 10)}-${_now.toTimeString().slice(0, 8).replace(/:/g, '-')}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  useEffect(() => { if (jwt) loadPlots(); }, [jwt, active.id]);
 
   async function runPlot(plot: Plot) {
     setRunning(plot.plot_id);
     setRunMessage(null);
     try {
-      const freshJwt = await getFreshJWT();
+      const freshJwt = await getJWTWithRefresh();
       if (!freshJwt) throw new Error('Session expired');
       const res = await fetch(`${GATEWAY}/run-plot-test`, {
         method: 'POST',
@@ -186,6 +327,9 @@ export default function Plots() {
         </div>
         <div style={s.headerRight}>
           <Link to="/" style={s.navBtnGray}>{'<- Dashboard'}</Link>
+          {(clearanceLevel === 'sec-wr4ngler' || clearanceLevel === 'admin') && (
+            <Link to="/ring" style={s.navBtnGold}>Ring</Link>
+          )}
           {(clearanceLevel === 'sec_wrangler' || clearanceLevel === 'admin') && (
             <Link to="/admin" style={s.navBtnGold}>Admin</Link>
           )}
@@ -194,15 +338,90 @@ export default function Plots() {
         </div>
       </div>
 
+      <ConstellationNav
+        constellations={constellations}
+        active={active}
+        onSelect={setConstellation}
+      />
+
       <div style={s.body}>
         <div style={s.intro}>
-          <div style={s.introTitle}>BEHAVIORAL TEST PLOTS</div>
-          <div style={s.introText}>
-            Plots define real user flows with expected inter-service call chains.
-            Each plot is a committed artifact in contracts/plots/, versioned alongside
-            the OpenAPI contracts. Click a plot to expand steps and run history.
+          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16 }}>
+            <div>
+              <div style={s.introTitle}>BEHAVIORAL TEST PLOTS</div>
+              <div style={s.introText}>
+                Plots define real user flows with expected inter-service call chains.
+                Each plot is a committed artifact in contracts/plots/, versioned alongside
+                the OpenAPI contracts. Click a plot to expand steps and run history.
+              </div>
+            </div>
+            {plots.length > 0 && (
+              <button
+                style={{ ...s.runAllBtn, opacity: runAll ? 0.5 : 1, flexShrink: 0 }}
+                onClick={runAllPlots}
+                disabled={runAll}
+              >
+                {runAll ? `Running ${plots.length} plots...` : `>> Run All (${plots.length})`}
+              </button>
+            )}
           </div>
         </div>
+
+        {runAllResults && (
+          <div style={s.runAllPanel}>
+            <div style={s.runAllHeader}>
+              <span style={s.runAllTitle}>RUN ALL RESULTS</span>
+              <span style={{
+                ...s.runAllSummary,
+                color: runAllResults.every(r => r.result?.status === 'passed') ? '#3fb950' : '#f85149',
+              }}>
+                {runAllResults.filter(r => r.result?.status === 'passed').length}/{runAllResults.length} passed
+              </span>
+              <button
+                style={s.reportBtn}
+                onClick={() => downloadReport(runAllResults)}
+              >
+                ↓ Report
+              </button>
+              <button style={s.bannerClose} onClick={() => setRunAllResults(null)}>x</button>
+            </div>
+            {runAllResults.map(({ plot, result, error }) => (
+              <div key={plot.plot_id} style={{
+                ...s.runAllRow,
+                borderLeftColor: result?.status === 'passed' ? '#3fb950' : '#f85149',
+              }}>
+                <span style={{ color: result?.status === 'passed' ? '#3fb950' : '#f85149', fontSize: 12, flexShrink: 0 }}>
+                  {result?.status === 'passed' ? '+' : 'x'}
+                </span>
+                <span style={s.runAllPlotName}>{plot.name}</span>
+                {result ? (
+                  <span style={s.runAllSteps}>
+                    {result.passed_steps}/{result.total_steps} steps
+                  </span>
+                ) : (
+                  <span style={{ fontSize: 11, color: '#f85149', fontStyle: 'italic' }}>
+                    {error || 'No result'}
+                  </span>
+                )}
+                {result?.steps && result.steps.some(s => !s.passed) && (
+                  <div style={s.runAllFailDetail}>
+                    {result.steps.filter(s => !s.passed).map(step => (
+                      <div key={step.step_number} style={s.runAllFailStep}>
+                        <span style={{ color: '#484f58' }}>Step {step.step_number}:</span>
+                        <span style={{ color: '#f85149' }}>{step.failure_reason || 'failed'}</span>
+                        {step.actual_status !== undefined && (
+                          <span style={{ color: '#484f58', fontFamily: "'Courier New', monospace", fontSize: 10 }}>
+                            got {step.actual_status}, expected {step.expected_status}
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
 
         {runMessage && (
           <div style={runMsgOk ? s.bannerOk : s.bannerErr}>
@@ -221,7 +440,7 @@ export default function Plots() {
         {loading ? (
           <div style={s.empty}>Loading plots...</div>
         ) : plots.length === 0 ? (
-          <div style={s.empty}>No plots found. Plot Store loads from contracts/plots/ on startup.</div>
+          <div style={s.empty}>No plots found for {active.label}. Plot Store loads from contracts/plots/ on startup.</div>
         ) : (
           <div style={s.plotList}>
             {plots.map(plot => {
@@ -477,4 +696,22 @@ const s: Record<string, React.CSSProperties> = {
   stepResultCode: { fontSize: 11, color: '#6e7681', fontFamily: "'Courier New', monospace" },
   stepResultLatency: { fontSize: 11, color: '#484f58' },
   stepResultError: { fontSize: 11, color: '#f85149', fontStyle: 'italic' },
+  reportBtn: { background: 'none', border: '1px solid #30363d', borderRadius: 4, color: '#8b949e', fontSize: 11, cursor: 'pointer', padding: '3px 10px', fontFamily: 'inherit' },
+  runAllBtn: { background: '#388bfd26', border: '1px solid #1f6feb', borderRadius: 4, color: '#58a6ff', fontSize: 11, cursor: 'pointer', padding: '7px 16px', fontFamily: 'inherit', whiteSpace: 'nowrap' },
+  runAllPanel: { background: '#161b22', border: '1px solid #21262d', borderRadius: 8, padding: '16px 20px', marginBottom: 20 },
+  runAllHeader: { display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 },
+  runAllTitle: { fontSize: 10, color: '#484f58', letterSpacing: 2, flex: 1 },
+  runAllSummary: { fontSize: 13, fontWeight: 600 },
+  runAllRow: { display: 'flex', flexDirection: 'column' as const, gap: 4, padding: '8px 10px', marginBottom: 6, borderLeft: '3px solid', borderTop: '1px solid #21262d', borderRight: '1px solid #21262d', borderBottom: '1px solid #21262d', borderRadius: '0 4px 4px 0', background: '#0d1117' },
+  runAllPlotName: { fontSize: 13, fontWeight: 600, color: '#e6edf3', flex: 1 },
+  runAllSteps: { fontSize: 11, color: '#6e7681' },
+  runAllFailDetail: { display: 'flex', flexDirection: 'column' as const, gap: 3, marginTop: 4, paddingLeft: 12 },
+  runAllFailStep: { display: 'flex', gap: 8, fontSize: 11, flexWrap: 'wrap' as const },
+  stepDetailRow: { display: 'flex', gap: 8, marginTop: 6, alignItems: 'flex-start' },
+  stepDetailLabel: { fontSize: 10, color: '#484f58', letterSpacing: 1, flexShrink: 0, marginTop: 2 },
+  stepDetailValue: { fontSize: 11, color: '#8b949e' },
+  stepDetailPre: { fontSize: 10, color: '#8b949e', background: '#161b22', border: '1px solid #21262d', borderRadius: 3, padding: '6px 8px', margin: 0, overflow: 'auto', maxHeight: 200 },
+  chainDetailList: { display: 'flex', flexDirection: 'column' as const, gap: 3 },
+  chainDetailItemPass: { fontSize: 10, color: '#3fb950', fontFamily: "'Courier New', monospace", background: 'rgba(63,185,80,0.06)', padding: '1px 6px', borderRadius: 2 },
+  chainDetailItemFail: { fontSize: 10, color: '#f85149', fontFamily: "'Courier New', monospace", background: 'rgba(248,81,73,0.06)', padding: '1px 6px', borderRadius: 2 },
 };

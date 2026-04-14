@@ -1,7 +1,7 @@
 {
   "name": "signal-clearance",
   "version": "0.1.0",
-  "description": "SETI Signal Clearance Job — federated OIDC identity and clearance management",
+  "description": "SETI Signal Clearance Job \u2014 federated OIDC identity and clearance management",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
@@ -13,13 +13,15 @@
     "jose": "^5.2.4",
     "jsonwebtoken": "^9.0.2",
     "redis": "^4.6.13",
-    "uuid": "^9.0.1"
+    "uuid": "^9.0.1",
+    "cookie-parser": "^1.4.6"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/jsonwebtoken": "^9.0.6",
     "@types/node": "^20.12.2",
     "@types/uuid": "^9.0.8",
-    "typescript": "^5.4.4"
+    "typescript": "^5.4.4",
+    "@types/cookie-parser": "^1.4.7"
   }
 }

@@ -32,9 +32,9 @@ export function seedDevGroupMappings(): void {
 
   const mappings = [
     { group_id: 'dev-admin', group_display_name: 'Dev-Admin', clearance_level: 'admin' },
-    { group_id: 'dev-sec', group_display_name: 'Dev-Sec-Wranglers', clearance_level: 'sec-wrangler' },
-    { group_id: 'dev-ops', group_display_name: 'Dev-Ops-Wranglers', clearance_level: 'ops-wrangler' },
-    { group_id: 'dev-connie', group_display_name: 'Dev-Connie-Wranglers', clearance_level: 'connie-wrangler' },
+    { group_id: 'dev-sec', group_display_name: 'Dev-Sec-Wranglers', clearance_level: 'sec-wr4ngler' },
+    { group_id: 'dev-ops', group_display_name: 'Dev-Ops-Wranglers', clearance_level: 'ops-wr4ngler' },
+    { group_id: 'dev-connie', group_display_name: 'Dev-Connie-Wranglers', clearance_level: 'connie-wr4ngler' },
   ];
 
   for (const m of mappings) {

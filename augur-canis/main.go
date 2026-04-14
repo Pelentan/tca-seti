@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -70,16 +69,19 @@ var (
 	contractResultTTL = 60 * time.Second
 
 	// Redis key prefixes
-	keyLastSeen       = "ac:state:%s:last_seen"
+	keyLastSeen        = "ac:state:%s:last_seen"
 	keyLastContainerID = "ac:state:%s:last_container_id"
-	keyLatencyWindow  = "ac:state:%s:latency_window"
-	keyHealthWindow   = "ac:state:%s:health_window"
-	keyAlertActive    = "ac:state:%s:alert_active"
-	keyAlertID        = "ac:state:%s:alert_id"
-	keyAlertType      = "ac:state:%s:alert_type"
-	keyBarkCount      = "ac:state:%s:bark_count"
-	keyLastBarkAt     = "ac:state:%s:last_bark_at"
-	keyAlertFirstAt   = "ac:state:%s:alert_first_at"
+	keyLatencyStream   = "ac:metrics:%s:latency" // Redis Stream — replaces keyLatencyWindow
+	keyHealthStream    = "ac:metrics:%s:health"  // Redis Stream — replaces keyHealthWindow
+	keyAlertActive     = "ac:state:%s:alert_active"
+	keyAlertID         = "ac:state:%s:alert_id"
+	keyAlertType       = "ac:state:%s:alert_type"
+	keyBarkCount       = "ac:state:%s:bark_count"
+	keyLastBarkAt      = "ac:state:%s:last_bark_at"
+	keyAlertFirstAt    = "ac:state:%s:alert_first_at"
+
+	// Stream retention — keep 24h of metric samples per Job
+	metricsStreamMaxLen = int64(2000) // ~24h at 30s check interval
 
 	// Active alerts stored by alert_id for acknowledgment lookup
 	keyAlertByID = "ac:alert:%s" // ac:alert:{alert_id} → service_name
@@ -296,17 +298,32 @@ func recordHealthState(ctx context.Context, serviceName, containerID string, hea
 	// Track container ID for K8s replacement detection
 	pipe.Set(ctx, fmt.Sprintf(keyLastContainerID, serviceName), containerID, 0)
 
-	// Rolling latency window — capped at 20 samples
-	// STUB: stored but not evaluated
-	latencyKey := fmt.Sprintf(keyLatencyWindow, serviceName)
-	pipe.LPush(ctx, latencyKey, latencyMs)
-	pipe.LTrim(ctx, latencyKey, 0, 19)
+	// Latency stream — time-series samples for UI and detectors
+	// XADD auto-generates a millisecond timestamp as the stream ID
+	pipe.XAdd(ctx, &redis.XAddArgs{
+		Stream: fmt.Sprintf(keyLatencyStream, serviceName),
+		MaxLen: metricsStreamMaxLen,
+		Approx: true,
+		ID:     "*",
+		Values: map[string]interface{}{
+			"latency_ms":  latencyMs,
+			"service":     serviceName,
+			"container_id": containerID,
+		},
+	})
 
-	// Rolling health window — 0/1 per check, capped at 20 samples
-	// STUB: stored but not evaluated
-	healthKey := fmt.Sprintf(keyHealthWindow, serviceName)
-	pipe.LPush(ctx, healthKey, healthy)
-	pipe.LTrim(ctx, healthKey, 0, 19)
+	// Health stream — 0/1 samples for failure rate detector and UI
+	pipe.XAdd(ctx, &redis.XAddArgs{
+		Stream: fmt.Sprintf(keyHealthStream, serviceName),
+		MaxLen: metricsStreamMaxLen,
+		Approx: true,
+		ID:     "*",
+		Values: map[string]interface{}{
+			"healthy":     healthy,
+			"service":     serviceName,
+			"container_id": containerID,
+		},
+	})
 
 	pipe.Exec(ctx)
 
@@ -591,40 +608,15 @@ func getRegisteredJob(ctx context.Context, serviceName string) (*RegisteredJobRe
 // Ensures registered jobs survive AC restarts
 // ---------------------------------------------------------------------------
 
-// bootstrapJobs seeds the in-memory registry with Phase 2 Jobs on startup.
-// AC must know its constellation regardless of whether Policy has registered yet.
-// Policy's POST /jobs calls update these records with any additional detail;
-// the bootstrap ensures contract tests work even if Policy registration is delayed.
-func bootstrapJobs() {
-	defaultJobs := []RegisteredJobRecord{
-		{ServiceName: "gateway",           NetworkEndpoint: envOr("ENDPOINT_GATEWAY",          "https://gateway:4000"),          Description: "SETI external gateway"},
-		{ServiceName: "seti-observability",NetworkEndpoint: envOr("ENDPOINT_OBSERVABILITY",     "https://seti-observability:4011"), Description: "SETI observability event collector"},
-		{ServiceName: "signal-clearance",  NetworkEndpoint: envOr("ENDPOINT_SIGNAL_CLEARANCE",  "https://signal-clearance:4001"), Description: "SETI identity and clearance"},
-		{ServiceName: "ui",                NetworkEndpoint: envOr("ENDPOINT_UI",                "https://ui:4020"),                Description: "SETI monitoring dashboard"},
-		{ServiceName: "augur-canis",       NetworkEndpoint: envOr("ENDPOINT_AUGUR_CANIS",       "https://augur-canis:4010"),      Description: "SETI Augur Canis health agent"},
-		{ServiceName: "policy",            NetworkEndpoint: envOr("ENDPOINT_POLICY",            "https://policy:4002"),           Description: "SETI policy and application registry"},
-		{ServiceName: "contract-test",     NetworkEndpoint: envOr("ENDPOINT_CONTRACT_TEST",     "https://contract-test:4003"),    Description: "SETI contract test executor"},
-		{ServiceName: "results",           NetworkEndpoint: envOr("ENDPOINT_RESULTS",           "https://results:4008"),          Description: "SETI test results store"},
-		{ServiceName: "signal-aggregator", NetworkEndpoint: envOr("ENDPOINT_SIGNAL_AGGREGATOR", "https://signal-aggregator:4006"), Description: "SETI signal aggregator"},
-		{ServiceName: "plot-store",        NetworkEndpoint: envOr("ENDPOINT_PLOT_STORE",        "https://plot-store:4005"),       Description: "SETI plot store"},
-		{ServiceName: "plot-test",         NetworkEndpoint: envOr("ENDPOINT_PLOT_TEST",         "https://plot-test:4004"),        Description: "SETI plot test executor"},
-		{ServiceName: "interactions",      NetworkEndpoint: envOr("ENDPOINT_INTERACTIONS",      "https://interactions:4009"),     Description: "SETI interactions (stub)"},
-		{ServiceName: "feed-wr4ngler",     NetworkEndpoint: envOr("ENDPOINT_FEED_WRANGLER",     "https://feed-wrangler:4007"),    Description: "SETI feed wrangler"},
-		{ServiceName: "integration",      NetworkEndpoint: envOr("ENDPOINT_INTEGRATION",      "https://integration:4013"),      Description: "SETI versioned API"},
-		{ServiceName: "ai-lien",          NetworkEndpoint: envOr("ENDPOINT_AI_LIEN",          "https://ai-lien:4252"),          Description: "SETI AI diagnostic engine"},
-	}
-
-	now := time.Now().UTC().Format(time.RFC3339)
-	for i := range defaultJobs {
-		defaultJobs[i].RegisteredAt = now
-		registeredJobs[defaultJobs[i].ServiceName] = &defaultJobs[i]
-	}
-	log.Printf("[augur-canis] Bootstrapped %d Phase 2 Jobs into registry", len(defaultJobs))
-
-	// Also load any additional jobs previously registered in Redis by Policy
+// loadPersistedJobs restores self-registration records persisted to Redis.
+// On restart, services will re-register themselves within seconds.
+// This load ensures AC knows about them immediately rather than waiting
+// for the first health check cycle after each service comes up.
+func loadPersistedJobs() {
 	ctx := context.Background()
 	keys, err := rdb.Keys(ctx, "ac:job:*").Result()
 	if err != nil {
+		log.Printf("[augur-canis] Could not load persisted jobs from Redis: %v", err)
 		return
 	}
 	loaded := 0
@@ -641,7 +633,9 @@ func bootstrapJobs() {
 		loaded++
 	}
 	if loaded > 0 {
-		log.Printf("[augur-canis] Loaded %d additional jobs from Redis", loaded)
+		log.Printf("[augur-canis] Loaded %d self-registered jobs from Redis", loaded)
+	} else {
+		log.Printf("[augur-canis] No persisted jobs found — waiting for services to self-register")
 	}
 }
 
@@ -720,21 +714,6 @@ func checkSilence() {
 // ---------------------------------------------------------------------------
 // Stubbed detectors — latency drift and failure rate
 // ---------------------------------------------------------------------------
-
-func runLatencyDriftDetector() {
-	// STUB: data is recorded in recordHealthState but never evaluated here.
-	// Implementation: read ac:state:{service}:latency_window from Redis,
-	// compute rolling mean, compare current reading to mean * threshold multiplier,
-	// fire AlertLatencyDrift if exceeded for K consecutive cycles.
-	log.Printf("[augur-canis] STUB: Latency drift detector registered — not yet active")
-}
-
-func runFailureRateDetector() {
-	// STUB: data is recorded in recordHealthState but never evaluated here.
-	// Implementation: read ac:state:{service}:health_window from Redis,
-	// compute failure_count/window_size, fire AlertFailureRate if > threshold.
-	log.Printf("[augur-canis] STUB: Failure rate detector registered — not yet active")
-}
 
 // ---------------------------------------------------------------------------
 // Alert lifecycle
@@ -932,9 +911,8 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":           statusString(redisOK),
-		"stub_active":      true, // canned query execution not yet implemented
-		"jobs_registered":  0,
-		"queries_defined":  0,
+		"jobs_registered":  len(registeredJobs),
+		"queries_defined":  len(registeredJobs), // one query per registered job
 		"checks_completed": checksHandled.Load(),
 		"checks_failed":    0,
 		"active_alerts":    activeAlerts,
@@ -943,9 +921,9 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		"last_cycle_at":    time.Now().UTC().Format(time.RFC3339),
 		"uptime_seconds":   int(time.Since(startTime).Seconds()),
 		"detectors": map[string]string{
-			"silence":      "active",
-			"latency_drift": "stub",
-			"failure_rate":  "stub",
+			"silence":       "active",
+			"latency_drift": "active",
+			"failure_rate":  "active",
 		},
 	})
 }
@@ -954,7 +932,7 @@ func statusString(redisOK bool) string {
 	if !redisOK {
 		return "degraded"
 	}
-	return "stub_active"
+	return "healthy"
 }
 
 func handleAcknowledge(w http.ResponseWriter, r *http.Request) {
@@ -1059,9 +1037,8 @@ func handleConfiguration(w http.ResponseWriter, r *http.Request) {
 		"feed_channel":              healthFeedChannel,
 		"request_channel":           checkRequestsChannel,
 		"alerts_channel":            alertsChannel,
-		"stub_active":               true,
-		"jobs_registered":           0,
-		"queries_defined":           0,
+		"jobs_registered":           len(registeredJobs),
+		"queries_defined":           len(registeredJobs),
 	})
 }
 
@@ -1110,19 +1087,56 @@ func handleJobs(w http.ResponseWriter, r *http.Request) {
 
 func handleQueriesStub(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusNotImplemented)
-	json.NewEncoder(w).Encode(map[string]string{
-		"code":    "STUB_ACTIVE",
-		"message": "Canned query management deferred to Phase 4 full implementation.",
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"queries": setiContractTests,
+		"total":   len(setiContractTests),
 	})
 }
 
+// handleChecksStub handles /checks/{service} — returns recent results for a specific Job.
 func handleChecksStub(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusNotImplemented)
-	json.NewEncoder(w).Encode(map[string]string{
-		"code":    "STUB_ACTIVE",
-		"message": "Direct check triggering deferred to Phase 4 full implementation.",
+	service := strings.TrimPrefix(r.URL.Path, "/checks/")
+	service = strings.TrimSuffix(service, "/")
+
+	ctx := context.Background()
+	keys, err := rdb.Keys(ctx, "ac:contract-suite:*").Result()
+	if err != nil || len(keys) == 0 {
+		json.NewEncoder(w).Encode(map[string]interface{}{"checks": []interface{}{}, "service": service})
+		return
+	}
+
+	var latest string
+	for _, k := range keys {
+		if latest == "" || k > latest {
+			latest = k
+		}
+	}
+
+	raw, err := rdb.Get(ctx, latest).Result()
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{"checks": []interface{}{}, "service": service})
+		return
+	}
+
+	var suite ContractSuiteResult
+	if err := json.Unmarshal([]byte(raw), &suite); err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{"checks": []interface{}{}, "service": service})
+		return
+	}
+
+	checks := []ContractTestResult{}
+	for _, res := range suite.Results {
+		if res.ServiceName == service {
+			checks = append(checks, res)
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"service": service,
+		"checks":  checks,
+		"total":   len(checks),
+		"run_id":  suite.RunID,
 	})
 }
 
@@ -1133,29 +1147,14 @@ func handleChecksStub(w http.ResponseWriter, r *http.Request) {
 var upstreamClient *http.Client
 
 func buildUpstreamClient() {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Printf("[augur-canis] CA cert not found — observability reporting will fail: %v", err)
+	if certMat == nil {
+		log.Printf("[augur-canis] certMat not ready — using default client")
 		upstreamClient = http.DefaultClient
 		return
 	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-
-	cert, err := tls.LoadX509KeyPair("/certs/augur-canis.crt", "/certs/augur-canis.key")
-	if err != nil {
-		log.Printf("[augur-canis] Service cert not found — observability reporting will fail: %v", err)
-		upstreamClient = http.DefaultClient
-		return
-	}
-
 	upstreamClient = &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				RootCAs:      caPool,
-				Certificates: []tls.Certificate{cert},
-				MinVersion:   tls.VersionTLS13,
-			},
+			TLSClientConfig: buildClientTLS(certMat),
 		},
 		Timeout: 5 * time.Second,
 	}
@@ -1207,51 +1206,44 @@ func (b bytesReader) Read(p []byte) (n int, err error) {
 // ---------------------------------------------------------------------------
 
 func loadTLSConfig() *tls.Config {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Fatalf("[augur-canis] Failed to read CA cert: %v", err)
-	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-
-	cert, err := tls.LoadX509KeyPair("/certs/augur-canis.crt", "/certs/augur-canis.key")
-	if err != nil {
-		log.Fatalf("[augur-canis] Failed to load service cert: %v", err)
-	}
-
-	return &tls.Config{
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    caPool,
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-	}
+	return buildServerTLS(certMat)
 }
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
+var certMat *CertMaterial
+
 func main() {
+	certMat = obtainCerts("augur-canis")
 	buildUpstreamClient()
 	connectRedis()
-	bootstrapJobs()
+	loadPersistedJobs()
+
+	// Start dev UI if AC_UI_PORT is set (plain HTTP, no auth — dev/setup only)
+	startDevUI()
 
 	// Start check request handler
 	go handleCheckRequests()
 
-	// Start contract test request handler
+	// Start contract test request handler (Redis pub/sub path from contract-test Job)
 	go handleContractTestRequests()
+
+	// Start AC's own contract test scheduler
+	go runContractTestScheduler()
 
 	// Start silence detector
 	go runSilenceDetector()
 
-	// Register stubbed detectors (no-ops until implemented)
+	// Start latency drift and failure rate detectors
 	runLatencyDriftDetector()
 	runFailureRateDetector()
 
 	// Admin API
 	mux := http.NewServeMux()
 	loadStarGazerCert()
+	go selfRegisterWithAC(certMat, "https://augur-canis:4010")
 
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/federation/register", handleFederationRegister)
@@ -1262,7 +1254,24 @@ func main() {
 	mux.HandleFunc("/alerts/", handleAcknowledge) // /alerts/{id}/acknowledge
 	mux.HandleFunc("/jobs", handleJobs)
 	mux.HandleFunc("/queries/", handleQueriesStub)
+	mux.HandleFunc("/checks/recent", handleRecentSuiteResults)
 	mux.HandleFunc("/checks/", handleChecksStub)
+	mux.HandleFunc("/run-contract-tests", handleRunContractTests)
+	mux.HandleFunc("/ring/run", handleAdHocContractTest)
+	mux.HandleFunc("/contract-suites", handleContractSuitesList)
+	mux.HandleFunc("/contract-suites/", handleContractSuiteDetail)
+	mux.HandleFunc("/baselines", handleListBaselines)
+	mux.HandleFunc("/baselines/", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			handleGetWranglerBaseline(w, r)
+		case http.MethodPost:
+			handleSetWranglerBaseline(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/metrics", handleMetrics)
 
 	server := &http.Server{
 		Addr:      ":" + port,
@@ -1276,7 +1285,7 @@ func main() {
 	log.Printf("[augur-canis] Silence threshold: %ds", silenceThresholdSec)
 	log.Printf("[augur-canis] Reminder interval: %ds", reminderIntervalSec)
 	log.Printf("[augur-canis] Initial barks: %d", maxInitialBarks)
-	log.Printf("[augur-canis] STUB: Canned query execution deferred to full implementation")
+	log.Printf("[augur-canis] Contract tests: %d tests, interval %ds", len(setiContractTests), contractTestIntervalSec)
 
 	if err := server.ListenAndServeTLS("", ""); err != nil {
 		log.Fatalf("[augur-canis] Server error: %v", err)

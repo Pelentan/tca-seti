@@ -140,3 +140,15 @@ SETI's own Plots are the reference implementation for Plot generation in the TCA
 *SETI is developed through Engineer-AI partnership as a demonstration of TCA methodology maturity.*
 
 *Michael E. Shaffer / AI Implementation Specialist / Systems Architect / Connie Wr4ngler*
+
+---
+
+## Language and Dependency Constraints
+
+### No Rust Dependencies
+No TCA Job or supporting binary may introduce a Rust dependency, directly or transitively through a package. This includes Python packages with Rust extensions (e.g. `cryptography`, `pydantic-core`, `orjson`) and any npm package compiled from Rust. The Go standard library, Python standard library, and Node.js built-in modules are the correct tools for cryptographic operations. If a package requires Rust to build, find a different approach.
+
+This constraint exists because Rust compilation introduces a toolchain dependency that is inconsistent with TCA's supply chain posture, and because packages with compiled extensions frequently fail in minimal runtime environments (distroless, scratch) in ways that are difficult to diagnose.
+
+### The Binary Pattern
+Cross-language operations (health checking, self-registration, certificate operations) are handled by small static Go binaries compiled with `CGO_ENABLED=0`. These binaries are copied into every container regardless of the container's primary language. This is the same pattern as `/healthcheck` — one implementation, available everywhere, no language-specific reimplementation.

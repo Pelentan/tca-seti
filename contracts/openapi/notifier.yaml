@@ -1,0 +1,316 @@
+openapi: 3.1.0
+
+info:
+  title: SETI - Notifier Job
+  description: |
+    Wakes a human. That's it.
+
+    The Notifier Job is a thin, intentionally opaque pager. It receives
+    a prompt and fires a notification through whatever mechanism the
+    operator has configured for their environment. SETI does not know
+    and does not care whether that is PagerDuty, SMS, a Teams webhook,
+    an email relay, or a physical siren in the server room.
+
+    This is a PERMANENT STUB in the open source distribution. If you
+    cloned this repository, you must implement this Job for your
+    environment before SETI can page humans. The contract is what you
+    implement against — the implementation is yours.
+
+    STUB STATUS: This implementation logs the notification request and
+    returns 202. It does not deliver any notification to any human.
+    Replace the stub handler with your notification mechanism before
+    deploying to production.
+
+    Design principles:
+    - The prompt is deliberately minimal. Sensitive incident details
+      (topology, credentials, baselines, full Lore context) travel
+      through secure internal channels, not through the notification
+      payload. The human follows the alert into SETI for the full
+      picture.
+    - The Notifier does not diagnose, does not reason, and does not
+      make decisions. It pages. AI-lien handles briefing assembly in
+      parallel via Interactions.
+    - Interactions is the only authorized caller. AI-lien returns
+      escalation recommendations to Interactions, which calls Notifier.
+      AI-lien never calls Notifier directly. This keeps the audit trail
+      in one place.
+    - The Notifier is fire-and-forget from the caller's perspective.
+      Interactions does not wait for delivery confirmation. If the
+      Notifier fails, it is an AC health event, not a call failure.
+
+    Internal service — mTLS only, not externally exposed.
+  version: 0.1.0
+
+x-tca-security:
+  transport: mtls
+  tls-min-version: "1.3"
+  client-cert-required: true
+  reject-without-client-cert: true
+  ca-cert: /certs/ca.crt
+  service-cert: /certs/notifier.crt
+  service-key: /certs/notifier.key
+  implementation:
+    server:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      require-and-verify-client-cert: true
+    client:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      verify-server-cert: true
+  notes: >
+    Sole authorized caller: Interactions Job. All other callers must
+    be rejected. The Notifier does not accept unauthenticated requests
+    under any circumstances — if it did, anyone on the internal network
+    could page on-call engineers arbitrarily.
+
+x-tca-observability:
+  report-outbound-calls: true
+  endpoint: https://seti-observability:4011/event
+  pattern: fire-and-forget
+  caller-name: "notifier"
+  required-fields:
+    - caller
+    - callee
+    - method
+    - path
+    - status_code
+    - latency_ms
+    - protocol
+  implementation:
+    timing: wrap-every-outbound-http-call
+    non-blocking: true
+    on-failure: log-and-drop
+    do-not-instrument:
+      - seti-observability
+  notes: >
+    The Notifier's outbound calls are to external notification systems
+    (PagerDuty, SMS gateway, webhook endpoint, etc.) — these are the
+    calls that matter most to instrument. Latency spikes here mean
+    humans are not being paged in a timely manner. Report every call.
+
+x-tca-stub:
+  permanent: true
+  reason: >
+    The notification mechanism is operator-specific. No default
+    implementation exists or should exist. This is not a temporary
+    stub pending Phase N — it is a defined integration point that
+    every operator must implement for their environment.
+  implementation-guidance: |
+    Replace the stub handler in /notify with a call to your
+    notification system. The prompt field is all you need to send.
+    Do not add logic here — keep the Notifier dumb. If you find
+    yourself adding routing logic or severity thresholds to the
+    Notifier, that logic belongs in Interactions instead.
+  examples:
+    - PagerDuty Events API v2: POST to events.pagerduty.com with
+      prompt as the summary field
+    - Twilio SMS: send prompt as message body to on-call number
+    - Microsoft Teams: POST to incoming webhook with prompt as text
+    - AWS SNS: publish prompt to configured topic ARN
+    - Slack: POST to webhook URL with prompt as text field
+
+servers:
+  - url: https://notifier:4300
+    description: Internal SETI network (mTLS enforced)
+
+tags:
+  - name: notify
+    description: Human notification
+  - name: health
+    description: Service health
+
+paths:
+
+  /notify:
+    post:
+      tags: [notify]
+      summary: Page a human
+      description: |
+        Sends a notification to the on-call human using whatever
+        mechanism the operator has configured.
+
+        The prompt field is the complete content of the notification.
+        It should be terse enough to fit an SMS or a push notification.
+        Full incident context is available in SETI — the prompt is a
+        signal, not a briefing.
+
+        Always returns 202. Delivery confirmation is not part of this
+        contract. The Notifier is responsible for retry logic and
+        failure handling internally. Callers must not poll for delivery
+        status.
+
+        STUB: logs the notification request, returns 202, delivers
+        nothing to any human. Replace the handler body.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotifyRequest'
+            examples:
+              critical_failure:
+                summary: Critical constellation failure
+                value:
+                  prompt: "SETI: Critical failure in app-tca-vox-prod. 0/20 contract tests passing. AI briefing in progress."
+                  severity: critical
+                  application_id: app-tca-vox-prod
+                  escalation_id: esc-1775946478584845120
+              ai_escalation:
+                summary: AI-lien recommends human involvement
+                value:
+                  prompt: "SETI: Degradation detected in app-tca-vox-prod. AI assessment: recurring latency pattern, Wr4ngler review requested."
+                  severity: high
+                  application_id: app-tca-vox-prod
+                  escalation_id: esc-1775946478584845121
+      responses:
+        '202':
+          description: Notification accepted for delivery
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotifyAcknowledgment'
+        '400':
+          description: Invalid notification request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error — notification mechanism failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      tags: [health]
+      summary: Service health check
+      description: |
+        Returns the Notifier's operational status and delivery
+        statistics. The stub_active field will be true in the open
+        source distribution — this is expected and not an error.
+        It becomes false only when the operator has replaced the
+        stub handler with a real implementation.
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  schemas:
+
+    NotifyRequest:
+      type: object
+      required:
+        - prompt
+        - severity
+        - application_id
+        - escalation_id
+      properties:
+        prompt:
+          type: string
+          description: |
+            The complete notification text. Should be terse — fits
+            an SMS or push notification. Full incident detail lives
+            in SETI, not in this payload. This is a pager, not a
+            briefing document.
+          maxLength: 500
+          example: "SETI: Critical failure in app-tca-vox-prod. 0/20 contract tests passing. AI briefing in progress."
+        severity:
+          type: string
+          enum: [critical, high, medium, low]
+          description: |
+            Severity level for routing within the notification system.
+            The operator's implementation may use this to determine
+            which channel or escalation path to use. SETI treats all
+            severities identically — routing decisions belong to the
+            operator's notification system, not to SETI.
+        application_id:
+          type: string
+          description: >
+            The constellation application that triggered the notification.
+            Included so the operator's system can route by application
+            if desired.
+          example: "app-tca-vox-prod"
+        escalation_id:
+          type: string
+          description: >
+            The Interactions escalation ID. Included for correlation —
+            if the human contacts the team, they can reference this ID
+            to pull the full context from Lore.
+          example: "esc-1775946478584845120"
+
+    NotifyAcknowledgment:
+      type: object
+      required:
+        - notification_id
+        - stub_active
+        - accepted_at
+      properties:
+        notification_id:
+          type: string
+          description: >
+            Unique identifier for this notification event. Used for
+            correlation in Lore and Interactions audit trail.
+          example: "notif-1775946478584845120"
+        stub_active:
+          type: boolean
+          description: >
+            True when the stub handler is in use — no human was
+            actually paged. Expected to be true in the open source
+            distribution. Must be false in any production deployment.
+        accepted_at:
+          type: string
+          format: date-time
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - stub_active
+        - notifications_accepted
+        - notifications_delivered
+        - uptime_seconds
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+        stub_active:
+          type: boolean
+          description: >
+            True when no real notification mechanism is configured.
+            A production deployment with stub_active: true means
+            no humans will be paged under any circumstances.
+        notifications_accepted:
+          type: integer
+          description: Total notification requests received
+        notifications_delivered:
+          type: integer
+          description: >
+            Notifications actually delivered to a human. Will always
+            equal zero when stub_active is true. If this diverges
+            significantly from notifications_accepted in a live
+            deployment, the notification mechanism has a delivery
+            problem.
+        uptime_seconds:
+          type: integer
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          example: "INVALID_REQUEST"
+        message:
+          type: string
+          example: "prompt is required and must not exceed 500 characters"

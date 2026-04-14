@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,6 +37,7 @@ var (
 	integrationURL    = envOr("INTEGRATION_URL", "https://integration:4013")
 	feedWranglerURL   = envOr("FEED_WRANGLER_URL", "https://feed-wrangler:4007")
 	policyURL         = envOr("POLICY_URL",       "https://policy:4002")
+	augurCanisURL     = envOr("AUGUR_CANIS_URL",  "https://augur-canis:4010")
 )
 
 func mustEnv(key string) string {
@@ -62,29 +62,13 @@ func envOr(key, def string) string {
 var upstreamClient *http.Client
 
 func buildUpstreamClient() *http.Client {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Fatalf("[gateway] Failed to read CA cert: %v", err)
-	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-
-	cert, err := tls.LoadX509KeyPair("/certs/gateway.crt", "/certs/gateway.key")
-	if err != nil {
-		log.Fatalf("[gateway] Failed to load gateway cert: %v", err)
-	}
-
-	tlsCfg := &tls.Config{
-		RootCAs:      caPool,
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-	}
-
 	return &http.Client{
-		Transport: &http.Transport{TLSClientConfig: tlsCfg},
-		Timeout:   30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: buildClientTLS(certMat),
+		},
 	}
 }
+
 
 // ---------------------------------------------------------------------------
 // Observability reporting
@@ -243,7 +227,16 @@ func proxyTo(upstream, path string) http.HandlerFunc {
 		reportEvent(callee, r.Method, path, resp.StatusCode, latencyMs)
 
 		respBody, _ := io.ReadAll(resp.Body)
-		w.Header().Set("Content-Type", "application/json")
+		// Copy upstream response headers to the client — critically includes Set-Cookie
+		for key, values := range resp.Header {
+			for _, v := range values {
+				w.Header().Add(key, v)
+			}
+		}
+		// Ensure JSON content type is set (may be overridden by upstream header copy)
+		if resp.Header.Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "application/json")
+		}
 		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
 	}
@@ -482,8 +475,12 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 // Main
 // ---------------------------------------------------------------------------
 
+var certMat *CertMaterial
+
 func main() {
+	certMat = obtainCerts("gateway")
 	upstreamClient = buildUpstreamClient()
+	go selfRegisterWithAC(certMat, "https://gateway:4000")
 	startRedisSubscriber()
 
 	mux := http.NewServeMux()
@@ -556,12 +553,47 @@ func main() {
 	// Observability rules — auth required
 	mux.HandleFunc("/observability/rules", requireAuth(proxyTo(observabilityURL, "/rules")))
 
+	// Augur Canis admin — health, job list, check results (auth required)
+	// Exposed for admin UI and Plot Test access to AC state.
+	mux.HandleFunc("/augur-canis/health", requireAuth(proxyTo(augurCanisURL, "/health")))
+	mux.HandleFunc("/augur-canis/jobs", requireAuth(proxyTo(augurCanisURL, "/jobs")))
+	mux.HandleFunc("/augur-canis/checks/recent", requireAuth(proxyTo(augurCanisURL, "/checks/recent")))
+	mux.HandleFunc("/augur-canis/configuration", requireAuth(proxyTo(augurCanisURL, "/configuration")))
+	mux.HandleFunc("/augur-canis/alerts", requireAuth(proxyTo(augurCanisURL, "/alerts/active")))
+	mux.HandleFunc("/augur-canis/run-contract-tests", requireAuth(proxyTo(augurCanisURL, "/run-contract-tests")))
+	mux.HandleFunc("/augur-canis/ring/run", requireAuth(proxyTo(augurCanisURL, "/ring/run")))
+	mux.HandleFunc("/augur-canis/contract-suites", requireAuth(proxyTo(augurCanisURL, "/contract-suites")))
+	mux.HandleFunc("/augur-canis/contract-suites/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		upstream := strings.TrimPrefix(r.URL.Path, "/augur-canis")
+		proxyTo(augurCanisURL, upstream)(w, r)
+	}))
+	mux.HandleFunc("/augur-canis/baselines", requireAuth(proxyTo(augurCanisURL, "/baselines")))
+	mux.HandleFunc("/augur-canis/baselines/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		upstream := strings.TrimPrefix(r.URL.Path, "/augur-canis")
+		proxyTo(augurCanisURL, upstream)(w, r)
+	}))
+	mux.HandleFunc("/augur-canis/metrics", requireAuth(proxyTo(augurCanisURL, "/metrics")))
+	mux.HandleFunc("/augur-canis/checks/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		upstream := strings.TrimPrefix(r.URL.Path, "/augur-canis")
+		proxyTo(augurCanisURL, upstream)(w, r)
+	}))
+
 	// Phase 4 routes — auth required
 	mux.HandleFunc("/v1/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		proxyTo(integrationURL, r.URL.Path)(w, r)
 	}))
 	mux.HandleFunc("/ai-providers", requireAuth(proxyTo(policyURL, "/ai-providers")))
+	mux.HandleFunc("/applications", requireAuth(proxyTo(policyURL, "/applications")))
+	mux.HandleFunc("/applications/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		proxyTo(policyURL, r.URL.Path)(w, r)
+	}))
 	mux.HandleFunc("/ai-providers/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		proxyTo(policyURL, r.URL.Path)(w, r)
+	}))
+	// Available applications — all Wr4nglers can read; write actions (register/deregister) are
+	// sec-wr4ngler only but enforcement lives in Policy, not here.
+	mux.HandleFunc("/available-applications", requireAuth(proxyTo(policyURL, "/available-applications")))
+	mux.HandleFunc("/available-applications/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		proxyTo(policyURL, r.URL.Path)(w, r)
 	}))
 
@@ -609,16 +641,12 @@ func main() {
 	})
 
 	// External TLS server (browser-facing)
-	externalCert, err := tls.LoadX509KeyPair("/certs/gateway.crt", "/certs/gateway.key")
-	if err != nil {
-		log.Fatalf("[gateway] Failed to load external TLS cert: %v", err)
-	}
-
+	// External TLS — browsers don't present client certs, use instance cert for server identity
 	server := &http.Server{
 		Addr:    ":" + externalPort,
 		Handler: mux,
 		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{externalCert},
+			Certificates: []tls.Certificate{certMat.InstanceCert},
 			MinVersion:   tls.VersionTLS12, // Browsers need 1.2 compatibility
 		},
 	}

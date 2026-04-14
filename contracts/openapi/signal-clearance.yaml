@@ -783,7 +783,7 @@ components:
           example: "wrnglr-a1b2c3d4"
         clearance_level:
           type: string
-          example: "connie-wrangler"
+          example: "connie-wr4ngler"
         identity_source:
           type: string
           description: Which IdP configuration authenticated this Wr4ngler
@@ -791,7 +791,7 @@ components:
         clearance_source:
           type: string
           description: AD group that produced the clearance level
-          example: "seti-connie-wranglers"
+          example: "seti-connie-wr4nglers"
 
     RefreshRequest:
       type: object
@@ -941,7 +941,7 @@ components:
       properties:
         name:
           type: string
-          example: "connie-wrangler"
+          example: "connie-wr4ngler"
         description:
           type: string
         scope:
@@ -1130,7 +1130,7 @@ components:
           example: "SETI-Connie-Wranglers"
         clearance_level:
           type: string
-          example: "connie-wrangler"
+          example: "connie-wr4ngler"
         created_at:
           type: string
           format: date-time

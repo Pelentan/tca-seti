@@ -1,0 +1,10 @@
+{
+  "tca-vox": {
+    "name": "TCA Vox",
+    "description": "Polyglot polling application — TCA proof of concept. Demonstrates contract-first, polyglot microservices across Go, TypeScript, Python, and GnuCOBOL.",
+    "ac_endpoint": "https://augur-canis.tca-vox.example:4010",
+    "registry_url": "https://api.github.com/repos/Pelentan/tca-vox/contents",
+    "registry_type": "github",
+    "registry_token": "github_pat_REPLACE_WITH_REAL_TOKEN"
+  }
+}

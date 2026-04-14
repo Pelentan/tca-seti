@@ -247,7 +247,7 @@ export function seedDefaults(): void {
   });
 
   createClearanceLevel({
-    name: 'ops-wrangler',
+    name: 'ops-wr4ngler',
     description: 'Access to all applications, all tiers, all environments. No anomaly or cluster feeds.',
     scope: {
       application_ids: ['*'],
@@ -258,7 +258,7 @@ export function seedDefaults(): void {
   });
 
   createClearanceLevel({
-    name: 'connie-wrangler',
+    name: 'connie-wr4ngler',
     description: 'Access to contract and plot results for production and staging. No anomaly or cluster signals.',
     scope: {
       application_ids: ['*'],
@@ -269,7 +269,7 @@ export function seedDefaults(): void {
   });
 
   createClearanceLevel({
-    name: 'sec-wrangler',
+    name: 'sec-wr4ngler',
     description: 'Full signal access including anomaly and cluster-level feeds.',
     scope: wildcard,
   });

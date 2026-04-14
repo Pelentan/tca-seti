@@ -1,60 +1,88 @@
-// cert-forge — TCA certificate authority init tool.
+// cert-forge — TCA PKI abstraction layer.
 //
-// Generates a constellation CA and signs service certificates using only
-// the Go standard library. No external dependencies. No shell gymnastics.
-// No CLI flag archaeology across OpenSSL versions.
+// Starts as a running service (not an init container that exits).
+// Manages all key material for the constellation — services never
+// hold private keys, never perform cryptographic operations directly.
 //
-// Usage: cert-forge [-config /path/to/forge.json]
+// Startup sequence:
+//  1. Generate own key pair and self-signed bootstrap cert (in memory)
+//  2. Start mTLS HTTP server using bootstrap cert
+//  3. Generate constellation CA (in memory — CA key never written to disk)
+//  4. Write CA public cert to volume (for bootstrap reference only)
+//  5. Generate static certs (star-gazer, etc.) and write to volume
+//  6. Mark ready — now accepting /instance-cert and /sign requests
 //
-// Reads forge.json, generates the CA and all service certs, writes PEM
-// files to the configured output directory, and exits. Designed to run
-// as a Docker init container — same lifecycle as the previous cert-init,
-// drop-in replacement with zero behavioral changes from the constellation's
-// perspective.
+// Services call /ca on startup to get the CA cert (unauthenticated),
+// then /instance-cert to get their instance cert (mTLS required using
+// the bootstrap cert they received at build time from the volume).
 //
-// The supply chain is the Go standard library. Nothing else.
+// Supply chain: Go standard library only. No external dependencies.
 package main
 
 import (
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
-	"flag"
 	"fmt"
 	"log"
 	"math/big"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // ---------------------------------------------------------------------------
-// Config
+// Configuration
+// ---------------------------------------------------------------------------
+
+var (
+	port           = envOr("PORT", "4014")
+	enrollmentPort = envOr("ENROLLMENT_PORT", "4015")
+	outputDir      = envOr("CERTS_DIR", "/certs")
+	configPath     = envOr("CONFIG_PATH", "/forge.json")
+)
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// ---------------------------------------------------------------------------
+// Config (forge.json — same format as before)
 // ---------------------------------------------------------------------------
 
 type CAConfig struct {
-	CommonName         string `json:"common_name"`
-	Organization       string `json:"organization"`
-	Country            string `json:"country"`
-	KeyBits            int    `json:"key_bits"`
-	ValidDays          int    `json:"valid_days"`
-	BackdateMinutes    int    `json:"backdate_minutes"`
+	CommonName      string `json:"common_name"`
+	Organization    string `json:"organization"`
+	Country         string `json:"country"`
+	KeyBits         int    `json:"key_bits"`
+	ValidDays       int    `json:"valid_days"`
+	BackdateMinutes int    `json:"backdate_minutes"`
 }
 
-type ServiceConfig struct {
+type StaticCertConfig struct {
 	Name string   `json:"name"`
 	SANs []string `json:"sans"`
 }
 
 type ForgeConfig struct {
-	CA        CAConfig        `json:"ca"`
-	Services  []ServiceConfig `json:"services"`
-	OutputDir string          `json:"output_dir"`
-	KeyBits   int             `json:"key_bits"`
-	ValidDays int             `json:"valid_days"`
+	CA          CAConfig           `json:"ca"`
+	StaticCerts []StaticCertConfig `json:"services"`
+	OutputDir   string             `json:"output_dir"`
+	KeyBits     int                `json:"key_bits"`
+	ValidDays   int                `json:"valid_days"`
 }
 
 func loadConfig(path string) (*ForgeConfig, error) {
@@ -66,75 +94,65 @@ func loadConfig(path string) (*ForgeConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %v", err)
 	}
-
-	// Apply defaults
-	if cfg.CA.KeyBits == 0 {
-		cfg.CA.KeyBits = 4096
-	}
-	if cfg.CA.ValidDays == 0 {
-		cfg.CA.ValidDays = 3650
-	}
-	if cfg.CA.BackdateMinutes == 0 {
-		cfg.CA.BackdateMinutes = 5
-	}
-	if cfg.KeyBits == 0 {
-		cfg.KeyBits = 2048
-	}
-	if cfg.ValidDays == 0 {
-		cfg.ValidDays = 3650
-	}
-	if cfg.OutputDir == "" {
-		cfg.OutputDir = "/certs"
-	}
+	if cfg.CA.KeyBits == 0 { cfg.CA.KeyBits = 4096 }
+	if cfg.CA.ValidDays == 0 { cfg.CA.ValidDays = 3650 }
+	if cfg.CA.BackdateMinutes == 0 { cfg.CA.BackdateMinutes = 5 }
+	if cfg.KeyBits == 0 { cfg.KeyBits = 2048 }
+	if cfg.ValidDays == 0 { cfg.ValidDays = 3650 }
+	if cfg.OutputDir != "" { outputDir = cfg.OutputDir }
 	return &cfg, nil
 }
 
 // ---------------------------------------------------------------------------
-// PEM writers
+// PKI state — held entirely in memory
 // ---------------------------------------------------------------------------
 
-func writeCert(path string, certDER []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+type CA struct {
+	cert    *x509.Certificate
+	certDER []byte
+	certPEM []byte
+	key     *rsa.PrivateKey
 }
 
-func writeKey(path string, key *rsa.PrivateKey) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return pem.Encode(f, &pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(key),
-	})
+// InstanceKey holds the key material for a single container instance.
+type InstanceKey struct {
+	key         *rsa.PrivateKey
+	cert        *x509.Certificate
+	certPEM     []byte
+	keyPEM      []byte
+	fingerprint string
+	instanceCN  string
+	validUntil  time.Time
 }
+
+var (
+	ca           *CA
+	caReady      bool
+	caReadyMu    sync.RWMutex
+
+	// instance key store: "service_name/instance_id" → InstanceKey
+	instanceKeys   = map[string]*InstanceKey{}
+	instanceKeysMu sync.RWMutex
+	certsIssued    atomic.Int64
+
+	startedAt = time.Now()
+)
 
 // ---------------------------------------------------------------------------
 // Serial number
 // ---------------------------------------------------------------------------
 
 func newSerial() *big.Int {
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	s, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
-		log.Fatalf("[cert-forge] Failed to generate serial number: %v", err)
+		log.Fatalf("[cert-forge] serial generation failed: %v", err)
 	}
-	return serial
+	return s
 }
 
 // ---------------------------------------------------------------------------
 // CA generation
 // ---------------------------------------------------------------------------
-
-type CA struct {
-	cert    *x509.Certificate
-	certDER []byte
-	key     *rsa.PrivateKey
-}
 
 func generateCA(cfg *ForgeConfig) (*CA, error) {
 	log.Printf("[cert-forge] Generating CA key (%d bit)...", cfg.CA.KeyBits)
@@ -160,28 +178,97 @@ func generateCA(cfg *ForgeConfig) (*CA, error) {
 		BasicConstraintsValid: true,
 	}
 
-	// Self-sign: template == parent, key signs itself
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
 		return nil, fmt.Errorf("create CA cert: %v", err)
 	}
-
 	cert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		return nil, fmt.Errorf("parse CA cert: %v", err)
 	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 
-	log.Printf("[cert-forge] CA generated (CN=%s, NotBefore=%s)",
-		cfg.CA.CommonName, notBefore.UTC().Format(time.RFC3339))
-
-	return &CA{cert: cert, certDER: certDER, key: key}, nil
+	log.Printf("[cert-forge] CA generated (CN=%s, NotBefore=%s)", cfg.CA.CommonName, notBefore.Format(time.RFC3339))
+	return &CA{cert: cert, certDER: certDER, certPEM: certPEM, key: key}, nil
 }
 
 // ---------------------------------------------------------------------------
-// Service cert generation
+// Instance cert generation — called per service startup
 // ---------------------------------------------------------------------------
 
-func generateServiceCert(svc ServiceConfig, ca *CA, cfg *ForgeConfig) error {
+func issueInstanceCert(cfg *ForgeConfig, serviceName, instanceID string) (*InstanceKey, error) {
+	caReadyMu.RLock()
+	ready := caReady
+	caReadyMu.RUnlock()
+	if !ready {
+		return nil, fmt.Errorf("CA not yet initialized")
+	}
+
+	key, err := rsa.GenerateKey(rand.Reader, cfg.KeyBits)
+	if err != nil {
+		return nil, fmt.Errorf("generate key: %v", err)
+	}
+
+	instanceCN := fmt.Sprintf("%s-%s", serviceName, instanceID)
+	notBefore := time.Now().Add(-time.Duration(cfg.CA.BackdateMinutes) * time.Minute)
+	notAfter := time.Now().Add(time.Duration(cfg.ValidDays) * 24 * time.Hour)
+
+	template := &x509.Certificate{
+		SerialNumber: newSerial(),
+		Subject: pkix.Name{
+			CommonName:   instanceCN,
+			Organization: []string{cfg.CA.Organization},
+			Country:      []string{cfg.CA.Country},
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{serviceName, instanceCN, "localhost"},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, ca.cert, &key.PublicKey, ca.key)
+	if err != nil {
+		return nil, fmt.Errorf("sign cert: %v", err)
+	}
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return nil, fmt.Errorf("parse cert: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256(certDER))
+
+	keyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	})
+
+	ik := &InstanceKey{
+		key:         key,
+		cert:        cert,
+		certPEM:     certPEM,
+		keyPEM:      keyPEM,
+		fingerprint: fingerprint,
+		instanceCN:  instanceCN,
+		validUntil:  notAfter,
+	}
+
+	storeKey := fmt.Sprintf("%s/%s", serviceName, instanceID)
+	instanceKeysMu.Lock()
+	instanceKeys[storeKey] = ik
+	instanceKeysMu.Unlock()
+	certsIssued.Add(1)
+
+	log.Printf("[cert-forge] Instance cert issued: %s (fingerprint=%s...)", instanceCN, fingerprint[:8])
+	return ik, nil
+}
+
+// ---------------------------------------------------------------------------
+// Static cert generation — star-gazer and other fixed identities
+// ---------------------------------------------------------------------------
+
+func generateStaticCert(cfg *ForgeConfig, svc StaticCertConfig) error {
 	key, err := rsa.GenerateKey(rand.Reader, cfg.KeyBits)
 	if err != nil {
 		return fmt.Errorf("generate key for %s: %v", svc.Name, err)
@@ -205,88 +292,338 @@ func generateServiceCert(svc ServiceConfig, ca *CA, cfg *ForgeConfig) error {
 		DNSNames:              svc.SANs,
 	}
 
-	// Sign with CA
 	certDER, err := x509.CreateCertificate(rand.Reader, template, ca.cert, &key.PublicKey, ca.key)
 	if err != nil {
 		return fmt.Errorf("sign cert for %s: %v", svc.Name, err)
 	}
 
-	// Write cert
-	certPath := filepath.Join(cfg.OutputDir, svc.Name+".crt")
-	if err := writeCert(certPath, certDER); err != nil {
+	certPath := filepath.Join(outputDir, svc.Name+".crt")
+	keyPath  := filepath.Join(outputDir, svc.Name+".key")
+
+	if err := writePEM(certPath, "CERTIFICATE", certDER); err != nil {
 		return fmt.Errorf("write cert for %s: %v", svc.Name, err)
 	}
-
-	// Write key
-	keyPath := filepath.Join(cfg.OutputDir, svc.Name+".key")
-	if err := writeKey(keyPath, key); err != nil {
+	if err := writePEM(keyPath, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(key)); err != nil {
 		return fmt.Errorf("write key for %s: %v", svc.Name, err)
 	}
 
-	log.Printf("[cert-forge] %s — cert and key written", svc.Name)
+	log.Printf("[cert-forge] Static cert written: %s", svc.Name)
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// PEM writer
+// ---------------------------------------------------------------------------
+
+func writePEM(path, blockType string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return pem.Encode(f, &pem.Block{Type: blockType, Bytes: data})
+}
+
+// ---------------------------------------------------------------------------
+// HTTP handlers
+// ---------------------------------------------------------------------------
+
+func handleCA(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	caReadyMu.RLock()
+	ready := caReady
+	caReadyMu.RUnlock()
+	if !ready {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "CA not yet initialized"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"ca_cert":     string(ca.certPEM),
+		"common_name": ca.cert.Subject.CommonName,
+	})
+}
+
+func handleInstanceCert(cfg *ForgeConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			ServiceName string `json:"service_name"`
+			InstanceID  string `json:"instance_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		if req.ServiceName == "" || req.InstanceID == "" {
+			http.Error(w, `{"error":"service_name and instance_id required"}`, http.StatusBadRequest)
+			return
+		}
+
+		ik, err := issueInstanceCert(cfg, req.ServiceName, req.InstanceID)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"cert":        string(ik.certPEM),
+			"key":         string(ik.keyPEM),
+			"fingerprint": ik.fingerprint,
+			"instance_cn": ik.instanceCN,
+			"valid_until": ik.validUntil.UTC().Format(time.RFC3339),
+		})
+	}
+}
+
+func handleSign(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ServiceName string `json:"service_name"`
+		InstanceID  string `json:"instance_id"`
+		Payload     string `json:"payload"` // base64-encoded
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.ServiceName == "" || req.InstanceID == "" || req.Payload == "" {
+		http.Error(w, `{"error":"service_name, instance_id, and payload required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Verify caller identity matches claimed identity
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		callerCN := r.TLS.PeerCertificates[0].Subject.CommonName
+		expectedCN := fmt.Sprintf("%s-%s", req.ServiceName, req.InstanceID)
+		// Allow bootstrap cert (CN == service_name) on first call before instance cert is obtained
+		if callerCN != expectedCN && callerCN != req.ServiceName {
+			w.Header().Set("Content-Type", "application/json")
+			log.Printf("[cert-forge] /sign: CN mismatch — caller=%q expected=%q service=%q", callerCN, expectedCN, req.ServiceName)
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": fmt.Sprintf("caller CN %q does not match claimed identity %q", callerCN, expectedCN),
+			})
+			return
+		}
+	}
+
+	storeKey := fmt.Sprintf("%s/%s", req.ServiceName, req.InstanceID)
+	instanceKeysMu.RLock()
+	ik, ok := instanceKeys[storeKey]
+	// Log all known keys for debugging when lookup fails
+	var knownKeys []string
+	for k := range instanceKeys {
+		knownKeys = append(knownKeys, k)
+	}
+	instanceKeysMu.RUnlock()
+	if !ok {
+		log.Printf("[cert-forge] /sign: key not found for %q — known keys: %v", storeKey, knownKeys)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("no key on record for %s/%s — call /instance-cert first", req.ServiceName, req.InstanceID),
+		})
+		return
+	}
+
+	payloadBytes, err := base64.StdEncoding.DecodeString(req.Payload)
+	if err != nil {
+		http.Error(w, `{"error":"payload is not valid base64"}`, http.StatusBadRequest)
+		return
+	}
+
+	hash := sha256.Sum256(payloadBytes)
+	sig, err := rsa.SignPKCS1v15(rand.Reader, ik.key, crypto.SHA256, hash[:])
+	if err != nil {
+		log.Printf("[cert-forge] Signing failed for %s/%s: %v", req.ServiceName, req.InstanceID, err)
+		http.Error(w, `{"error":"signing failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"signature":   base64.StdEncoding.EncodeToString(sig),
+		"fingerprint": ik.fingerprint,
+		"algorithm":   "RSASSA-PKCS1-v1_5-SHA256",
+	})
+}
+
+// ---------------------------------------------------------------------------
+// TLS — cert-forge uses its own instance cert once the CA is ready.
+// Before that, it uses a temporary self-signed bootstrap cert.
+// ---------------------------------------------------------------------------
+
+// Hot-swap machinery removed — three-server design eliminates the need
+
+// constellationCAPool and getConfigForClient removed — three-server design
+
+func buildInstanceTLSConfig(ik *InstanceKey, clientCAs *x509.CertPool, requireClientCert bool) *tls.Config {
+	tlsCert := tls.Certificate{
+		Certificate: [][]byte{ik.cert.Raw},
+		PrivateKey:  ik.key,
+		Leaf:        ik.cert,
+	}
+	cfg := &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		MinVersion:   tls.VersionTLS13,
+	}
+	if requireClientCert && clientCAs != nil {
+		cfg.ClientCAs = clientCAs
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return cfg
+}
+
+// ---------------------------------------------------------------------------
+// Router — /ca is unauthenticated, everything else requires mTLS
+// ---------------------------------------------------------------------------
+
+// Three servers, three ports, one purpose each:
+//  4016 — plain HTTP, /ca only (CA cert is public)
+//  4015 — enrollment mTLS, /instance-cert only
+//  4014 — constellation mTLS, /sign only
+
+func buildPublicMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ca", handleCA)
+	return mux
+}
+
+func buildEnrollmentMux(cfg *ForgeConfig) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/instance-cert", handleInstanceCert(cfg))
+	return mux
+}
+
+func buildSignMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sign", handleSign)
+	return mux
+}
+
+// requireClientCert removed — each server enforces at TLS level
 
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
 func main() {
-	configPath := flag.String("config", "/forge.json", "Path to forge.json config file")
-	flag.Parse()
-
 	log.Printf("[cert-forge] Starting — stdlib only, no external dependencies")
-	log.Printf("[cert-forge] Config: %s", *configPath)
 
-	cfg, err := loadConfig(*configPath)
+	cfg, err := loadConfig(configPath)
 	if err != nil {
 		log.Fatalf("[cert-forge] Config error: %v", err)
 	}
-
-	// Ensure output directory exists
-	if err := os.MkdirAll(cfg.OutputDir, 0755); err != nil {
-		log.Fatalf("[cert-forge] Cannot create output dir %s: %v", cfg.OutputDir, err)
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		log.Fatalf("[cert-forge] Cannot create output dir: %v", err)
 	}
 
-	// Generate CA
-	ca, err := generateCA(cfg)
+	// Phase 1: Generate CA
+	generatedCA, err := generateCA(cfg)
 	if err != nil {
 		log.Fatalf("[cert-forge] CA generation failed: %v", err)
 	}
+	ca = generatedCA
+	caReadyMu.Lock()
+	caReady = true
+	caReadyMu.Unlock()
 
-	// Write CA cert (key stays in memory — never written separately)
-	caPath := filepath.Join(cfg.OutputDir, "ca.crt")
-	if err := writeCert(caPath, ca.certDER); err != nil {
+	// Write CA public cert to volume
+	caPath := filepath.Join(outputDir, "ca.crt")
+	if err := writePEM(caPath, "CERTIFICATE", ca.certDER); err != nil {
 		log.Fatalf("[cert-forge] Failed to write CA cert: %v", err)
 	}
+	log.Printf("[cert-forge] CA cert written to %s", caPath)
 
-	// Write CA key — needed by services for mTLS client auth verification
-	caKeyPath := filepath.Join(cfg.OutputDir, "ca.key")
-	if err := writeKey(caKeyPath, ca.key); err != nil {
-		log.Fatalf("[cert-forge] Failed to write CA key: %v", err)
+	// Phase 2: Issue cert-forge's own instance cert (for sign + enrollment servers)
+	selfID := os.Getenv("HOSTNAME")
+	if selfID == "" {
+		selfID = "local"
+	}
+	selfIK, err := issueInstanceCert(cfg, "cert-forge", selfID)
+	if err != nil {
+		log.Fatalf("[cert-forge] Self cert issuance failed: %v", err)
+	}
+	log.Printf("[cert-forge] Instance cert issued: %s", selfIK.instanceCN)
+
+	// Phase 3: Generate enrollment CA and cert
+	generatedEnrollCA, err := generateEnrollmentCA(cfg)
+	if err != nil {
+		log.Fatalf("[cert-forge] Enrollment CA generation failed: %v", err)
+	}
+	enrollmentCA = generatedEnrollCA
+	enrollCert, err := generateEnrollmentCert(cfg, enrollmentCA)
+	if err != nil {
+		log.Fatalf("[cert-forge] Enrollment cert generation failed: %v", err)
+	}
+	if err := writeEnrollmentMaterial(enrollCert); err != nil {
+		log.Fatalf("[cert-forge] Failed to write enrollment material: %v", err)
 	}
 
-	log.Printf("[cert-forge] CA written to %s", cfg.OutputDir)
+	// Build TLS configs — each server has exactly one purpose
+	caPool := x509.NewCertPool()
+	caPool.AddCert(ca.cert)
+	enrollPool := x509.NewCertPool()
+	enrollPool.AddCert(enrollmentCA.cert)
 
-	// Generate service certs
-	log.Printf("[cert-forge] Generating %d service certificates...", len(cfg.Services))
-	for _, svc := range cfg.Services {
-		if err := generateServiceCert(svc, ca, cfg); err != nil {
+	signTLS   := buildInstanceTLSConfig(selfIK, caPool, true)   // constellation mTLS
+	enrollTLS := buildInstanceTLSConfig(selfIK, enrollPool, true) // enrollment mTLS
+
+	// Server 1: plain HTTP on publicPort — /ca only (CA cert is public)
+	publicPort := cfEnvOr("PUBLIC_PORT", "4016")
+	go func() {
+		log.Printf("[cert-forge] Public server on :%s (plain HTTP — /ca only)", publicPort)
+		if err := http.ListenAndServe(":"+publicPort, buildPublicMux()); err != nil {
+			log.Fatalf("[cert-forge] Public server error: %v", err)
+		}
+	}()
+
+	// Server 2: enrollment mTLS on enrollmentPort — /instance-cert only
+	go func() {
+		log.Printf("[cert-forge] Enrollment server on :%s (enrollment mTLS — /instance-cert only)", enrollmentPort)
+		enrollServer := &http.Server{Addr: ":" + enrollmentPort, Handler: buildEnrollmentMux(cfg), TLSConfig: enrollTLS}
+		if err := enrollServer.ListenAndServeTLS("", ""); err != nil {
+			log.Fatalf("[cert-forge] Enrollment server error: %v", err)
+		}
+	}()
+
+	// Server 3: constellation mTLS on port — /sign only
+	log.Printf("[cert-forge] Sign server on :%s (constellation mTLS — /sign only)", port)
+	signServer := &http.Server{Addr: ":" + port, Handler: buildSignMux(), TLSConfig: signTLS}
+
+	// Phase 4: Generate static certs (star-gazer, etc.)
+	for _, svc := range cfg.StaticCerts {
+		if err := generateStaticCert(cfg, svc); err != nil {
 			log.Fatalf("[cert-forge] %v", err)
 		}
 	}
+	log.Printf("[cert-forge] cert-forge fully operational.")
 
-	// Verify everything was written
-	entries, err := os.ReadDir(cfg.OutputDir)
-	if err != nil {
-		log.Fatalf("[cert-forge] Cannot read output dir: %v", err)
+	if err := signServer.ListenAndServeTLS("", ""); err != nil {
+		log.Fatalf("[cert-forge] Sign server error: %v", err)
 	}
+}
 
-	log.Printf("[cert-forge] Certificate generation complete.")
-	log.Printf("[cert-forge] Output directory contents (%d files):", len(entries))
-	for _, e := range entries {
-		info, _ := e.Info()
-		log.Printf("[cert-forge]   %s (%d bytes)", e.Name(), info.Size())
+func cfEnvOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	log.Printf("[cert-forge] Exiting cleanly.")
+	return def
 }

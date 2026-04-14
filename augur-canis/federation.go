@@ -3,18 +3,15 @@ package main
 import (
 	"context"
 	"crypto"
-	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"log"
-	"math/big"
 	"net/http"
 	"os"
 	"sync"
@@ -65,12 +62,13 @@ type FederationStatusResponse struct {
 }
 
 type ServiceRegistrationRequest struct {
-	ServiceName     string `json:"service_name"`
-	NetworkEndpoint string `json:"network_endpoint"`
+	ServiceName     string   `json:"service_name"`
+	NetworkEndpoint string   `json:"network_endpoint"`
 	Networks        []string `json:"networks,omitempty"`
-	CertFingerprint string `json:"cert_fingerprint"`
-	Timestamp       string `json:"timestamp"`
-	Signature       string `json:"signature"`
+	CertFingerprint string   `json:"cert_fingerprint"`
+	CertPEM         string   `json:"cert_pem"`
+	Timestamp       string   `json:"timestamp"`
+	Signature       string   `json:"signature"`
 }
 
 type ServiceRegistrationAck struct {
@@ -87,8 +85,9 @@ type federationState struct {
 	mu              sync.RWMutex
 	registered      bool
 	setiInstanceID  string
-	sessionKey      *rsa.PrivateKey
-	sessionCert     []byte // PEM
+	sessionMat      *CertMaterial
+	sessionCert     *x509.Certificate
+	sessionCertPEM  []byte // DER
 	sessionCertID   string
 	registeredAt    time.Time
 	eventsSigned    int64
@@ -132,93 +131,85 @@ func loadStarGazerCert() {
 // ---------------------------------------------------------------------------
 
 func generateSessionCert() error {
-	// Load constellation CA cert and key
-	caPath := "/certs/ca.crt"
-	caKeyPath := "/certs/ca.key"
-
-	caCertPEM, err := os.ReadFile(caPath)
-	if err != nil {
-		return fmt.Errorf("load CA cert: %v", err)
+	// Request a session cert from cert-forge — AC never holds the CA key
+	// The session cert is used to sign health feed events for SETI verification
+	if certMat == nil {
+		return fmt.Errorf("certMat not ready — AC not fully initialized")
 	}
-	caKeyPEM, err := os.ReadFile(caKeyPath)
-	if err != nil {
-		return fmt.Errorf("load CA key: %v", err)
+	// Use cert-forge to issue a dedicated session cert for feed signing
+	// Session ID combines service name with a random suffix
+	sessionInstanceID := fmt.Sprintf("session-%d", time.Now().UnixNano())
+	sessionMat := requestSessionCert(sessionInstanceID)
+	if sessionMat == nil {
+		return fmt.Errorf("failed to obtain session cert from cert-forge")
 	}
-
-	tlsCert, err := tls.X509KeyPair(caCertPEM, caKeyPEM)
-	if err != nil {
-		return fmt.Errorf("parse CA keypair: %v", err)
-	}
-	caCert, err := x509.ParseCertificate(tlsCert.Certificate[0])
-	if err != nil {
-		return fmt.Errorf("parse CA cert: %v", err)
-	}
-	caKey, ok := tlsCert.PrivateKey.(*rsa.PrivateKey)
-	if !ok {
-		return fmt.Errorf("CA key is not RSA")
-	}
-
-	// Generate session key pair
-	sessionKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return fmt.Errorf("generate session key: %v", err)
-	}
-
-	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	template := &x509.Certificate{
-		SerialNumber: serial,
-		Subject: pkix.Name{
-			CommonName:   fmt.Sprintf("ac-session-%s", constellationID()),
-			Organization: []string{"SETI Federation"},
-		},
-		NotBefore:             time.Now().Add(-1 * time.Minute),
-		NotAfter:              time.Now().Add(48 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		BasicConstraintsValid: true,
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, template, caCert, &sessionKey.PublicKey, caKey)
-	if err != nil {
-		return fmt.Errorf("create session cert: %v", err)
-	}
-
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-
-	// Cert ID: first 8 chars of base64-encoded serial
-	certID := base64.RawURLEncoding.EncodeToString(serial.Bytes())
+	// sessionMat contains the cert and key for this session
+	// Extract a cert ID from the fingerprint
+	certID := sessionMat.Fingerprint
 	if len(certID) > 8 {
 		certID = certID[:8]
 	}
 
 	federation.mu.Lock()
-	federation.sessionKey = sessionKey
-	federation.sessionCert = certPEM
+	federation.sessionMat = sessionMat
+	federation.sessionCert = sessionMat.InstanceCert.Leaf
+	federation.sessionCertPEM = sessionMat.InstanceCert.Certificate[0]
 	federation.sessionCertID = certID
 	federation.mu.Unlock()
 
-	log.Printf("[federation] Session cert generated (id=%s, valid 48h)", certID)
+	log.Printf("[federation] Session cert obtained from cert-forge (id=%s)", certID)
 	return nil
+}
+
+// requestSessionCert obtains a short-lived cert from cert-forge for signing feed events.
+func requestSessionCert(sessionInstanceID string) *CertMaterial {
+	if certMat == nil {
+		return nil
+	}
+	forgeURL    := cfEnvOr("CERT_FORGE_URL", "https://cert-forge:4014")
+	enrollPort  := cfEnvOr("ENROLLMENT_PORT", "4015")
+	enrollCert  := cfEnvOr("ENROLLMENT_CERT", "/certs/enrollment.crt")
+	enrollKey   := cfEnvOr("ENROLLMENT_KEY", "/certs/enrollment.key")
+	enrollURL   := deriveEnrollmentURL(forgeURL, enrollPort)
+
+	certPEM, keyPEM, fingerprint, instanceCN, validUntil :=
+		requestInstanceCert(enrollURL, enrollCert, enrollKey, "augur-canis-session", sessionInstanceID)
+	if certPEM == nil {
+		return nil
+	}
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		log.Printf("[federation] Failed to parse session cert: %v", err)
+		return nil
+	}
+	return &CertMaterial{
+		CACertPEM:    certMat.CACertPEM,
+		InstanceCert: tlsCert,
+		Fingerprint:  fingerprint,
+		InstanceCN:   instanceCN,
+		InstanceID:   sessionInstanceID,
+		ServiceName:  "augur-canis-session",
+		ValidUntil:   validUntil,
+	}
 }
 
 // ---------------------------------------------------------------------------
 // Event signing — called before every health feed publish
 // ---------------------------------------------------------------------------
 
-// signEvent adds session_cert_id and signature to an event map before
-// it is marshaled and published to tca:augur-canis.
+// signEventPayload delegates signing to cert-forge /sign using the session cert.
 // If no session is active the event is published unsigned.
 func signEventPayload(payload []byte) (string, string, error) {
 	federation.mu.RLock()
-	key := federation.sessionKey
+	sessionMat := federation.sessionMat
 	certID := federation.sessionCertID
 	federation.mu.RUnlock()
 
-	if key == nil {
+	if sessionMat == nil {
 		return "", "", nil // no active session — publish unsigned
 	}
 
-	hash := sha256.Sum256(payload)
-	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, hash[:])
+	sig, err := signPayload(sessionMat, payload)
 	if err != nil {
 		return "", "", fmt.Errorf("sign event: %v", err)
 	}
@@ -227,7 +218,7 @@ func signEventPayload(payload []byte) (string, string, error) {
 	federation.eventsSigned++
 	federation.mu.Unlock()
 
-	return certID, base64.StdEncoding.EncodeToString(sig), nil
+	return certID, sig, nil
 }
 
 // publishSignedFeedEvent marshals the event map, adds a signature if
@@ -315,14 +306,31 @@ func handleFederationRegister(w http.ResponseWriter, r *http.Request) {
 	federation.setiInstanceID = req.SetiInstanceID
 	federation.registeredAt = time.Now()
 	federation.eventsSigned = 0
-	certPEM := federation.sessionCert
+	sessionCertPEM := federation.sessionCertPEM
 	certID := federation.sessionCertID
+	sessionMat := federation.sessionMat
 	federation.mu.Unlock()
+
+	_ = sessionCertPEM
+	_ = sessionMat
 
 	log.Printf("[federation] SETI registered (instance=%s, session=%s)", req.SetiInstanceID, certID)
 
+	// Return PEM-encoded session cert to SETI for feed event verification
+	var sessionPEM string
+	if federation.sessionMat != nil {
+		federation.mu.RLock()
+		if len(federation.sessionMat.InstanceCert.Certificate) > 0 {
+			sessionPEM = string(pem.EncodeToMemory(&pem.Block{
+				Type:  "CERTIFICATE",
+				Bytes: federation.sessionMat.InstanceCert.Certificate[0],
+			}))
+		}
+		federation.mu.RUnlock()
+	}
+
 	resp := FederationRegistrationResponse{
-		SessionCert:     string(certPEM),
+		SessionCert:     sessionPEM,
 		SessionCertID:   certID,
 		IssuedAt:        time.Now().UTC().Format(time.RFC3339),
 		FeedChannel:     healthFeedChannel,
@@ -347,11 +355,81 @@ func handleFederationStatus(w http.ResponseWriter, r *http.Request) {
 	if federation.registered {
 		resp.SessionCertID = federation.sessionCertID
 		resp.RegisteredAt = federation.registeredAt.UTC().Format(time.RFC3339)
+		if federation.sessionMat != nil {
+			resp.RegisteredAt = federation.registeredAt.UTC().Format(time.RFC3339)
+		}
 	}
 	federation.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// verifyServiceRegistration verifies a self-registration request.
+//
+// Strategy: the service sends its cert fingerprint. We fetch the cert from
+// the certs volume (all constellation certs live there, generated by cert-forge).
+// We verify the request signature using that cert's public key. If the signature
+// verifies, the service has the corresponding private key — proving it is the
+// legitimate holder of a cert issued by this constellation's CA.
+//
+// This is a deliberate simplification appropriate for the PoC: in production,
+// the cert would be presented over mTLS and the TLS layer would verify it against
+// the CA automatically. The explicit check here makes the verification visible
+// and auditable.
+func verifyServiceRegistration(req ServiceRegistrationRequest) error {
+	// Services no longer have static certs in the volume — they obtain instance
+	// certs from cert-forge. The service sends its cert PEM in the registration
+	// request so AC can verify the signature without reading files.
+	if req.CertPEM == "" {
+		return fmt.Errorf("cert_pem required for signature verification — service must send its instance cert")
+	}
+
+	block, _ := pem.Decode([]byte(req.CertPEM))
+	if block == nil {
+		return fmt.Errorf("cert_pem for %s is not valid PEM", req.ServiceName)
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse cert for %s: %v", req.ServiceName, err)
+	}
+
+	// Verify the cert fingerprint matches what the service claimed
+	actualFingerprint := fmt.Sprintf("%x", sha256.Sum256(cert.Raw))
+	if actualFingerprint != req.CertFingerprint {
+		return fmt.Errorf("cert fingerprint mismatch for %s", req.ServiceName)
+	}
+
+	// Verify the cert was signed by the constellation CA
+	if certMat == nil {
+		return fmt.Errorf("AC not fully initialized — no CA cert available")
+	}
+	caPool := x509.NewCertPool()
+	caPool.AppendCertsFromPEM(certMat.CACertPEM)
+	if _, err := cert.Verify(x509.VerifyOptions{Roots: caPool}); err != nil {
+		return fmt.Errorf("cert for %s not signed by constellation CA: %v", req.ServiceName, err)
+	}
+
+	// Verify the request signature using the cert's public key
+	pubKey, ok := cert.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return fmt.Errorf("cert for %s has non-RSA key", req.ServiceName)
+	}
+
+	payload := req.ServiceName + req.NetworkEndpoint + req.CertFingerprint + req.Timestamp
+	hash := sha256.Sum256([]byte(payload))
+
+	sigBytes, err := base64.StdEncoding.DecodeString(req.Signature)
+	if err != nil {
+		return fmt.Errorf("decode signature: %v", err)
+	}
+
+	if err := rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, hash[:], sigBytes); err != nil {
+		return fmt.Errorf("invalid signature: %v", err)
+	}
+
+	return nil
 }
 
 func handleServicesRegister(w http.ResponseWriter, r *http.Request) {
@@ -370,12 +448,23 @@ func handleServicesRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// STUB: signature verification against constellation CA deferred.
-	// Full implementation verifies req.Signature against ca.crt before
-	// accepting the registration. For now, accept all well-formed requests
-	// and log visibly.
-	log.Printf("[federation] STUB: service self-registration from %s at %s (signature verification not yet enforced)",
-		req.ServiceName, req.NetworkEndpoint)
+	// Verify the signature against the constellation CA.
+	// The signed payload is: service_name + network_endpoint + cert_fingerprint + timestamp
+	// The signing key is the service's private key (cert issued by constellation CA).
+	// We verify by loading the service's cert directly — the cert itself proves the
+	// signing key is CA-signed, so verifying the signature with the cert's public key
+	// is sufficient to establish constellation membership.
+	if req.Signature == "" {
+		log.Printf("[federation] Registration rejected — missing signature from %s", req.ServiceName)
+		http.Error(w, `{"error":"signature required"}`, http.StatusUnauthorized)
+		return
+	}
+
+	if err := verifyServiceRegistration(req); err != nil {
+		log.Printf("[federation] Registration rejected from %s: %v", req.ServiceName, err)
+		http.Error(w, `{"error":"signature verification failed"}`, http.StatusUnauthorized)
+		return
+	}
 
 	// Register or refresh the job in AC's registry
 	status := "registered"
@@ -405,14 +494,35 @@ func constellationID() string {
 }
 
 func isJobRegistered(serviceName string) bool {
-	ctx := context.Background()
-	key := fmt.Sprintf("ac:job:%s", serviceName)
-	v, err := rdb.Get(ctx, key).Result()
-	return err == nil && v != ""
+	jobsMu.RLock()
+	_, ok := registeredJobs[serviceName]
+	jobsMu.RUnlock()
+	return ok
 }
 
+// jobsMu guards concurrent access to registeredJobs from self-registration
+// requests arriving while the main goroutine may also be reading the map.
+var jobsMu sync.RWMutex
+
 func registerJob(serviceName, endpoint string) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	record := &RegisteredJobRecord{
+		ServiceName:     serviceName,
+		NetworkEndpoint: endpoint,
+		Description:     "self-registered",
+		RegisteredAt:    now,
+	}
+
+	// Update in-memory map
+	jobsMu.Lock()
+	registeredJobs[serviceName] = record
+	jobsMu.Unlock()
+
+	// Persist to Redis so registration survives AC restart
 	ctx := context.Background()
 	key := fmt.Sprintf("ac:job:%s", serviceName)
-	rdb.Set(ctx, key, endpoint, 0)
+	data, _ := json.Marshal(record)
+	rdb.Set(ctx, key, data, 0)
+
+	log.Printf("[federation] Job registered: %s at %s", serviceName, endpoint)
 }

@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -43,24 +42,97 @@ func envOr(key, def string) string {
 // Plot model
 // ---------------------------------------------------------------------------
 
-type PlotStep struct {
-	StepNumber    int                      `json:"step_number"`
-	Description   string                   `json:"description"`
-	Method        string                   `json:"method"`
-	Path          string                   `json:"path"`
-	Headers       map[string]string        `json:"headers,omitempty"`
-	Body          interface{}              `json:"body,omitempty"`
-	ExpectedStatus int                     `json:"expected_status"`
-	ExpectedChain []ExpectedCall           `json:"expected_chain,omitempty"`
-	VerifyWithin  int                      `json:"verify_within_seconds,omitempty"`
+// PlotCall mirrors the contract PlotCall schema — the HTTP action for a step.
+type PlotCall struct {
+	Method  string            `json:"method"`
+	Path    string            `json:"path"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Body    interface{}       `json:"body,omitempty"`
 }
 
+// PlotAssertion defines a semantic assertion on a step's response body.
+type PlotAssertion struct {
+	Field    string      `json:"field"`
+	Operator string      `json:"operator"` // equals, not_equals, contains, exists, not_exists, greater_than, less_than
+	Value    interface{} `json:"value,omitempty"`
+}
+
+// CaptureDefinition extracts a value from the response for use in later steps.
+type CaptureDefinition struct {
+	Name string `json:"name"` // referenced as {name} in subsequent steps
+	Path string `json:"path"` // dot-notation into the response body
+}
+
+// ExpectedCall defines an inter-service call expected in the observability stream.
 type ExpectedCall struct {
 	Caller         string `json:"caller"`
 	Callee         string `json:"callee"`
 	Method         string `json:"method,omitempty"`
 	Path           string `json:"path,omitempty"`
 	MinOccurrences int    `json:"min_occurrences,omitempty"`
+}
+
+// PlotStep supports both the contract schema (Call wrapper) and the legacy flat format.
+// Normalize() must be called before execution to resolve whichever format is present.
+type PlotStep struct {
+	StepNumber  int    `json:"step_number"`
+	Description string `json:"description"`
+
+	// Contract schema — preferred
+	Call             *PlotCall           `json:"call,omitempty"`
+	ExpectStatus     int                 `json:"expect_status,omitempty"`
+	Assertions       []PlotAssertion     `json:"assertions,omitempty"`
+	Capture          []CaptureDefinition `json:"capture,omitempty"`
+	ExpectCallChain  []ExpectedCall      `json:"expect_call_chain,omitempty"`
+
+	// Legacy flat format — still accepted for backward compatibility
+	Method         string            `json:"method,omitempty"`
+	Path           string            `json:"path,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	Body           interface{}       `json:"body,omitempty"`
+	ExpectedStatus int               `json:"expected_status,omitempty"`
+	ExpectedChain  []ExpectedCall    `json:"expected_chain,omitempty"`
+	VerifyWithin   int               `json:"verify_within_seconds,omitempty"`
+}
+
+// Normalize resolves the dual-format PlotStep into canonical fields.
+// After calling this, Method/Path/Headers/Body/ExpectedStatus/ExpectedChain
+// are always populated regardless of which format the JSON used.
+func (s *PlotStep) Normalize(captures map[string]string) {
+	// Resolve call wrapper → flat fields
+	if s.Call != nil {
+		s.Method = s.Call.Method
+		s.Path = s.Call.Path
+		if s.Call.Headers != nil {
+			s.Headers = s.Call.Headers
+		}
+		if s.Call.Body != nil {
+			s.Body = s.Call.Body
+		}
+	}
+	// Resolve expect_status → expected_status
+	if s.ExpectStatus != 0 && s.ExpectedStatus == 0 {
+		s.ExpectedStatus = s.ExpectStatus
+	}
+	// Resolve expect_call_chain → expected_chain
+	if len(s.ExpectCallChain) > 0 && len(s.ExpectedChain) == 0 {
+		s.ExpectedChain = s.ExpectCallChain
+	}
+	// Apply capture substitutions to path and body
+	if len(captures) > 0 {
+		s.Path = applyCaptures(s.Path, captures)
+		if bodyStr, ok := s.Body.(string); ok {
+			s.Body = applyCaptures(bodyStr, captures)
+		}
+	}
+}
+
+// applyCaptures replaces {name} tokens in a string with captured values.
+func applyCaptures(s string, captures map[string]string) string {
+	for k, v := range captures {
+		s = strings.ReplaceAll(s, "{"+k+"}", v)
+	}
+	return s
 }
 
 type Plot struct {
@@ -100,30 +172,13 @@ func generateID() string {
 var upstreamClient *http.Client
 
 func buildUpstreamClient() {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Printf("[plot-store] CA cert not found: %v", err)
-		upstreamClient = http.DefaultClient
-		return
-	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-	cert, err := tls.LoadX509KeyPair("/certs/plot-store.crt", "/certs/plot-store.key")
-	if err != nil {
-		log.Printf("[plot-store] Service cert not found: %v", err)
-		upstreamClient = http.DefaultClient
-		return
-	}
 	upstreamClient = &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				RootCAs: caPool, Certificates: []tls.Certificate{cert},
-				MinVersion: tls.VersionTLS13,
-			},
+			TLSClientConfig: buildClientTLS(certMat),
 		},
-		Timeout: 10 * time.Second,
 	}
 }
+
 
 func reportEvent(callee, method, path string, status int, latencyMs int64) {
 	go func() {
@@ -314,17 +369,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 var startTime = time.Now()
 
 func loadServerTLS() *tls.Config {
-	caCert, _ := os.ReadFile("/certs/ca.crt")
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-	cert, err := tls.LoadX509KeyPair("/certs/plot-store.crt", "/certs/plot-store.key")
-	if err != nil {
-		log.Fatalf("[plot-store] cert: %v", err)
-	}
-	return &tls.Config{
-		ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: caPool,
-		Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13,
-	}
+	return buildServerTLS(certMat)
 }
 
 func loadPlotsFromDisk() {
@@ -377,7 +422,279 @@ func loadPlotsFromDisk() {
 	log.Printf("[plot-store] Loaded %d plots from %s", loaded, plotsPath)
 }
 
+var certMat *CertMaterial
+
+// ---------------------------------------------------------------------------
+// Registry ingest — called by Policy on application registration
+// ---------------------------------------------------------------------------
+
+type IngestRequest struct {
+	RegistryURL   string `json:"registry_url"`
+	RegistryType  string `json:"registry_type"`
+	RegistryToken string `json:"registry_token"`
+}
+
+// PlotSubmission mirrors the plot-store.yaml PlotSubmission schema —
+// the JSON format written by the AI partner into contracts/plots/.
+type PlotSubmission struct {
+	ApplicationID   string       `json:"application_id"`
+	JobName         string       `json:"job_name"`
+	PlotName        string       `json:"plot_name"`
+	ContractVersion string       `json:"contract_version"`
+	Description     string       `json:"description"`
+	GeneratedBy     string       `json:"generated_by"`
+	Steps           []PlotStep   `json:"steps"`
+}
+
+func registryFetch(req IngestRequest, path string) ([]byte, error) {
+	url := strings.TrimRight(req.RegistryURL, "/") + "/" + strings.TrimLeft(path, "/")
+	httpReq, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	switch req.RegistryType {
+	case "gitlab":
+		httpReq.Header.Set("PRIVATE-TOKEN", req.RegistryToken)
+	default: // github, generic
+		httpReq.Header.Set("Authorization", "Bearer "+req.RegistryToken)
+	}
+	httpReq.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("registry returned HTTP %d for %s", resp.StatusCode, path)
+	}
+	buf := make([]byte, 0, 32768)
+	tmp := make([]byte, 4096)
+	for {
+		n, err := resp.Body.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+	return buf, nil
+}
+
+// registryListPlots returns a list of {name, download_url} for files
+// in contracts/plots/. GitHub and GitLab both return a JSON array of
+// file objects; generic endpoints are expected to do the same.
+type registryFile struct {
+	Name        string `json:"name"`
+	Type        string `json:"type"`        // "file" (GitHub) or "blob" (GitLab)
+	DownloadURL string `json:"download_url"` // GitHub
+	RawURL      string `json:"raw_url"`      // GitLab fallback
+	ContentURL  string `json:"content_url"`  // generic
+}
+
+func (f registryFile) fetchURL() string {
+	if f.DownloadURL != "" {
+		return f.DownloadURL
+	}
+	if f.RawURL != "" {
+		return f.RawURL
+	}
+	return f.ContentURL
+}
+
+func fetchFileContent(req IngestRequest, downloadURL string) ([]byte, error) {
+	httpReq, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	switch req.RegistryType {
+	case "gitlab":
+		httpReq.Header.Set("PRIVATE-TOKEN", req.RegistryToken)
+	default:
+		httpReq.Header.Set("Authorization", "Bearer "+req.RegistryToken)
+	}
+	// Request raw content, not JSON-wrapped base64
+	httpReq.Header.Set("Accept", "application/vnd.github.raw+json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d fetching file", resp.StatusCode)
+	}
+	buf := make([]byte, 0, 8192)
+	tmp := make([]byte, 4096)
+	for {
+		n, readErr := resp.Body.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	return buf, nil
+}
+
+func handleIngest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"code":"METHOD_NOT_ALLOWED"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	start := time.Now()
+
+	tag := strings.TrimPrefix(r.URL.Path, "/ingest/")
+	tag = strings.TrimSuffix(tag, "/")
+	if tag == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_REQUEST", "message": "tag required in path"})
+		return
+	}
+
+	var req IngestRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil ||
+		req.RegistryURL == "" || req.RegistryToken == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"code":    "INVALID_REQUEST",
+			"message": "registry_url, registry_type, and registry_token required",
+		})
+		return
+	}
+	if req.RegistryType == "" {
+		req.RegistryType = "generic"
+	}
+
+	// List contracts/plots/ directory
+	listing, err := registryFetch(req, "contracts/plots")
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{
+			"code":    "REGISTRY_UNREACHABLE",
+			"message": err.Error(),
+		})
+		reportEvent("registry:"+tag, "GET", "contracts/plots", 502, time.Since(start).Milliseconds())
+		return
+	}
+	reportEvent("registry:"+tag, "GET", "contracts/plots", 200, time.Since(start).Milliseconds())
+
+	var files []registryFile
+	if err := json.Unmarshal(listing, &files); err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{
+			"code":    "REGISTRY_PARSE_ERROR",
+			"message": "could not parse registry directory listing",
+		})
+		return
+	}
+
+	ingested, updated, skipped := 0, 0, 0
+	var skipReasons []string
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	for _, f := range files {
+		if f.Type != "file" && f.Type != "blob" {
+			continue
+		}
+		if !strings.HasSuffix(f.Name, ".json") {
+			continue // plots are JSON files in contracts/plots/
+		}
+
+		dlURL := f.fetchURL()
+		if dlURL == "" {
+			skipped++
+			skipReasons = append(skipReasons, fmt.Sprintf("%s: no download URL", f.Name))
+			continue
+		}
+
+		content, err := fetchFileContent(req, dlURL)
+		if err != nil {
+			skipped++
+			skipReasons = append(skipReasons, fmt.Sprintf("%s: fetch failed: %v", f.Name, err))
+			continue
+		}
+
+		var sub PlotSubmission
+		if err := json.Unmarshal(content, &sub); err != nil {
+			skipped++
+			skipReasons = append(skipReasons, fmt.Sprintf("%s: invalid JSON: %v", f.Name, err))
+			continue
+		}
+		if sub.JobName == "" || sub.PlotName == "" || len(sub.Steps) == 0 {
+			skipped++
+			skipReasons = append(skipReasons, fmt.Sprintf("%s: missing job_name, plot_name, or steps", f.Name))
+			continue
+		}
+
+		// Use the tag as application_id if the submission doesn't specify one
+		appID := sub.ApplicationID
+		if appID == "" {
+			appID = "app-" + tag
+		}
+		plotName := sub.JobName + "/" + sub.PlotName
+
+		mu.Lock()
+		// Check for existing plot with same app+name — version it if found
+		var existingID string
+		for id, p := range plots {
+			if p.ApplicationID == appID && p.Name == plotName {
+				existingID = id
+				break
+			}
+		}
+		if existingID != "" {
+			plots[existingID].Flagged = true
+			plots[existingID].FlagReason = "superseded by ingest version"
+			plots[existingID].UpdatedAt = now
+			updated++
+		} else {
+			ingested++
+		}
+
+		newPlot := &Plot{
+			PlotID:        generateID(),
+			ApplicationID: appID,
+			Name:          plotName,
+			Description:   sub.Description,
+			Version:       sub.ContractVersion,
+			Author:        sub.GeneratedBy,
+			Steps:         sub.Steps,
+			Flagged:       false,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}
+		plots[newPlot.PlotID] = newPlot
+		mu.Unlock()
+
+		log.Printf("[plot-store] Ingested plot %s/%s for %s", sub.JobName, sub.PlotName, appID)
+	}
+
+	result := map[string]interface{}{
+		"tag":          tag,
+		"ingested":     ingested,
+		"updated":      updated,
+		"skipped":      skipped,
+		"ingested_at":  now,
+	}
+	if len(skipReasons) > 0 {
+		result["skip_reasons"] = skipReasons
+	}
+
+	log.Printf("[plot-store] Ingest complete for %s: %d new, %d updated, %d skipped",
+		tag, ingested, updated, skipped)
+	reportEvent("registry:"+tag, "POST", "/ingest/"+tag, 200, time.Since(start).Milliseconds())
+	json.NewEncoder(w).Encode(result)
+}
+
 func main() {
+	certMat = obtainCerts("plot-store")
+	go selfRegisterWithAC(certMat, "https://plot-store:4005")
 	buildUpstreamClient()
 	loadPlotsFromDisk()
 
@@ -386,6 +703,7 @@ func main() {
 	mux.HandleFunc("/plots", handlePlots)
 	mux.HandleFunc("/plots/", handlePlot)
 	mux.HandleFunc("/applications/", handleAppPlots)
+	mux.HandleFunc("/ingest/", handleIngest)
 
 	server := &http.Server{Addr: ":" + port, Handler: mux, TLSConfig: loadServerTLS()}
 	log.Printf("[plot-store] Listening on :%s (mTLS, TLS 1.3)", port)

@@ -1,7 +1,9 @@
 import express, { Request, Response, NextFunction } from 'express';
+import cookieParser from 'cookie-parser';
 import https from 'https';
 import { v4 as uuidv4 } from 'uuid';
-import { buildMTLSOptions } from './mtls.js';
+import { buildMTLSOptions, obtainCerts } from './certforge.js';
+import { selfRegister } from './selfregister.js';
 import { reportEvent } from './observability.js';
 import { issueJWT } from './jwt.js';
 import {
@@ -43,6 +45,7 @@ import { devAuthRouter, seedDevGroupMappings } from './devAuth.js';
 
 const app = express();
 app.use(express.json());
+app.use(cookieParser());
 
 const PORT = parseInt(process.env.PORT || '4001', 10);
 
@@ -225,6 +228,15 @@ async function completeAuth(idToken: string, configId: string, res: Response): P
 
   console.log(`[signal-clearance] Wrangler authenticated: ${wrangler.wrangler_id} (${clearance_level})`);
 
+  // Set httpOnly cookie so silent refresh works without storing token in JS
+  res.cookie('seti_refresh', refreshToken, {
+    httpOnly: true,
+    secure: process.env.AUTH_MODE === 'production',
+    sameSite: 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    path: '/',
+  });
+
   res.json({
     jwt,
     refresh_token: refreshToken,
@@ -253,9 +265,10 @@ function clearanceLevelToType(level: string): WranglerType {
 
 app.post('/auth/refresh', async (req: Request, res: Response) => {
   try {
-    const { refresh_token } = req.body;
+    // Accept refresh token from body OR from httpOnly cookie (silent refresh from UI)
+    const refresh_token = req.body?.refresh_token || req.cookies?.seti_refresh;
     if (!refresh_token) {
-      res.status(400).json({ code: 'MISSING_REFRESH_TOKEN', message: 'refresh_token is required' });
+      res.status(400).json({ code: 'MISSING_REFRESH_TOKEN', message: 'refresh_token required in body or cookie' });
       return;
     }
 
@@ -588,6 +601,7 @@ async function main() {
     console.log('[signal-clearance] AUTH_MODE=production — OIDC federation active');
   }
 
+  await obtainCerts();
   const tlsOptions = buildMTLSOptions();
   const server = https.createServer(tlsOptions, app);
 
@@ -595,6 +609,7 @@ async function main() {
     console.log(`[signal-clearance] Listening on :${PORT} (mTLS, TLS 1.3)`);
     console.log(`[signal-clearance] Default clearance levels: ${listClearanceLevels().length}`);
     console.log(`[signal-clearance] Auth mode: ${authMode}`);
+    setTimeout(() => selfRegister(), 3000);
   });
 }
 

@@ -2,6 +2,7 @@ import { Routes, Route, Navigate } from 'react-router-dom';
 import { useAuth } from './hooks/useAuth';
 import Admin from "./pages/Admin";
 import Plots from "./pages/Plots";
+import Ring from "./pages/Ring";
 import Dashboard from './pages/Dashboard';
 import Login from './pages/Login';
 import DevLogin from './pages/DevLogin';
@@ -30,6 +31,10 @@ export default function App() {
       <Route
         path="/admin"
         element={jwt ? <Admin /> : <Navigate to={loginPath} replace />}
+      />
+      <Route
+        path="/ring"
+        element={jwt ? <Ring /> : <Navigate to={loginPath} replace />}
       />
       <Route
         path="/plots"

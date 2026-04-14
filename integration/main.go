@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -43,32 +42,13 @@ func envOr(key, def string) string {
 var upstreamClient *http.Client
 
 func buildUpstreamClient() {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Printf("[integration] CA cert not found: %v", err)
-		upstreamClient = http.DefaultClient
-		return
-	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-	cert, err := tls.LoadX509KeyPair("/certs/integration.crt", "/certs/integration.key")
-	if err != nil {
-		log.Printf("[integration] Service cert not found: %v", err)
-		upstreamClient = http.DefaultClient
-		return
-	}
 	upstreamClient = &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				RootCAs:      caPool,
-				Certificates: []tls.Certificate{cert},
-				MinVersion:   tls.VersionTLS13,
-			},
+			TLSClientConfig: buildClientTLS(certMat),
 		},
-		Timeout: 15 * time.Second,
 	}
-	log.Printf("[integration] mTLS upstream client ready")
 }
+
 
 func reportEvent(callee, method, path string, status int, latencyMs int64) {
 	go func() {
@@ -261,25 +241,14 @@ func extractPathSegment(path, prefix, suffix string) string {
 // ---------------------------------------------------------------------------
 
 func loadServerTLS() *tls.Config {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Fatalf("[integration] CA cert not found — ensure cert-init completed before integration starts: %v", err)
-	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-	cert, err := tls.LoadX509KeyPair("/certs/integration.crt", "/certs/integration.key")
-	if err != nil {
-		log.Fatalf("[integration] Service cert not found — ensure cert-init generated integration certs: %v", err)
-	}
-	return &tls.Config{
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    caPool,
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-	}
+	return buildServerTLS(certMat)
 }
 
+var certMat *CertMaterial
+
 func main() {
+	certMat = obtainCerts("integration")
+	go selfRegisterWithAC(certMat, "https://integration:4013")
 	buildUpstreamClient()
 
 	mux := http.NewServeMux()

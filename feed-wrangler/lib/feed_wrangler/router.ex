@@ -23,13 +23,18 @@ defmodule FeedWrangler.Router do
 
   # Create feed
   post "/feeds" do
-    wrangler_id = conn.body_params["wrangler_id"] || "anonymous"
-    clearance_level = conn.body_params["clearance_level"] || "connie-wr4ngler"
-    filters = conn.body_params["filters"] || []
+    wrangler_id = conn.body_params["wrangler_id"]
 
-    feed = FeedWrangler.FeedRegistry.create(wrangler_id, clearance_level, filters)
-    Logger.info("[feed-wrangler] Feed created: #{feed.feed_id} for #{wrangler_id}")
-    send_json(conn, 201, feed)
+    if is_nil(wrangler_id) or wrangler_id == "" do
+      send_json(conn, 400, %{code: "INVALID_REQUEST", message: "wrangler_id is required"})
+    else
+      clearance_level = conn.body_params["clearance_level"] || "connie-wr4ngler"
+      filters = conn.body_params["filters"] || []
+
+      feed = FeedWrangler.FeedRegistry.create(wrangler_id, clearance_level, filters)
+      Logger.info("[feed-wrangler] Feed created: #{feed.feed_id} for #{wrangler_id}")
+      send_json(conn, 201, feed)
+    end
   end
 
   # List feeds

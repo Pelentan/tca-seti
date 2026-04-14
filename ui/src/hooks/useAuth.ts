@@ -39,7 +39,7 @@ export function useAuth() {
       return;
     }
 
-    // Try silent refresh via httpOnly cookie
+    // Expired or missing — try silent refresh via httpOnly cookie
     silentRefresh().finally(() => {
       setState(prev => ({ ...prev, isLoading: false }));
     });
@@ -62,8 +62,6 @@ export function useAuth() {
 
   async function silentRefresh() {
     try {
-      // credentials: 'include' sends the httpOnly seti_refresh cookie.
-      // No need to read or send the token from JS — the browser handles it.
       const res = await fetch(`${GATEWAY}/auth/refresh`, {
         method: 'POST',
         credentials: 'include',
@@ -73,17 +71,18 @@ export function useAuth() {
       if (res.ok) {
         const data = await res.json();
         storeAndSetJWT(data.jwt);
-        // Cookie is rotated server-side; no localStorage handling needed
+      } else {
+        localStorage.removeItem(JWT_KEY);
+        setState({ jwt: null, wranglerId: null, clearanceLevel: null, isLoading: false });
       }
     } catch {
-      // Silent refresh failed — user needs to log in
+      // Network error — don't clear state
     }
   }
 
   function logout() {
     const jwt = localStorage.getItem(JWT_KEY);
     localStorage.removeItem(JWT_KEY);
-    // httpOnly cookie cleared by the logout endpoint
     setState({ jwt: null, wranglerId: null, clearanceLevel: null, isLoading: false });
     if (jwt) {
       fetch(`${GATEWAY}/auth/logout`, {
@@ -91,26 +90,24 @@ export function useAuth() {
         headers: { Authorization: `Bearer ${jwt}` },
       }).catch(() => {});
     }
-    // In dev mode route to dev login, in production to OIDC login
     const isDevMode = import.meta.env.VITE_AUTH_MODE !== 'production';
     window.location.href = isDevMode ? '/dev-login' : '/login';
   }
 
+  // ---------------------------------------------------------------------------
+  // getFreshJWT — called before every authenticated API call.
+  // Always refreshes — every interaction with the backend extends the session.
+  // ---------------------------------------------------------------------------
   async function getFreshJWT(): Promise<string | null> {
-    // Return current JWT if still valid (more than 60s remaining)
-    const current = localStorage.getItem(JWT_KEY);
-    if (current) {
-      const claims = parseJWT(current);
-      const exp = Number(claims?.exp ?? 0);
-      if (Date.now() / 1000 < exp - 60) return current;
-    }
-    // Expired or nearly expired — silent refresh
     await silentRefresh();
     const refreshed = localStorage.getItem(JWT_KEY);
     return refreshed && !isExpired(refreshed) ? refreshed : null;
   }
 
-  return { ...state, logout, getFreshJWT };
+  // Alias — kept for call sites that explicitly want refresh-on-action semantics
+  const getJWTWithRefresh = getFreshJWT;
+
+  return { ...state, logout, getFreshJWT, getJWTWithRefresh };
 }
 
 function parseJWT(token: string): Record<string, string> | null {

@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -226,38 +224,22 @@ func handleRules(w http.ResponseWriter, r *http.Request) {
 // mTLS server setup
 // ---------------------------------------------------------------------------
 
-func loadTLSConfig() *tls.Config {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Fatalf("[observability] Failed to read CA cert: %v", err)
-	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-
-	cert, err := tls.LoadX509KeyPair("/certs/seti-observability.crt", "/certs/seti-observability.key")
-	if err != nil {
-		log.Fatalf("[observability] Failed to load service cert: %v", err)
-	}
-
-	return &tls.Config{
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    caPool,
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-	}
-}
+// loadTLSConfig replaced by cert-forge client — see certforge.go
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 func main() {
+	certMat := obtainCerts("seti-observability")
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "4011"
 	}
 
 	connectRedis()
+	go selfRegisterWithAC(certMat, "https://seti-observability:4011")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/event", handleEvent)
@@ -279,7 +261,7 @@ func main() {
 	server := &http.Server{
 		Addr:      ":" + port,
 		Handler:   mux,
-		TLSConfig: loadTLSConfig(),
+		TLSConfig: buildServerTLS(certMat),
 	}
 
 	// Strip trailing slash for cleaner logging

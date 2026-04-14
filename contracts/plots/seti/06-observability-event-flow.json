@@ -1,8 +1,8 @@
 {
   "name": "Observability Event Flow",
   "description": "Posts a synthetic event to the Observability Job and verifies the rules endpoint is reachable. Tests the observability infrastructure that underpins all SETI monitoring. If this plot fails, the dashboard event stream is broken.",
-  "application_id": "seti-self",
-  "author": "seti-self",
+  "application_id": "seti",
+  "author": "seti",
   "version": "1.0.0",
   "tags": ["observability", "infrastructure", "core"],
   "steps": [

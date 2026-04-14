@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // ---------------------------------------------------------------------------
@@ -52,6 +54,27 @@ func envOr(key, def string) string {
 // Plot model (mirrors Plot Store)
 // ---------------------------------------------------------------------------
 
+// PlotCall mirrors the contract PlotCall schema.
+type PlotCall struct {
+	Method  string            `json:"method"`
+	Path    string            `json:"path"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Body    interface{}       `json:"body,omitempty"`
+}
+
+// PlotAssertion defines a semantic assertion on a step's response body.
+type PlotAssertion struct {
+	Field    string      `json:"field"`
+	Operator string      `json:"operator"`
+	Value    interface{} `json:"value,omitempty"`
+}
+
+// CaptureDefinition extracts a value from the response for later steps.
+type CaptureDefinition struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
 type ExpectedCall struct {
 	Caller         string `json:"caller"`
 	Callee         string `json:"callee"`
@@ -60,16 +83,138 @@ type ExpectedCall struct {
 	MinOccurrences int    `json:"min_occurrences,omitempty"`
 }
 
+// PlotStep supports both the contract schema (Call wrapper) and the legacy flat format.
 type PlotStep struct {
-	StepNumber     int               `json:"step_number"`
-	Description    string            `json:"description"`
-	Method         string            `json:"method"`
-	Path           string            `json:"path"`
+	StepNumber  int    `json:"step_number"`
+	Description string `json:"description"`
+
+	// Contract schema — preferred
+	Call            *PlotCall           `json:"call,omitempty"`
+	ExpectStatus    int                 `json:"expect_status,omitempty"`
+	Assertions      []PlotAssertion     `json:"assertions,omitempty"`
+	Capture         []CaptureDefinition `json:"capture,omitempty"`
+	ExpectCallChain []ExpectedCall      `json:"expect_call_chain,omitempty"`
+
+	// Legacy flat format — backward compatible
+	Method         string            `json:"method,omitempty"`
+	Path           string            `json:"path,omitempty"`
 	Headers        map[string]string `json:"headers,omitempty"`
 	Body           interface{}       `json:"body,omitempty"`
-	ExpectedStatus int               `json:"expected_status"`
+	ExpectedStatus int               `json:"expected_status,omitempty"`
 	ExpectedChain  []ExpectedCall    `json:"expected_chain,omitempty"`
 	VerifyWithin   int               `json:"verify_within_seconds,omitempty"`
+}
+
+// Normalize resolves dual-format fields into canonical flat fields.
+// Must be called before execution. Applies capture substitutions to path and body.
+func (s *PlotStep) Normalize(captures map[string]string) {
+	if s.Call != nil {
+		s.Method = s.Call.Method
+		s.Path = s.Call.Path
+		if s.Call.Headers != nil {
+			s.Headers = s.Call.Headers
+		}
+		if s.Call.Body != nil {
+			s.Body = s.Call.Body
+		}
+	}
+	if s.ExpectStatus != 0 && s.ExpectedStatus == 0 {
+		s.ExpectedStatus = s.ExpectStatus
+	}
+	if len(s.ExpectCallChain) > 0 && len(s.ExpectedChain) == 0 {
+		s.ExpectedChain = s.ExpectCallChain
+	}
+	if len(captures) > 0 {
+		s.Path = applyCaptures(s.Path, captures)
+		if bodyStr, ok := s.Body.(string); ok {
+			s.Body = applyCaptures(bodyStr, captures)
+		}
+	}
+}
+
+func applyCaptures(s string, captures map[string]string) string {
+	for k, v := range captures {
+		s = strings.ReplaceAll(s, "{"+k+"}", v)
+	}
+	return s
+}
+
+// resolvePath navigates a dot-notation path into a decoded JSON value.
+// Returns the value and true if found, nil and false if not.
+func resolvePath(data interface{}, path string) (interface{}, bool) {
+	if path == "" {
+		return data, true
+	}
+	parts := strings.SplitN(path, ".", 2)
+	m, ok := data.(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	val, exists := m[parts[0]]
+	if !exists {
+		return nil, false
+	}
+	if len(parts) == 1 {
+		return val, true
+	}
+	return resolvePath(val, parts[1])
+}
+
+// evaluateAssertion checks a single PlotAssertion against the response body.
+type AssertionResult struct {
+	Field         string      `json:"field"`
+	Operator      string      `json:"operator"`
+	ExpectedValue interface{} `json:"expected_value,omitempty"`
+	ActualValue   interface{} `json:"actual_value,omitempty"`
+	Passed        bool        `json:"passed"`
+}
+
+func evaluateAssertion(a PlotAssertion, body interface{}) AssertionResult {
+	result := AssertionResult{Field: a.Field, Operator: a.Operator, ExpectedValue: a.Value}
+	actual, found := resolvePath(body, a.Field)
+	result.ActualValue = actual
+
+	switch a.Operator {
+	case "exists":
+		result.Passed = found
+	case "not_exists":
+		result.Passed = !found
+	case "equals", "eq":
+		result.Passed = found && fmt.Sprintf("%v", actual) == fmt.Sprintf("%v", a.Value)
+	case "not_equals":
+		result.Passed = found && fmt.Sprintf("%v", actual) != fmt.Sprintf("%v", a.Value)
+	case "contains":
+		if s, ok := actual.(string); ok {
+			result.Passed = found && strings.Contains(s, fmt.Sprintf("%v", a.Value))
+		}
+	case "not_contains":
+		if s, ok := actual.(string); ok {
+			result.Passed = found && !strings.Contains(s, fmt.Sprintf("%v", a.Value))
+		}
+	case "present":
+		result.Passed = found && actual != nil
+	case "gte", "greater_than_or_equal":
+		if n, ok := actual.(float64); ok {
+			if v, ok := a.Value.(float64); ok {
+				result.Passed = n >= v
+			}
+		}
+	case "greater_than":
+		if n, ok := actual.(float64); ok {
+			if v, ok := a.Value.(float64); ok {
+				result.Passed = n > v
+			}
+		}
+	case "less_than":
+		if n, ok := actual.(float64); ok {
+			if v, ok := a.Value.(float64); ok {
+				result.Passed = n < v
+			}
+		}
+	default:
+		result.Passed = false
+	}
+	return result
 }
 
 type Plot struct {
@@ -85,21 +230,24 @@ type Plot struct {
 // ---------------------------------------------------------------------------
 
 type StepResult struct {
-	StepNumber     int            `json:"step_number"`
-	Description    string         `json:"description"`
-	Passed         bool           `json:"passed"`
-	ActualStatus   int            `json:"actual_status"`
-	ExpectedStatus int            `json:"expected_status"`
-	ChainPassed    bool           `json:"chain_passed"`
-	ChainMatched   []ExpectedCall `json:"chain_matched,omitempty"`
-	ChainUnmatched []ExpectedCall `json:"chain_unmatched,omitempty"`
-	FailureReason  string         `json:"failure_reason,omitempty"`
-	LatencyMs      int64          `json:"latency_ms"`
-	ExecutedAt     string         `json:"executed_at"`
-	RequestURL     string         `json:"request_url,omitempty"`
-	RequestMethod  string         `json:"request_method,omitempty"`
-	RequestBody    interface{}    `json:"request_body,omitempty"`
-	ResponseBody   interface{}    `json:"response_body,omitempty"`
+	StepNumber        int               `json:"step_number"`
+	Description       string            `json:"description"`
+	Passed            bool              `json:"passed"`
+	ActualStatus      int               `json:"actual_status"`
+	ExpectedStatus    int               `json:"expected_status"`
+	ChainPassed       bool              `json:"chain_passed"`
+	ChainMatched      []ExpectedCall    `json:"chain_matched,omitempty"`
+	ChainUnmatched    []ExpectedCall    `json:"chain_unmatched,omitempty"`
+	AssertionResults  []AssertionResult `json:"assertion_results,omitempty"`
+	AssertionsPassed  int               `json:"assertions_passed"`
+	AssertionsFailed  int               `json:"assertions_failed"`
+	FailureReason     string            `json:"failure_reason,omitempty"`
+	LatencyMs         int64             `json:"latency_ms"`
+	AttemptsCount     int               `json:"attempts_count"` // >1 means retries were needed
+	ExecutedAt        string            `json:"executed_at"`
+	RequestMethod     string            `json:"request_method,omitempty"`
+	RequestBody       interface{}       `json:"request_body,omitempty"`
+	ResponseBody      interface{}       `json:"response_body,omitempty"`
 }
 
 type PlotRun struct {
@@ -116,12 +264,70 @@ type PlotRun struct {
 	CompletedAt   string       `json:"completed_at,omitempty"`
 }
 
+// Retry constants for transient failures (pod recycle, connection refused, 5xx).
+// Hardcoded by design — change requires code review and rebuild.
+const (
+	stepMaxAttempts   = 3
+	stepRetryInterval = 10 * time.Second
+)
+
 var (
-	runsMu   sync.RWMutex
-	runs     = map[string]*PlotRun{}
+	runsMu    sync.RWMutex
+	runs      = map[string]*PlotRun{}
 	totalRuns atomic.Int64
 	startTime = time.Now()
+	rdb       *redis.Client
 )
+
+func connectRedis() {
+	rdb = redis.NewClient(&redis.Options{Addr: redisURL})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Printf("[plot-test] Redis not available: %v — whiff buffer disabled", err)
+		rdb = nil
+	} else {
+		log.Printf("[plot-test] Connected to Redis at %s", redisURL)
+	}
+}
+
+// writeStepWhiff writes a step execution result to the bad-whiff Redis Stream.
+// Fire-and-forget. Every step writes regardless of pass/fail.
+func writeStepWhiff(applicationID, runID string, step PlotStep, result StepResult) {
+	if rdb == nil {
+		return
+	}
+	go func() {
+		key := "seti:whiff:" + applicationID
+		args := &redis.XAddArgs{
+			Stream: key,
+			MaxLen: 10000,
+			Approx: true,
+			ID:     "*",
+			Values: map[string]interface{}{
+				"application_id":     applicationID,
+				"run_id":             runID,
+				"step_number":        fmt.Sprintf("%d", result.StepNumber),
+				"description":        result.Description,
+				"method":             result.RequestMethod,
+				"path":               step.Path,
+				"expected_status":    fmt.Sprintf("%d", result.ExpectedStatus),
+				"actual_status":      fmt.Sprintf("%d", result.ActualStatus),
+				"passed":             fmt.Sprintf("%v", result.Passed),
+				"chain_passed":       fmt.Sprintf("%v", result.ChainPassed),
+				"assertions_passed":  fmt.Sprintf("%d", result.AssertionsPassed),
+				"assertions_failed":  fmt.Sprintf("%d", result.AssertionsFailed),
+				"latency_ms":         fmt.Sprintf("%d", result.LatencyMs),
+				"attempts_count":     fmt.Sprintf("%d", result.AttemptsCount),
+				"recorded_at":        result.ExecutedAt,
+			},
+		}
+		if err := rdb.XAdd(context.Background(), args).Err(); err != nil {
+			log.Printf("[plot-test] whiff buffer write failed for %s step %d: %v",
+				applicationID, result.StepNumber, err)
+		}
+	}()
+}
 
 // ---------------------------------------------------------------------------
 // mTLS client
@@ -130,30 +336,13 @@ var (
 var upstreamClient *http.Client
 
 func buildUpstreamClient() {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Printf("[plot-test] CA cert not found: %v", err)
-		upstreamClient = http.DefaultClient
-		return
-	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-	cert, err := tls.LoadX509KeyPair("/certs/plot-test.crt", "/certs/plot-test.key")
-	if err != nil {
-		log.Printf("[plot-test] Service cert not found: %v", err)
-		upstreamClient = http.DefaultClient
-		return
-	}
 	upstreamClient = &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				RootCAs: caPool, Certificates: []tls.Certificate{cert},
-				MinVersion: tls.VersionTLS13,
-			},
+			TLSClientConfig: buildClientTLS(certMat),
 		},
-		Timeout: 30 * time.Second,
 	}
 }
+
 
 func reportEvent(callee, method, path string, status int, latencyMs int64) {
 	go func() {
@@ -317,9 +506,54 @@ func verifyChain(applicationID string, after time.Time, step PlotStep) (bool, []
 	return result.Passed, result.Matched, result.Unmatched
 }
 
-// ---------------------------------------------------------------------------
-// Execute a full plot run
-// ---------------------------------------------------------------------------
+// isRetryable returns true for failures that are likely transient —
+// network errors and 5xx responses that indicate a pod mid-recycle.
+// 4xx responses, assertion failures, and chain failures are NOT retried:
+// those are real failures that retrying won't fix.
+func isRetryable(status int, err error) bool {
+	if err != nil {
+		return true // network-level failure: connection refused, timeout, DNS
+	}
+	return status >= 500 // 5xx: pod degraded or mid-recycle
+}
+
+// executeStepWithRetry wraps executeStep with retry logic for transient failures.
+// Attempts up to stepMaxAttempts times with stepRetryInterval between each.
+// Returns the result, attempt count, and whether any retry was needed.
+func executeStepWithRetry(applicationID string, step PlotStep, jwt string) (int, interface{}, int64, error, int) {
+	var (
+		status       int
+		responseBody interface{}
+		latency      int64
+		execErr      error
+	)
+
+	for attempt := 1; attempt <= stepMaxAttempts; attempt++ {
+		status, responseBody, latency, execErr = executeStep(applicationID, step, jwt)
+
+		if !isRetryable(status, execErr) {
+			return status, responseBody, latency, execErr, attempt
+		}
+
+		if attempt < stepMaxAttempts {
+			reason := fmt.Sprintf("status=%d", status)
+			if execErr != nil {
+				reason = execErr.Error()
+			}
+			log.Printf("[plot-test] Step %d transient failure (attempt %d/%d): %s — retrying in %s",
+				step.StepNumber, attempt, stepMaxAttempts, reason, stepRetryInterval)
+			time.Sleep(stepRetryInterval)
+		}
+	}
+
+	// All attempts exhausted — return last result with attempt count
+	if execErr != nil {
+		execErr = fmt.Errorf("retry_exhausted after %d attempts: %w", stepMaxAttempts, execErr)
+	} else {
+		execErr = fmt.Errorf("retry_exhausted after %d attempts: last status %d", stepMaxAttempts, status)
+	}
+	return status, responseBody, latency, execErr, stepMaxAttempts
+}
 
 func executeRun(plotID, applicationID string) *PlotRun {
 	runID := fmt.Sprintf("plot-run-%d", time.Now().UnixNano())
@@ -360,9 +594,15 @@ func executeRun(plotID, applicationID string) *PlotRun {
 	}
 
 	// Execute each step
+	captures := map[string]string{} // capture store — scoped to this run
 	for _, step := range plot.Steps {
 		stepStart := time.Now()
-		actualStatus, responseBody, latency, execErr := executeStep(applicationID, step, jwt)
+
+		// Normalize resolves call wrapper / expect_status / expect_call_chain
+		// and applies any captures from prior steps to path and body
+		step.Normalize(captures)
+
+		actualStatus, responseBody, latency, execErr, attempts := executeStepWithRetry(applicationID, step, jwt)
 
 		stepResult := StepResult{
 			StepNumber:     step.StepNumber,
@@ -370,10 +610,15 @@ func executeRun(plotID, applicationID string) *PlotRun {
 			ExpectedStatus: step.ExpectedStatus,
 			ActualStatus:   actualStatus,
 			LatencyMs:      latency,
+			AttemptsCount:  attempts,
 			ExecutedAt:     stepStart.UTC().Format(time.RFC3339),
 			RequestMethod:  step.Method,
 			RequestBody:    step.Body,
 			ResponseBody:   responseBody,
+		}
+
+		if attempts > 1 {
+			log.Printf("[plot-test] Step %d required %d attempts", step.StepNumber, attempts)
 		}
 
 		if execErr != nil {
@@ -381,11 +626,33 @@ func executeRun(plotID, applicationID string) *PlotRun {
 			stepResult.ChainPassed = false
 			stepResult.FailureReason = execErr.Error()
 		} else {
-			// Check response status
 			statusPassed := actualStatus == step.ExpectedStatus
 
-			// Brief delay to allow observability events to propagate through
-			// the pipeline: gateway → seti-observability → Redis → Signal Aggregator
+			// Extract capture values from response body for use in subsequent steps
+			for _, cap := range step.Capture {
+				if val, found := resolvePath(responseBody, cap.Path); found {
+					captures[cap.Name] = fmt.Sprintf("%v", val)
+					log.Printf("[plot-test] Step %d captured %s = %v", step.StepNumber, cap.Name, val)
+				}
+			}
+
+			// Evaluate semantic assertions on response body
+			var assertionResults []AssertionResult
+			assertionsPassed, assertionsFailed := 0, 0
+			for _, assertion := range step.Assertions {
+				ar := evaluateAssertion(assertion, responseBody)
+				assertionResults = append(assertionResults, ar)
+				if ar.Passed {
+					assertionsPassed++
+				} else {
+					assertionsFailed++
+				}
+			}
+			stepResult.AssertionResults = assertionResults
+			stepResult.AssertionsPassed = assertionsPassed
+			stepResult.AssertionsFailed = assertionsFailed
+
+			// Brief delay to allow observability events to propagate
 			time.Sleep(500 * time.Millisecond)
 
 			// Verify call chain
@@ -394,11 +661,16 @@ func executeRun(plotID, applicationID string) *PlotRun {
 			stepResult.ChainMatched = matched
 			stepResult.ChainUnmatched = unmatched
 
-			stepResult.Passed = statusPassed && chainPassed
+			assertionsPassed2 := assertionsFailed == 0
+			stepResult.Passed = statusPassed && chainPassed && assertionsPassed2
 			if !statusPassed {
-				stepResult.FailureReason = fmt.Sprintf("Expected status %d, got %d", step.ExpectedStatus, actualStatus)
+				stepResult.FailureReason = fmt.Sprintf("Expected status %d, got %d",
+					step.ExpectedStatus, actualStatus)
+			} else if !assertionsPassed2 {
+				stepResult.FailureReason = fmt.Sprintf("%d assertion(s) failed", assertionsFailed)
 			} else if !chainPassed {
-				stepResult.FailureReason = fmt.Sprintf("%d expected calls not observed in event stream", len(unmatched))
+				stepResult.FailureReason = fmt.Sprintf("%d expected call(s) not observed in event stream",
+					len(unmatched))
 			}
 		}
 
@@ -409,9 +681,15 @@ func executeRun(plotID, applicationID string) *PlotRun {
 		}
 		run.Steps = append(run.Steps, stepResult)
 
-		log.Printf("[plot-test] Step %d/%d (%s): passed=%v status=%d chain=%v latency=%dms",
+		// Write every step result to bad-whiff buffer — tier 2 storage.
+		// AI-lien needs baseline data, not just failure data.
+		writeStepWhiff(applicationID, runID, step, stepResult)
+
+		log.Printf("[plot-test] Step %d/%d (%s): passed=%v status=%d assertions=%d/%d chain=%v latency=%dms",
 			step.StepNumber, run.TotalSteps, step.Description,
-			stepResult.Passed, actualStatus, stepResult.ChainPassed, latency)
+			stepResult.Passed, actualStatus,
+			stepResult.AssertionsPassed, stepResult.AssertionsPassed+stepResult.AssertionsFailed,
+			stepResult.ChainPassed, latency)
 	}
 
 	if run.FailedSteps > 0 {
@@ -428,15 +706,18 @@ func executeRun(plotID, applicationID string) *PlotRun {
 		postJSON(resultsURL+"/plot-results", run, nil)
 	}()
 
-	// Escalate failures to Interactions
+	// Escalate to Interactions — always, on any failure.
+	// Interactions decides the path (immediate/AI/silence) based on failure rate and Lore history.
 	if run.FailedSteps > 0 {
 		go func() {
 			postJSON(interactionsURL+"/escalate", map[string]interface{}{
 				"run_id":         runID,
-				"plot_id":        plotID,
 				"application_id": applicationID,
-				"failed_steps":   run.FailedSteps,
-				"total_steps":    run.TotalSteps,
+				"test_tier":      "plot",
+				"total_tests":    run.TotalSteps,
+				"failed_tests":   run.FailedSteps,
+				"passed_tests":   run.PassedSteps,
+				"skipped_tests":  0,
 			}, nil)
 		}()
 	}
@@ -465,7 +746,7 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.ApplicationID == "" {
-		req.ApplicationID = "seti-self"
+		req.ApplicationID = "seti"
 	}
 
 	// Run async, return immediately
@@ -503,24 +784,16 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func loadServerTLS() *tls.Config {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Fatalf("[plot-test] CA cert not found: %v", err)
-	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-	cert, err := tls.LoadX509KeyPair("/certs/plot-test.crt", "/certs/plot-test.key")
-	if err != nil {
-		log.Fatalf("[plot-test] cert: %v — ensure cert-init completed before plot-test starts", err)
-	}
-	return &tls.Config{
-		ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: caPool,
-		Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13,
-	}
+	return buildServerTLS(certMat)
 }
 
+var certMat *CertMaterial
+
 func main() {
+	certMat = obtainCerts("plot-test")
+	go selfRegisterWithAC(certMat, "https://plot-test:4004")
 	buildUpstreamClient()
+	connectRedis()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", handleHealth)
@@ -535,5 +808,140 @@ func main() {
 
 	if err := server.ListenAndServeTLS("", ""); err != nil {
 		log.Fatalf("[plot-test] %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler — polls Policy for applications with plot tests enabled and
+// runs them on the configured cron schedule (simplified: daily at 02:00 UTC).
+// ---------------------------------------------------------------------------
+
+var (
+	plotScheduledApps   = map[string]*plotScheduledApp{}
+	plotScheduledAppsMu sync.Mutex
+)
+
+type plotScheduledApp struct {
+	applicationID string
+	stop          chan struct{}
+}
+
+func startPlotScheduler() {
+	log.Printf("[plot-test] Scheduler starting — polling policy every 60s for applications with plot tests enabled")
+	go func() {
+		syncPlotSchedules()
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			syncPlotSchedules()
+		}
+	}()
+}
+
+func syncPlotSchedules() {
+	apps, err := fetchPlotEnabledApps()
+	if err != nil {
+		log.Printf("[plot-test] Scheduler: could not fetch applications: %v", err)
+		return
+	}
+
+	plotScheduledAppsMu.Lock()
+	defer plotScheduledAppsMu.Unlock()
+
+	for _, appID := range apps {
+		if _, ok := plotScheduledApps[appID]; ok {
+			continue // already scheduled
+		}
+
+		sa := &plotScheduledApp{
+			applicationID: appID,
+			stop:          make(chan struct{}),
+		}
+		plotScheduledApps[appID] = sa
+
+		go func(s *plotScheduledApp) {
+			log.Printf("[plot-test] Scheduler: watching %s — runs daily at 02:00 UTC", s.applicationID)
+			for {
+				now := time.Now().UTC()
+				// Next 02:00 UTC
+				next := time.Date(now.Year(), now.Month(), now.Day(), 2, 0, 0, 0, time.UTC)
+				if now.After(next) {
+					next = next.Add(24 * time.Hour)
+				}
+				timer := time.NewTimer(next.Sub(now))
+				select {
+				case <-timer.C:
+					log.Printf("[plot-test] Scheduler: triggering daily run for %s", s.applicationID)
+					triggerPlotRunForApp(s.applicationID)
+				case <-s.stop:
+					timer.Stop()
+					return
+				}
+			}
+		}(sa)
+	}
+
+	// Stop removed applications
+	for id, sa := range plotScheduledApps {
+		found := false
+		for _, appID := range apps {
+			if appID == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			close(sa.stop)
+			delete(plotScheduledApps, id)
+			log.Printf("[plot-test] Scheduler: stopped watching %s", id)
+		}
+	}
+}
+
+func fetchPlotEnabledApps() ([]string, error) {
+	var result struct {
+		Applications []struct {
+			ApplicationID string `json:"application_id"`
+			Status        string `json:"status"`
+			TestSchedule  *struct {
+				PlotTestEnabled bool `json:"plot_test_enabled"`
+				Enabled         bool `json:"enabled"`
+			} `json:"test_schedule"`
+		} `json:"applications"`
+	}
+	if _, err := getJSON(policyURL+"/applications", &result); err != nil {
+		return nil, err
+	}
+	var apps []string
+	for _, a := range result.Applications {
+		if a.Status != "active" {
+			continue
+		}
+		if a.TestSchedule != nil && a.TestSchedule.PlotTestEnabled && a.TestSchedule.Enabled {
+			apps = append(apps, a.ApplicationID)
+		}
+	}
+	return apps, nil
+}
+
+func triggerPlotRunForApp(applicationID string) {
+	// Fetch all plots for this application from plot-store and run each
+	plotStoreURL := envOr("PLOT_STORE_URL", "https://plot-store:4005")
+	var result struct {
+		Plots []struct {
+			PlotID string `json:"plot_id"`
+		} `json:"plots"`
+	}
+	if _, err := getJSON(fmt.Sprintf("%s/plots?application_id=%s", plotStoreURL, applicationID), &result); err != nil {
+		log.Printf("[plot-test] Scheduler: could not fetch plots for %s: %v", applicationID, err)
+		return
+	}
+	if len(result.Plots) == 0 {
+		log.Printf("[plot-test] Scheduler: no plots found for %s — skipping run", applicationID)
+		return
+	}
+	log.Printf("[plot-test] Scheduler: running %d plots for %s", len(result.Plots), applicationID)
+	for _, p := range result.Plots {
+		go executeRun(p.PlotID, applicationID)
 	}
 }

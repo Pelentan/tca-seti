@@ -373,6 +373,64 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /ingest/{tag}:
+    post:
+      tags: [plots]
+      summary: Ingest plots from a registered application's contract registry
+      description: |
+        Called by the Policy Job when an application is registered or
+        re-registered. Plot Store fetches the contents of the
+        contracts/plots directory from the application's registry using
+        the provided credentials, then stores each Plot definition.
+
+        Plots are submitted with the application tag as the application_id.
+        If a Plot with the same application_id, job_name, and plot_name
+        already exists, a new version is created and the prior version
+        is marked deprecated.
+
+        Returns a summary of plots ingested, updated, and skipped.
+        A plot is skipped if its JSON is malformed or missing required fields.
+
+        Internal endpoint — callable only by Policy Job via mTLS.
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Application tag from remote-apps.json
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestRequest'
+      responses:
+        '200':
+          description: Ingest complete
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResult'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: Could not reach registry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /health:
     get:
       tags: [health]
@@ -797,3 +855,51 @@ components:
         message:
           type: string
           example: "Plot 'plot-a1b2c3d4' not found"
+
+    IngestRequest:
+      type: object
+      required:
+        - registry_url
+        - registry_type
+        - registry_token
+      properties:
+        registry_url:
+          type: string
+          description: Base URL for registry access (e.g. GitHub API contents URL)
+          example: "https://api.github.com/repos/Pelentan/tca-vox/contents"
+        registry_type:
+          type: string
+          enum: [github, gitlab, generic]
+          description: Registry type — determines auth header format
+        registry_token:
+          type: string
+          description: Read-only access token for the registry
+
+    IngestResult:
+      type: object
+      required:
+        - tag
+        - ingested
+        - updated
+        - skipped
+        - ingested_at
+      properties:
+        tag:
+          type: string
+        ingested:
+          type: integer
+          description: New plots stored
+        updated:
+          type: integer
+          description: Existing plots versioned (prior version deprecated)
+        skipped:
+          type: integer
+          description: Files skipped due to malformed JSON or missing required fields
+        skip_reasons:
+          type: array
+          items:
+            type: string
+          description: One entry per skipped file explaining why it was skipped
+        ingested_at:
+          type: string
+          format: date-time

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -246,6 +245,46 @@ func processEvent(sub *Subscription, channel, payload string) {
 	// Re-publish to seti:events for dashboard and other subscribers
 	enriched, _ := json.Marshal(ev)
 	localRDB.Publish(context.Background(), "seti:aggregated", enriched)
+
+	// Write to bad-whiff buffer — tier 2 of the three-tier storage model.
+	// Every event writes regardless of pass/fail. AI-lien needs baseline data,
+	// not just anomaly data. The buffer is a 24-hour sliding window of everything
+	// that crossed the constellation boundary for this application.
+	// Key: seti:whiff:{application_id}  Stream: MAXLEN ~10000 approximate trim.
+	// A full buffer (10k entries) is itself a signal worth investigating.
+	writeWhiffBuffer(sub.ApplicationID, ev)
+}
+
+// writeWhiffBuffer writes an event to the application's bad-whiff Redis Stream.
+// Fire-and-forget — errors are logged but never affect the caller.
+// Key pattern: seti:whiff:{application_id}
+// MAXLEN ~10000 approximate trim — keeps recent history without unbounded growth.
+func writeWhiffBuffer(applicationID string, ev ConstellationEvent) {
+	go func() {
+		key := "seti:whiff:" + applicationID
+		ctx := context.Background()
+
+		args := &redis.XAddArgs{
+			Stream: key,
+			MaxLen: 10000,
+			Approx: true,
+			ID:     "*",
+			Values: map[string]interface{}{
+				"application_id": applicationID,
+				"caller":         ev.Caller,
+				"callee":         ev.Callee,
+				"method":         ev.Method,
+				"path":           ev.Path,
+				"status_code":    fmt.Sprintf("%d", ev.StatusCode),
+				"latency_ms":     fmt.Sprintf("%d", ev.LatencyMs),
+				"protocol":       ev.Protocol,
+				"received_at":    ev.ReceivedAt,
+			},
+		}
+		if err := localRDB.XAdd(ctx, args).Err(); err != nil {
+			log.Printf("[signal-aggregator] whiff buffer write failed for %s: %v", applicationID, err)
+		}
+	}()
 }
 
 // ---------------------------------------------------------------------------
@@ -254,20 +293,20 @@ func processEvent(sub *Subscription, channel, payload string) {
 
 func selfSubscribe() {
 	sub := &Subscription{
-		ApplicationID: "seti-self",
+		ApplicationID: "seti",
 		RedisURL:      redisURL,
 		Channels:      []string{"seti:events", "tca:augur-canis"},
 		Status:        "active",
 		SubscribedAt:  time.Now().UTC().Format(time.RFC3339),
 	}
 	subMu.Lock()
-	subscriptions["seti-self"] = sub
+	subscriptions["seti"] = sub
 	subMu.Unlock()
 	windowMu.Lock()
-	windows["seti-self"] = []ConstellationEvent{}
+	windows["seti"] = []ConstellationEvent{}
 	windowMu.Unlock()
 	startSubscription(sub)
-	log.Printf("[signal-aggregator] Self-subscribed to seti-self (tca:events, tca:augur-canis)")
+	log.Printf("[signal-aggregator] Self-subscribed to seti (tca:events, tca:augur-canis)")
 }
 
 // ---------------------------------------------------------------------------
@@ -366,30 +405,13 @@ func verifyCallChain(req VerifyRequest) VerifyResult {
 // ---------------------------------------------------------------------------
 
 func buildUpstreamClient() {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Printf("[signal-aggregator] CA cert not found: %v", err)
-		upstreamClient = http.DefaultClient
-		return
-	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-	cert, err := tls.LoadX509KeyPair("/certs/signal-aggregator.crt", "/certs/signal-aggregator.key")
-	if err != nil {
-		log.Printf("[signal-aggregator] Service cert not found: %v", err)
-		upstreamClient = http.DefaultClient
-		return
-	}
 	upstreamClient = &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				RootCAs: caPool, Certificates: []tls.Certificate{cert},
-				MinVersion: tls.VersionTLS13,
-			},
+			TLSClientConfig: buildClientTLS(certMat),
 		},
-		Timeout: 10 * time.Second,
 	}
 }
+
 
 func reportEvent(callee, method, path string, status int, latencyMs int64) {
 	go func() {
@@ -564,20 +586,7 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 func loadServerTLS() *tls.Config {
-	caCert, err := os.ReadFile("/certs/ca.crt")
-	if err != nil {
-		log.Fatalf("[signal-aggregator] CA cert: %v", err)
-	}
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
-	cert, err := tls.LoadX509KeyPair("/certs/signal-aggregator.crt", "/certs/signal-aggregator.key")
-	if err != nil {
-		log.Fatalf("[signal-aggregator] Service cert: %v", err)
-	}
-	return &tls.Config{
-		ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: caPool,
-		Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13,
-	}
+	return buildServerTLS(certMat)
 }
 
 var startTime = time.Now()
@@ -586,10 +595,14 @@ var startTime = time.Now()
 // Main
 // ---------------------------------------------------------------------------
 
+var certMat *CertMaterial
+
 func main() {
+	certMat = obtainCerts("signal-aggregator")
 	buildUpstreamClient()
 	connectRedis()
 	loadStarGazer()
+	go selfRegisterWithAC(certMat, "https://signal-aggregator:4006")
 	selfSubscribe()
 	go initFederationOnStartup()
 
@@ -607,7 +620,7 @@ func main() {
 	}
 
 	log.Printf("[signal-aggregator] Listening on :%s (mTLS, TLS 1.3)", port)
-	log.Printf("[signal-aggregator] Self-subscribed to seti-self — watching tca:events and tca:augur-canis")
+	log.Printf("[signal-aggregator] Self-subscribed to seti — watching tca:events and tca:augur-canis")
 
 	if err := server.ListenAndServeTLS("", ""); err != nil {
 		log.Fatalf("[signal-aggregator] %v", err)

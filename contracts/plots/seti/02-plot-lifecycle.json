@@ -1,8 +1,8 @@
 {
   "name": "Plot Lifecycle",
   "description": "Creates a plot and retrieves it. Verifies Plot Store accepts and returns structured plot data correctly. The plot created is intentionally minimal — it validates the storage mechanism, not the execution pipeline.",
-  "application_id": "seti-self",
-  "author": "seti-self",
+  "application_id": "seti",
+  "author": "seti",
   "version": "1.0.0",
   "tags": ["plot-store", "lifecycle", "core"],
   "steps": [
@@ -12,7 +12,7 @@
       "method": "POST",
       "path": "/plots",
       "body": {
-        "application_id": "seti-self",
+        "application_id": "seti",
         "name": "Lifecycle Verification Plot",
         "description": "Created by the Plot Lifecycle plot test to verify storage",
         "author": "plot-test",

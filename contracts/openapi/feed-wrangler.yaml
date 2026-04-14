@@ -1,7 +1,7 @@
 openapi: 3.1.0
 
 info:
-  title: SETI - Feed Wr4ngler Job
+  title: SETI - Feed Wrangler Job
   description: |
     Coordinates authorized signal delivery to Wr4nglers. The Feed
     Wr4ngler is the ring boss of SETI's external delivery layer —

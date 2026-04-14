@@ -1,8 +1,8 @@
 {
   "name": "Feed Provisioning",
   "description": "Creates a signal feed via Feed Wr4ngler and verifies it exists. Tests the scoped signal delivery provisioning path. Feed Wr4ngler is the Elixir OTP service — this plot also verifies the Elixir runtime is stable.",
-  "application_id": "seti-self",
-  "author": "seti-self",
+  "application_id": "seti",
+  "author": "seti",
   "version": "1.0.0",
   "tags": ["feed-wrangler", "elixir", "feeds"],
   "steps": [

@@ -1,9 +1,10 @@
 # Tessellated Constellation Architecture — Project Guidelines
 
 **Status:** Living Document  
-**Last Updated:** 2026-03-30  
+**Last Updated:** 2026-04-13  
 **Audience:** AI partners and engineers working on TCA projects  
-**Scope:** Architectural rules, sequencing, and operational standards for any TCA implementation
+**Scope:** Architectural rules, sequencing, and operational standards for any TCA implementation  
+**Related:** [Augur Canis Guidelines](AC-GUIDELINES.md) · [SETI Guidelines](SETI-GUIDELINES.md)
 
 ---
 
@@ -462,199 +463,73 @@ The AI partner maintains PHASE-PLAN.md as source of truth alongside the code. Wh
 
 ---
 
-## 20. The Augur Canis (AC) — Standard TCA Component
+## 20. Augur Canis — Standard TCA Component
 
-Every TCA constellation includes an Augur Canis (AC) agent alongside the Observability Job. AC is not optional instrumentation — it is the health verification layer that enables Docker and Kubernetes to know whether a Job is genuinely functioning, not merely running.
+Augur Canis (AC) is a health and behavioral monitoring service for TCA constellations.  It is also a standalone product with its own repository.  Every TCA constellation includes an Augur Canis instance.
 
-The name carries two meanings that describe the thing precisely. *Augur*: one who reads signs and renders a verdict through examination, not by asking the subject. *Canis*: the dog that alerts when the pattern breaks. Together: behavioral verification plus anomaly signaling.
+The name carries two meanings that describe the thing precisely.  *Augur*: one who reads signs and renders a verdict through examination, not by asking the subject.  *Canis*: the dog that alerts when the pattern breaks.  Together: behavioral verification plus anomaly signaling.
 
-### What Augur Canis Does
+### What AC Does
 
-AC executes minimal canned queries against each Job in the constellation to verify behavioral health, not just process presence. A Job can be running and broken. AC detects the difference.
+AC executes contract tests against every registered Job, maintains rolling time-series metric streams, runs three anomaly detectors continuously, fires alerts through a Redis pub/sub channel, and remembers baselines.  Full reference: [AC-GUIDELINES.md](AC-GUIDELINES.md).
 
-It publishes health state to a Redis pub/sub channel (`tca:augur-canis`) that SETI subscribes to alongside `tca:events`. Health state, latency, and time-to-complete for every Job flow into the same signal layer as observability events.
+The six capabilities in brief:
 
-When anomalies are detected, AC barks on a dedicated alert channel (`tca:augur-canis:alerts`) separate from the health feed. The alert channel carries only barks — a subscriber that only wants to know when something is wrong does not need to filter a high-volume health feed.
+**Health monitoring** — AC sends `POST /check` to every registered service on a configurable interval (default 30 seconds).  Services respond with status and container ID.  AC records latency, detects silence, and tracks Kubernetes container replacements.
 
-### Network Topology — Point-to-Point Isolation
+**Contract test execution** — AC maintains a hardcoded suite of behavioral assertions authored independently from the contracts they verify.  Tests run on a schedule and on demand.  The suite is the "say it three times" verification layer:  contract says what, implementation does it, test verifies independently.
 
-AC connects to each Job via its own dedicated network containing exactly two members: AC and that Job. If the constellation has N Jobs, there are N dedicated AC networks, named `ac-{service}-net`.
+**Latency drift detection** — Rolling time-series streams per Job in Redis Streams.  Auto-baseline established from observed data.  Alert fires when current mean exceeds baseline × multiplier for N consecutive cycles.  Wr4ngler SLA thresholds can be set per Job with configurable alert severity.
 
-This is not a shared AC network. A shared network would mean a compromised Job could reach every other Job through AC's network. Point-to-point networks mean the blast radius of any compromise stops at that Job's own networks plus its dedicated AC link — and that link cannot be used by the compromised Job to pivot, because AC is the sole initiator on all point-to-point networks.
+**Failure rate detection** — Rolling health stream per Job.  Alert fires when failure rate exceeds configurable threshold.
+
+**Silence detection** — Alert fires when a Job stops responding.  Auto-resolves on Kubernetes container replacement via container ID tracking.
+
+**Institutional memory** — Auto-baselines per Job in Redis.  Wr4ngler baselines in Redis (persistent, explicit operator decisions).  Metric streams queryable via time-bounded API for the SETI LaE visualization.
+
+### Self-Registration
+
+Any service that wants AC to monitor it calls `POST /services/register` at startup.  The registration includes the service name, network endpoint, certificate fingerprint, and a signature for identity verification.  Self-registration retries indefinitely — services do not fail to start because AC is not yet available.
+
+The service name in the registration payload must match the contract title exactly as processed by the contract-test Job's `serviceNameFromTitle()` function.  A mismatch causes all contract tests for that service to be silently skipped with `job_not_deployed`.
+
+### Network Topology
+
+AC joins a dedicated two-member Docker network with each service it monitors (`ac-net` in the SETI implementation).  This is not a shared network.  A shared AC network means a compromised Job can reach every other Job through AC's network.  Point-to-point isolation confines the blast radius.
 
 In Docker Compose:
 ```yaml
 networks:
-  ac-gateway-net:
+  ac-net:
     driver: bridge
-  ac-clearance-net:
-    driver: bridge
-  # ... one per Job
 ```
 
-Each Job is attached to its normal operational networks plus its single dedicated AC network. AC is attached to all AC networks and nothing else — it has no access to the operational networks between Jobs.
+Each Job attaches to its operational networks plus `ac-net`.  AC attaches to `ac-net` only — it has no access to the operational networks between Jobs.
 
-### Health Check Mechanism — Redis-Mediated, No Open Ports
+### Detection Thresholds Are Code, Not Configuration
 
-No Job exposes a plain HTTP health port. No Job exposes any additional surface for health checking. The mechanism is entirely Redis-mediated, with no open ports on any container:
+All detector thresholds (`MIN_BASELINE_SAMPLES`, `LATENCY_DRIFT_MULTIPLIER`, `FAILURE_RATE_THRESHOLD`, `CONSECUTIVE_DRIFT_CYCLES`) are Go constants in the source, not environment variables.  Changing a detection threshold is an architectural decision — it requires a code review, a rebuild, and a tracked deployment.  Environment variable thresholds can be silently changed and silently reverted.  Code constants require a commit.
 
-1. The healthcheck binary inside a Job container publishes a check request to Redis `tca:check-requests` with a unique `request_id`, `container_id`, and `service_name`.
-2. AC subscribes to `tca:check-requests`, receives the request, looks up the canned query for `service_name` from its DB.
-3. AC executes the canned query over the dedicated point-to-point mTLS network to that Job.
-4. AC publishes the result to `tca:check-results:{request_id}` with a configurable TTL (default 30 seconds). The TTL prevents accumulation if the healthcheck binary crashes or times out.
-5. The healthcheck binary subscribes to `tca:check-results:{request_id}`, reads the result, exits 0 (healthy) or 1 (unhealthy).
+### Dev UI — Port 4666
 
-Docker Compose healthcheck:
-```yaml
-healthcheck:
-  test: ["CMD", "/healthcheck"]
-  interval: 30s
-  timeout: 10s
-  retries: 3
-  start_period: 30s
-environment:
-  SERVICE_NAME: "job-name"
-  REDIS_URL: "redis:6379"
-```
+When `AC_UI_PORT=4666` is set, AC serves a plain HTML observability page on that port — no authentication, no build step, embedded in the binary.  Intended for initial setup verification.  The port name is the warning: 4666, "For 666."  Remove before production.
 
-Kubernetes exec probe (identical binary, no network call from K8s):
-```yaml
-livenessProbe:
-  exec:
-    command: ["/healthcheck"]
-  initialDelaySeconds: 30
-  periodSeconds: 30
-```
+### Standalone Repository
 
-The healthcheck binary falls back to a Redis connectivity check if AC is unavailable (startup ordering, AC restart). A Job that can reach Redis is treated as degraded-healthy rather than killed. AC will do the full behavioral verification on the next cycle.
-
-### Canned Queries
-
-AC stores one query definition per Job in its own isolated database. A canned query is the minimum request that confirms a Job is alive and responding correctly per its contract — not a Contract Test, not a Plot. Just enough to distinguish "running and healthy" from "running and broken."
-
-Query definitions are versioned and updateable by the Sec Wr4ngler without code changes or redeployment. The query version used is recorded in every check result for audit purposes. As a constellation evolves, query definitions evolve with it — AC does not need to be redeployed to update a check.
-
-Example query definitions:
-- **Observability Job**: POST /event with a known test payload, expect 202
-- **Gateway**: GET /health, expect 200 with `{"status":"healthy"}`
-- **Signal Clearance**: GET /health, expect 200
-- **A data-writing Job**: POST with a minimal valid payload, expect 201 or 202
-
-### Anomaly Detection and Alert Lifecycle
-
-AC watches the health feed for three classes of anomaly. Silence detection is active. Latency drift and failure rate detection are implemented as data-collection stubs — the Redis windows are populated on every check cycle, the alert logic is deferred.
-
-**Silence detection (active):** If a Job stops appearing in the check feed for longer than `SILENCE_THRESHOLD_SECONDS` (default 3x check interval), AC fires an alert.
-
-**Latency drift (stubbed):** Rolling window of the last 20 latency readings per Job stored in Redis. Alert fires when current reading exceeds `baseline * multiplier` for K consecutive cycles. Stub: window populated, alert logic not yet active.
-
-**Failure rate (stubbed):** Rolling window of the last 20 health results (0/1) per Job stored in Redis. Alert fires when failure rate exceeds configurable threshold. Stub: window populated, alert logic not yet active.
-
-**Alert lifecycle:**
-1. Condition detected → bark once, `bark_count: 1`
-2. Next check cycle → bark again, `bark_count: 2`
-3. Next check cycle → bark again, `bark_count: 3`
-4. After 3 barks → reminder bark every `REMINDER_INTERVAL_SECONDS` (default 30s) until acknowledged
-5. `POST /alerts/{alert_id}/acknowledge` → stops reminders, sends acknowledgment bark, condition still watched
-6. Condition clears → auto-resolve regardless of acknowledgment state, sends `resolved` bark with `resolution_type: condition_cleared`
-7. If condition never acknowledged when it clears → resolved bark notes `unacknowledged_clear` for post-mortem
-
-**Alert storm prevention:** The `alert_active` flag prevents duplicate initial alerts. Once in reminder mode, reminders fire on the configured interval regardless of check cycle timing.
-
-### Kubernetes Container Replacement Detection
-
-When Kubernetes replaces a container (OOMKill, crashloop, manual restart), AC infers the replacement from the data it already receives. No Kubernetes API access required. No RBAC. No sidecar.
-
-The healthcheck binary includes the container ID (`$HOSTNAME`, which Docker sets to the container ID) in every check request. AC tracks the last known container ID per Job:
-
-- Check request arrives with a new container ID for a service that had an active alert → AC auto-resolves with `resolution_type: container_replaced`
-- Check request arrives with a new container ID for a service with no active alert → AC resets the latency and health windows for that Job, logs the replacement
-
-**Optional enhancement — PreStop lifecycle hook:**
-```yaml
-lifecycle:
-  preStop:
-    exec:
-      command: ["/notify-ac"]
-```
-A tiny binary that publishes a `terminating` event to Redis before the container is killed. AC receives it and can mark the alert as `container_replaced` with advance notice rather than inferring after the fact. This is optional — the container ID change detection catches replacements even when the PreStop hook cannot execute (frozen container).
-
-### Redis Channels
-
-| Channel | Publisher | Subscriber | Purpose |
-|---------|-----------|------------|---------|
-| `tca:check-requests` | healthcheck binary | AC | Trigger a check for a specific Job |
-| `tca:check-results:{request_id}` | AC | healthcheck binary | Return check result to caller |
-| `tca:augur-canis` | AC | SETI Signal Aggregator | Constellation health state feed |
-| `tca:augur-canis:alerts` | AC | SETI, operators, AI monitors | Alert-only feed — barks only |
-
-### Redis State Keys
-
-AC stores all anomaly detection state in Redis. State resets on Redis flush — this is a feature, not a bug. A Redis flush typically follows an architecture change, which invalidates the existing baseline. AC re-establishes its baseline naturally on the next N check cycles.
-
-```
-ac:state:{service}:last_seen           → ISO8601 timestamp of last check request
-ac:state:{service}:last_container_id   → current container ID
-ac:state:{service}:last_container_id:prev → previous container ID (for replacement detection)
-ac:state:{service}:latency_window      → list of last 20 latency_ms values (capped)
-ac:state:{service}:health_window       → list of last 20 healthy values — 0 or 1 (capped)
-ac:state:{service}:alert_active        → "1" when alert is firing
-ac:state:{service}:alert_id            → current alert UUID
-ac:state:{service}:alert_type          → silence | latency_drift | failure_rate
-ac:state:{service}:bark_count          → 1-3 initial, "acknowledged" after ack
-ac:state:{service}:last_bark_at        → ISO8601 timestamp of last bark
-ac:state:{service}:alert_first_at      → ISO8601 timestamp when alert first fired
-ac:alert:{alert_id}                    → service_name (reverse lookup, 24h TTL)
-```
-
-### The Healthcheck Binary
-
-A small static Go binary built into every container. It handles the full Redis pub/sub coordination:
-
-```
-/healthcheck
-  → publishes to tca:check-requests
-  → waits on tca:check-results:{request_id} (with TTL-based timeout)
-  → exits 0 (healthy=1) or 1 (healthy=0)
-  → falls back to Redis PING if AC unavailable — degraded-healthy
-```
-
-Built during the Docker build stage from `healthcheck/` in the project root. The same binary works in every container regardless of language. In scratch containers it is the only binary besides the service binary. In distroless containers it is copied in alongside the service.
-
-For distroless/nodejs containers, `healthcheck.js` provides identical behavior using Node's built-in `net` module and raw RESP protocol — no npm dependencies.
-
-```dockerfile
-# In every Go/static Job's Dockerfile (project-root build context):
-WORKDIR /hc
-COPY healthcheck/go.mod healthcheck/go.sum ./
-RUN go mod download
-COPY healthcheck/main.go .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /healthcheck .
-```
-
-The binary requires two environment variables:
-- `REDIS_URL` — Redis connection string (already present in every Job)
-- `SERVICE_NAME` — this Job's service name, for the check request payload
-
-### SETI Integration
-
-SETI knows that every registered TCA application has an Augur Canis agent. The Signal Aggregator subscribes to each application's `tca:augur-canis` channel alongside `tca:events` when the application is registered. Cross-application Job health flows into the same signal layer as observability events.
-
-The dedicated `tca:augur-canis:alerts` channel is also subscribed by SETI for alert correlation. An AI monitoring agent subscribed to the alerts channel needs no special logic — three barks followed by reminders is a sufficient signal for automated escalation. A human operator benefits from the reminder cadence to ensure the alert is seen.
+AC has its own repository: github.com/Pelentan/augur-canis.  It can be adopted independently of SETI and TCA.  The integration surface with SETI is entirely through AC's existing admin API — no new endpoints are required when AC is integrated into a SETI constellation.
 
 ### Adding AC to a New TCA Project
 
-1. Add the Augur Canis Job to the constellation with its own DB.
-2. Add one `ac-{service}-net` network per Job in docker-compose.yml.
-3. Attach each Job to its dedicated AC network in addition to its operational networks.
-4. Attach AC to all AC networks and to the main internal network only.
-5. Register each Job with AC via `POST /jobs`.
-6. Define a canned query for each Job via `PUT /queries/{service_name}`.
-7. Add the healthcheck binary build to each Job's Dockerfile.
-8. Set `SERVICE_NAME` and `REDIS_URL` environment variables in each Job's service definition.
-9. Add Docker Compose healthcheck `test: ["CMD", "/healthcheck"]` to each service.
+1. Add AC and Redis to the constellation's docker-compose.yml.
+2. Add `ac-net` to docker-compose networks.
+3. Add each Job to `ac-net` in its service definition.
+4. Each service calls `selfRegisterWithAC()` at startup.
+5. Add contract test entries to `contracttests.go` for each new service.
+6. Add Docker Compose healthcheck `test: ["CMD", "/healthcheck"]` to each service.
 
-AC's own health is verified by SETI's Signal Aggregator watching the `tca:augur-canis` feed — if the feed goes silent, AC itself has failed. AC does not check itself.
+The healthcheck binary (`healthcheck/` in the project root) is built into every container during the Docker build stage.  It handles the Redis-mediated health coordination and falls back to a Redis PING if AC is unavailable.
+
+Full setup reference: [AC-GUIDELINES.md](AC-GUIDELINES.md).
 
 ---
 
@@ -721,3 +596,221 @@ Writing OpenAPI specs first forces clarity. Ambiguities that would cause mid-imp
 
 **2026-02-25 — Stub Contracts Are Real Contracts**
 When the real implementation replaces a stub, no caller changes. That is the test.
+
+**2026-04-09 — cert-forge: PKI Abstraction Is a Standard TCA Component**
+Distributing certificates via a shared Docker volume exposes all private keys to all services — any compromised service can read every other service's key material. cert-forge solves this by acting as a PKI abstraction layer: it generates the CA in memory, issues instance certificates on demand over an enrollment mTLS connection, and holds all private key material in memory only. Services receive their own cert/key over an encrypted channel and never see any other service's material. cert-forge is a candidate standard TCA component applicable to any constellation, not a SETI-specific pattern.
+
+**2026-04-09 — cert-forge: Three-Port Architecture Is Load-Bearing**
+TLS client authentication cannot be enforced per-path on a single port — it is a connection-level property. cert-forge requires three distinct servers: port for plain HTTP (CA cert distribution — public), port for enrollment mTLS (instance cert issuance — requires enrollment cert), port for constellation mTLS (signing operations — requires instance cert). Attempting to collapse these onto fewer ports will break the security model.
+
+**2026-04-09 — cert-forge: Enrollment CA Pattern**
+cert-forge generates a separate enrollment CA whose only issued credential is a single enrollment cert written to the shared volume. This cert's only capability is calling the instance-cert endpoint. The constellation CA private key never touches the shared volume. In K8s production, the cert issuance backend points to cert-manager or the organizational CA — the signing responsibility stays with cert-forge, the constellation is decoupled from infrastructure PKI choices.
+
+**2026-04-09 — Gateway Must Forward Upstream Response Headers**
+A reverse proxy that reads the upstream response body and status code but does not copy upstream response headers silently discards Set-Cookie, Cache-Control, and other headers the client depends on. In SETI, the gateway was discarding Set-Cookie from signal-clearance, so the httpOnly refresh token cookie was never stored in the browser — the client sent every refresh request with no cookie and received 400. Always copy all upstream response headers to the client response before writing the body.
+
+**2026-04-09 — httpOnly Cookie Scope Is the Issuing Domain and Port**
+A cookie set by a service on port N is scoped to port N. If a reverse proxy on port M forwards the response but does not preserve the Set-Cookie header, the browser never receives the cookie. If the proxy does forward it, the cookie is scoped to the proxy's port (M), and the browser will send it back to port M — which is correct when all client traffic routes through the proxy. The cookie must be issued through the gateway, not directly from the upstream service, for cookie-based auth to work in a proxied architecture.
+
+**2026-04-09 — Session Timeout Is Inactivity Timeout, Not Wall Clock**
+A JWT with a 15-minute TTL is not a 15-minute session limit — it is a 15-minute inactivity timeout, implemented by refreshing the token on every authenticated API call. getFreshJWT() must call the refresh endpoint unconditionally on every invocation, not only when the token is near expiry. Any expiry-check before refresh defeats the inactivity timeout model: a user active at minute 10 who returns at minute 17 is still locked out because the token was never refreshed during the active period.
+
+**2026-04-09 — Contract Title Must Produce the Same String as Service Self-Registration Name**
+Contract-test derives the service name from the contract title using serviceNameFromTitle(). Augur Canis looks up registered jobs by the name the service used when it called self-register. If these two strings don't match exactly, every test for that service is silently skipped with job_not_deployed — not failed, skipped. The contract title is authoritative. Display name choices (capitalisation, numeronym substitution like Wr4ngler vs Wrangler) must not diverge from the technical identifier. Verify: serviceNameFromTitle(contract.title) == service.service_name in self-registration payload.
+
+**2026-04-13 — Contract Tests Are Not Generated Tests**
+A contract test suite generated from OpenAPI contracts cannot independently verify those contracts — it re-states them.  Independent verification requires a human to read the contract, understand the intent, and write assertions separately.  If a contract changes, the tests must be updated manually.  That friction is the point.  Hardcode the test suite; update it by hand.
+
+**2026-04-13 — Negative Tests Are the Tests Most Likely to Find Real Bugs**
+Positive tests verify that correct input produces correct output.  Negative tests verify that incorrect input produces a 4xx response, not a 5xx.  A 5xx on bad input means the Job is swallowing errors.  This is a real bug that positive tests cannot surface.  Every Job with POST endpoints needs at least one negative test sending malformed or missing required fields.
+
+**2026-04-13 — Detection Thresholds Belong in Code, Not Configuration**
+Monitoring and alerting thresholds are architectural decisions with operational consequences.  An environment variable threshold can be set to zero by anyone with access to the compose file, then reset.  A hardcoded constant requires a code review, a rebuild, and a deployment.  The friction is the safeguard.  Interactions' critical failure threshold (50%) and silence window (7 days) are Go constants, not env vars.
+
+**2026-04-13 — Python BaseHTTPServer + Go mTLS Client: Use ResilientHTTPServer**
+Python's `BaseHTTPServer.handle_error` propagates `BrokenPipeError` and `ssl.SSLError` to stderr and terminates the handler thread.  This causes the Go mTLS client to see a broken pipe on the write side.  Subclass `HTTPServer` with a `handle_error` override that silently absorbs `BrokenPipeError`, `ConnectionResetError`, and `ssl.SSLError`.  These are expected when an mTLS client closes the connection before reading the full response.
+
+**2026-04-13 — Go HTTP Client + Python BaseHTTPServer: Use bytes.NewReader with ContentLength**
+A custom `io.Reader` type that only implements `Read()` causes Go's HTTP client to use chunked transfer encoding — it cannot determine content length upfront.  Python's `BaseHTTPServer` does not handle chunked POST bodies reliably under TLS and closes the connection mid-write.  Use `bytes.NewReader(payload)` with explicit `req.ContentLength = int64(len(payload))` for all POST requests from Go to Python services.
+
+**2026-04-13 — Redis Streams over Lists for Time-Series Data**
+Redis Lists (LPUSH/LTRIM) store raw values with no timestamps.  Time-bounded queries require iterating the full list and filtering client-side.  Redis Streams (XADD/XRANGE) store entries with millisecond-precision timestamps as built-in IDs, enabling `XRANGE minMs maxMs` queries with no client-side filtering.  Any metric or event data that will be queried by time window belongs in a Stream.
+
+**2026-04-13 — AI-lien With Lore Is a Different Instrument Than AI-lien Without It**
+An AI analysis without institutional memory is a first-responder with no case history.  Feeding Lore baselines, recent incidents, and known patterns into the analysis context before every query produces qualitatively different assessments.  The loop — Lore feeds AI-lien, AI-lien feeds Lore — means every analysis makes the next one better.  Build the memory layer before depending on the intelligence layer.
+
+**2026-04-13 — The Notifier Must Be a Permanent Stub in the Open Source Distribution**
+Notification mechanisms are environment-specific.  A default implementation that "mostly works" (e.g., a generic SMTP sender) gives operators the wrong signal — they ship with a default they did not choose, and humans do not get paged correctly.  An explicit permanent stub with `stub_active: true` in the health response forces operators to make a deliberate decision about how humans get woken up.  The stub is the safeguard.
+
+**2026-04-13 — getFreshJWT in React useEffect Dependencies Causes Infinite Loops**
+Functions from hooks (e.g., `useAuth`) typically get a new reference on every render.  Including them in `useEffect` or `useCallback` dependency arrays causes the effect to fire on every render, triggering state updates, causing re-renders.  Fix: store the function in a `useRef` and sync it with a separate effect.  Call `ref.current()` inside effects instead of the function directly.  The dependency array contains only the values that should meaningfully trigger re-runs.
+
+**2026-04-12 — Chunked Transfer Encoding Breaks Node.js TLS POST Endpoints from Go mTLS Clients**
+Node.js TLS POST endpoint connections from Go mTLS clients time out consistently when the Go client uses chunked transfer encoding.  AC's suite removes negative POST tests for Node.js services (signal-clearance) rather than fighting the transport mismatch.  Verify via Ring Trial instead.
+
+**2026-04-12 — Plot Test Retry Logic Belongs in Plot-test, Not Callers**
+Retry logic for transient failures (pod recycle, connection refused, 5xx) belongs in the executor — plot-test in this case — not in callers or escalation paths.  Only retry on network-level failures and 5xx.  Never retry on 4xx, assertion failures, or chain failures.  Record the attempt count in every step result so the pattern is visible in Lore even when the plot passes.
+
+
+
+---
+
+## 21. cert-forge — PKI Abstraction Layer
+
+Every TCA constellation needs certificates. The naive approach — generating all certificates in an init container and distributing them via a shared Docker volume — has a fundamental flaw: every service can read every other service's private key material. A single compromised container exposes the entire constellation's PKI.
+
+cert-forge is the correct architecture. It is a persistent running service that acts as a PKI abstraction layer: generates the CA in memory, issues instance certificates to services on demand over an authenticated enrollment channel, and never writes private key material to any shared storage.
+
+### Three-Port Design
+
+TLS client authentication is a connection-level property — it cannot be enforced per-path on a single port. cert-forge requires three servers:
+
+| Port | Transport | Endpoint | Who Can Call |
+|------|-----------|----------|--------------|
+| Plain HTTP | `/ca` | Anyone — CA cert is public |
+| Enrollment mTLS | `/instance-cert` | Holder of enrollment cert only |
+| Constellation mTLS | `/sign` | Holder of a valid instance cert |
+
+### Enrollment CA Pattern
+
+cert-forge generates a separate enrollment CA at startup. It issues exactly one enrollment certificate — written to the shared volume as the only key material that ever touches shared storage. Every service container receives this enrollment cert via environment variable. Its sole capability is calling `/instance-cert`. The constellation CA private key never leaves cert-forge's memory.
+
+### Service Startup Sequence
+
+1. Service starts, reads enrollment cert from environment
+2. Calls cert-forge enrollment server with enrollment cert — proves it is an authorized container
+3. cert-forge issues an instance cert signed by the constellation CA, delivers it over the encrypted enrollment connection
+4. Service builds its mTLS server and client using the instance cert
+5. Service self-registers with AC using its instance cert fingerprint for verification
+
+### Key Material Lifecycle
+
+- **CA private key**: generated in memory, never persisted
+- **Instance private keys**: generated in memory, delivered to requesting service, never written to volume
+- **Enrollment cert**: written to volume (the only private key material on shared storage)
+- **star-gazer cert**: static, written to volume (federation identity — different lifecycle)
+
+### K8s Production
+
+cert-forge's signing backend points to cert-manager or the organizational CA. The signing responsibility remains with cert-forge. No other service changes when the PKI backend changes. The constellation is fully decoupled from infrastructure PKI choices.
+
+### cert-forge Is a Standard TCA Component
+
+Like Augur Canis, cert-forge applies to any TCA constellation regardless of domain. Any constellation with more than one service has the shared-volume PKI problem. cert-forge solves it once, in one place, in one language, with a contract any service in any language can consume.
+
+### Adding cert-forge to a New TCA Project
+
+1. Add cert-forge to the constellation. All other services add `depends_on: cert-forge: condition: service_healthy`.
+2. Pass `ENROLLMENT_CERT` and `ENROLLMENT_KEY` to every service container (from the cert-forge-generated volume).
+3. Replace cert-init with cert-forge in docker-compose.yml — `restart: unless-stopped`, not `restart: "no"`.
+4. Each service calls `obtainCerts(serviceName)` at startup before building any TLS configuration.
+5. Remove all `volumes` mounts of individual service certs — only `ca.crt` and the enrollment cert need to be on the volume.
+
+The certforge client pattern is implemented in Go, TypeScript, Python, and Elixir in the SETI codebase. The Go implementation in `augur-canis/certforge.go` is the canonical reference.
+
+---
+
+## 22. SETI — Standard TCA Monitoring Constellation
+
+S.E.T.I. (Search for Erroneous Tessellated Interactions) is the monitoring constellation for TCA applications.  It sits outside the constellations it monitors and watches them through the Augur Canis contract test layer, the Plot test behavioral layer, and the Observability event stream.
+
+SETI is itself a TCA constellation — it follows the same contract-first discipline it enforces on others.  It has its own repository: github.com/Pelentan/tca-seti.
+
+Full reference: [SETI-GUIDELINES.md](SETI-GUIDELINES.md).
+
+### What SETI Adds to AC
+
+AC is the verification layer — it tests contracts, detects anomalies, fires alerts.  SETI is the operational shell around AC:
+
+- **Intelligence layer** — Interactions routes failures through three paths (immediate, AI analysis, silence).  AI-lien performs diagnostic analysis using the double-tap pattern and reads Lore before every analysis.  Lore stores institutional memory in PostgreSQL.
+- **Wr4ngler interface** — Dashboard (live event stream), Ring (Trial, Reports, LaE), Admin.
+- **Plot tests** — Multi-step behavioral tests verifying real user flows across service boundaries with call chain verification.
+- **Notifier** — Human alert pathway (permanent stub — operator implements for their environment).
+- **Integration Job** — Versioned external API for monitored application tooling.
+
+### What SETI Does Not Replace
+
+SETI does not replace the observability instrumentation inside a monitored constellation.  Each monitored constellation still needs:
+- Its own Observability Job
+- Its own `reportEvent()` pattern in each Job
+- Its own `x-tca-observability` block in each contract
+
+SETI subscribes to the monitored constellation's event streams externally.  It does not reach inside the constellation to instrument it.
+
+### SETI as Gateway to TCA
+
+The adoption path:  AC first (standalone, one dependency, self-registration snippet).  SETI when the operator is ready for the full intelligence layer.  TCA discipline applies the framework to the monitored constellation.  Each step adds capability without requiring the next step.
+
+---
+
+## 23. Testing Philosophy — Three Layers
+
+TCA testing has three distinct layers.  Each serves a different purpose and requires a different author.
+
+### Layer 1: Contract Tests (AC — Augur Canis)
+
+**What:** Hardcoded behavioral assertions — positive tests for endpoint correctness, negative tests for error handling.
+
+**Who authors:** Engineers who read the contract and write assertions independently from it.
+
+**What AI can do:** Scaffold the positive tests from the contract.  Cannot independently verify the contract.
+
+**Key principle:** Tests generated from contracts re-state them.  Independent authorship is what makes them verification rather than documentation.
+
+**Where they live:** `augur-canis/contracttests.go` — hardcoded, updated by hand when contracts change.
+
+### Layer 2: Plot Tests (SETI — Plot Test Job)
+
+**What:** Multi-step behavioral flows that verify real user journeys across service boundaries, including call chain verification.
+
+**Who authors:** Engineers with domain knowledge of the monitored application; AI can scaffold from contracts and running system.
+
+**What AI can do:** Build the happy-path Plot from contracts and observed behavior.  Cannot verify adversarial scenarios or real-world usage patterns.
+
+**Key principle:** Plots prove the happy path works.  The Show Wr4ngler finds every path that isn't happy.
+
+**Where they live:** `contracts/plots/{application}/` — JSON files, versioned with the constellation.
+
+### Layer 3: Show Wr4ngler Testing (Human — not automatable)
+
+**What:** Adversarial testing from the user perspective — edge cases, concurrent load, real-world usage patterns, security boundary probing.
+
+**Who authors:** The Show Wr4ngler — a defined role, not a job title.
+
+**What AI can do:** Nothing that cannot be derived from the contract.  The Show Wr4ngler brings what AI cannot: operational experience, adversarial intent, and the ability to ask "what would a determined user do here?"
+
+**Key principle:** Plots generated by AI can only verify what the contract already describes.  Show Wr4ngler tests question the contract.
+
+**When Show Wr4ngler tests reveal defects:** Convert to Plot tests or AC contract tests.  Tests that require human judgment or adversarial tooling remain in the Show Wr4ngler's manual playbook.
+
+### What Goes Where
+
+| Question | Answer | Layer |
+|----------|--------|-------|
+| Does this endpoint return the correct status? | Contract test | AC |
+| Does this endpoint return 4xx on bad input? | Contract test (negative) | AC |
+| Does this user flow produce the expected sequence of calls? | Plot test | SETI |
+| What happens when the user does something unexpected? | Show Wr4ngler | Human |
+| Does the mTLS boundary reject plain HTTP? | Rodeo Clown (future) | Security sidecar |
+
+---
+
+## 24. Rodeo Clown (Future — Security Boundary Verification)
+
+Rodeo Clown is a planned SETI sidecar for security boundary verification.  Named deliberately — a Rodeo Clown operates outside the normal structure and absorbs hits.
+
+Where AC's contract test suite verifies that endpoints respond correctly from inside the constellation (AC always presents a valid certificate), Rodeo Clown operates without a valid constellation certificate.  It probes the transport security boundary from outside.
+
+**What it tests:**
+- Does the gateway reject connections without a valid client certificate?
+- Does it reject self-signed certificates not issued by the constellation CA?
+- Does it reject expired certificates?
+- Does it reject connections over plain HTTP where mTLS is required?
+
+**What it is not:**  Chaos Monkey.  Chaos Monkey tests failure recovery.  Rodeo Clown tests the transport security boundary.  The scope is deliberately narrow.
+
+**How it reports:**  Findings route to SETI via the Integration Job's external API — the only SETI endpoint accessible without a constellation certificate.  Rodeo Clown cannot authenticate to the mTLS observability endpoint because it deliberately does not have valid credentials.
+
+**Why it does not exist yet:**  Security boundary verification requires adversarial tooling and real traffic to be meaningful.  Building it before there are constellations to probe against would produce a tool with nothing to test.  When TCA Vox or another monitored constellation is running in production, Rodeo Clown has a target.
+
+**Repository:**  Will have its own repository, linked from both the AC and SETI repositories.  It is a SETI sidecar, not a core SETI Job.

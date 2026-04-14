@@ -100,6 +100,8 @@ tags:
     description: Contract version tracking
   - name: health
     description: Service health
+  - name: available-applications
+    description: Available application manifest from remote-apps.json
 
 paths:
 
@@ -1525,3 +1527,264 @@ components:
         message:
           type: string
           example: "Application 'app-tca-vox-prod' not found in registry"
+
+
+  # ---------------------------------------------------------------------------
+  # AVAILABLE APPLICATIONS (remote-apps.json source)
+  # ---------------------------------------------------------------------------
+
+  /available-applications:
+    get:
+      tags: [available-applications]
+      summary: List all applications available for SETI monitoring
+      description: |
+        Returns all applications declared in remote-apps.json, augmented
+        with their current active/inactive state in SETI. Applications
+        listed here may or may not be actively registered in the Policy
+        application registry.
+
+        Visible to all authenticated Wr4ngler clearance levels.
+        Registration and deregistration require sec-wr4ngler clearance —
+        enforced at the Gateway.
+      responses:
+        '200':
+          description: Available application list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailableApplicationList'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /available-applications/{tag}/test-connection:
+    post:
+      tags: [available-applications]
+      summary: Test read access to an application's contract registry
+      description: |
+        Attempts to list the contents of the application's contracts/openapi
+        directory using the configured registry_url, registry_type, and
+        registry_token. Returns success/failure and the number of contract
+        files found if successful.
+
+        Does not attempt AC federation — tests repository access only.
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Short application tag from remote-apps.json
+      responses:
+        '200':
+          description: Connection test result (success or failure)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionTestResult'
+        '404':
+          description: Tag not found in remote-apps.json
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /available-applications/{tag}/register:
+    post:
+      tags: [available-applications]
+      summary: Activate monitoring for an available application
+      description: |
+        Promotes an available application to active monitoring status:
+        1. Registers the application in the Policy application registry
+           if not already present.
+        2. Calls Signal Aggregator to initiate AC federation using
+           the application's ac_endpoint.
+        3. Calls Plot Store to ingest plots from the application's
+           contracts/plots directory in the registry.
+
+        Idempotent — if the application is already active, returns
+        current status without re-registering. Re-register by calling
+        deregister first.
+
+        Requires sec-wr4ngler clearance — enforced at Gateway.
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Application registered and monitoring active
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailableApplication'
+        '404':
+          description: Tag not found in remote-apps.json
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: AC federation failed or Plot Store ingest failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /available-applications/{tag}/deregister:
+    post:
+      tags: [available-applications]
+      summary: Deactivate monitoring for an active application
+      description: |
+        Marks the application inactive — stops contract and plot test
+        scheduling, drops the AC federation subscription. Does not
+        remove historical results or plots from their respective Jobs.
+        The application remains visible in the available-applications
+        list with status inactive.
+
+        Requires sec-wr4ngler clearance — enforced at Gateway.
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Application deactivated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailableApplication'
+        '404':
+          description: Tag not found in remote-apps.json
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Application is not currently active
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    AvailableApplication:
+      type: object
+      required:
+        - tag
+        - name
+        - description
+        - ac_endpoint
+        - registry_url
+        - registry_type
+        - monitoring_status
+      properties:
+        tag:
+          type: string
+          description: Short identifier key from remote-apps.json
+          example: "tca-vox"
+        name:
+          type: string
+          description: Human-readable application name
+          example: "TCA Vox"
+        description:
+          type: string
+          description: Application description
+          example: "Polyglot polling application — TCA proof of concept"
+        ac_endpoint:
+          type: string
+          description: HTTPS endpoint for this constellation's Augur Canis
+          example: "https://augur-canis.tca-vox.example:4010"
+        registry_url:
+          type: string
+          description: Base URL for contract registry access
+          example: "https://api.github.com/repos/Pelentan/tca-vox/contents"
+        registry_type:
+          type: string
+          enum: [github, gitlab, generic]
+          description: Registry type — determines auth header format
+        monitoring_status:
+          type: string
+          enum: [active, inactive]
+          description: |
+            active — application is registered in Policy and tests are running.
+            inactive — declared in remote-apps.json but not currently monitored.
+        application_id:
+          type: string
+          description: >
+            Policy application_id when monitoring_status is active.
+            Absent when inactive.
+          example: "app-tca-vox"
+        activated_at:
+          type: string
+          format: date-time
+          description: When this application was most recently registered. Absent when inactive.
+        connection_last_tested_at:
+          type: string
+          format: date-time
+          description: When test-connection was last run against this application's registry.
+        connection_last_status:
+          type: string
+          enum: [ok, failed, untested]
+          description: Result of the most recent test-connection call.
+
+    AvailableApplicationList:
+      type: object
+      required:
+        - applications
+        - total
+        - active_count
+        - inactive_count
+      properties:
+        applications:
+          type: array
+          items:
+            $ref: '#/components/schemas/AvailableApplication'
+        total:
+          type: integer
+        active_count:
+          type: integer
+        inactive_count:
+          type: integer
+
+    ConnectionTestResult:
+      type: object
+      required:
+        - tag
+        - success
+        - tested_at
+      properties:
+        tag:
+          type: string
+        success:
+          type: boolean
+        contracts_found:
+          type: integer
+          description: Number of YAML files found in contracts/openapi. Present on success.
+        plots_found:
+          type: integer
+          description: Number of Plot files found in contracts/plots. Present on success.
+        error:
+          type: string
+          description: Error detail. Present on failure.
+        tested_at:
+          type: string
+          format: date-time

@@ -886,4 +886,4 @@ components:
           example: "INSUFFICIENT_CLEARANCE"
         message:
           type: string
-          example: "JWT clearance level 'connie-wrangler' does not grant access to anomaly feeds"
+          example: "JWT clearance level 'connie-wr4ngler' does not grant access to anomaly feeds"

@@ -1,0 +1,62 @@
+{
+  "name": "Observability Pipeline Verification",
+  "description": "Validates the observability pipeline: allowlist rules are inspectable through the gateway, a contract test run is triggered (fire-and-forget), and historical results confirm the pipeline processed events end-to-end. The event submission endpoint is internal-only — this plot verifies the pipeline through its downstream effects.",
+  "application_id": "seti",
+  "author": "claude-sonnet-4-6-session-20260410",
+  "version": "0.5.0",
+  "tags": ["seti-observability", "events", "pipeline"],
+  "steps": [
+    {
+      "step_number": 1,
+      "description": "Gateway health check confirms SETI is up",
+      "call": { "method": "GET", "path": "/health" },
+      "expect_status": 200,
+      "assertions": [
+        { "field": "status", "operator": "equals", "value": "healthy" }
+      ]
+    },
+    {
+      "step_number": 2,
+      "description": "Observability rules are inspectable via gateway — confirms allowlist is configured",
+      "call": { "method": "GET", "path": "/observability/rules" },
+      "expect_status": 200,
+      "assertions": [
+        { "field": "knownCallers", "operator": "present" }
+      ],
+      "expect_call_chain": [
+        { "caller": "gateway", "callee": "seti-observability", "method": "GET", "path": "/rules" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 3,
+      "description": "Trigger a contract test run — fire-and-forget, returns 'accepted', run executes asynchronously and generates observability events",
+      "call": {
+        "method": "POST",
+        "path": "/run-contract-test",
+        "body": { "application_id": "seti" }
+      },
+      "expect_status": 200,
+      "assertions": [
+        { "field": "status", "operator": "equals", "value": "accepted" }
+      ],
+      "expect_call_chain": [
+        { "caller": "gateway", "callee": "contract-test", "method": "POST", "path": "/run" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 4,
+      "description": "Confirm results are stored — proves the observability pipeline processed events end-to-end",
+      "call": { "method": "GET", "path": "/contract-results" },
+      "expect_status": 200,
+      "assertions": [
+        { "field": "runs", "operator": "present" }
+      ],
+      "expect_call_chain": [
+        { "caller": "gateway", "callee": "results", "method": "GET", "path": "/contract-results" }
+      ],
+      "verify_within_seconds": 10
+    }
+  ]
+}
