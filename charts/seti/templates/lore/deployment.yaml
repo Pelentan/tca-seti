@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lore
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: lore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lore
+  template:
+    metadata:
+      labels:
+        app: lore
+        {{- include "seti.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "seti.waitForCertForge" . | nindent 8 }}
+        {{- include "seti.waitForPostgres" . | nindent 8 }}
+      containers:
+        - name: lore
+          image: {{ .Values.registry }}/lore:{{ .Values.lore.tag }}
+          ports:
+            - containerPort: {{ .Values.lore.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.lore.port | quote }}
+            - name: SERVICE_NAME
+              value: "lore"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: seti-postgres-credentials
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:4010"
+            - name: OBSERVABILITY_URL
+              value: "https://seti-observability:{{ .Values.setiObservability.port }}"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: seti-certs
+              mountPath: /certs
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: seti-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lore
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: lore
+spec:
+  selector:
+    app: lore
+  ports:
+    - port: {{ .Values.lore.port }}
+      targetPort: {{ .Values.lore.port }}

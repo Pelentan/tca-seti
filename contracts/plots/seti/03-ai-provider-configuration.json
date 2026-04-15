@@ -1,9 +1,9 @@
 {
   "name": "AI Provider Configuration",
-  "description": "Registers an AI provider with Policy and verifies it is retrievable. Does not attempt to refresh models (Ollama may not be running in all environments) — that step is exercised manually via the Admin panel. Tests the configuration storage pathway.",
+  "description": "Registers an AI provider with Policy and verifies it is retrievable. Does not attempt to refresh models (Ollama may not be running in all environments) — that step is exercised manually via the Admin panel. Tests the configuration storage pathway. Cleans up after itself so repeated runs always produce consistent results.",
   "application_id": "seti",
   "author": "seti",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "tags": ["policy", "ai-lien", "configuration"],
   "steps": [
     {
@@ -30,6 +30,17 @@
       "expected_status": 200,
       "expected_chain": [
         { "caller": "gateway", "callee": "policy", "method": "GET", "path": "/ai-providers" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 3,
+      "description": "Remove the test provider — cleanup so repeated runs start clean",
+      "method": "DELETE",
+      "path": "/ai-providers/plot-test-provider",
+      "expected_status": 200,
+      "expected_chain": [
+        { "caller": "gateway", "callee": "policy", "method": "DELETE", "path": "/ai-providers/plot-test-provider" }
       ],
       "verify_within_seconds": 10
     }

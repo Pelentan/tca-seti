@@ -291,3 +291,87 @@ React/TS    — UI (served by Go static file server)
 
 ### Lessons Learned
 *Populated when phase completes.*
+
+---
+
+## Phase 10 — Kubernetes Migration: TCA 2.0 deployment architecture
+
+**Status:** Complete
+**Deliverable:** The full SETI constellation runs on k3d (local K8s) with the same operational behavior as Docker Compose. A Helm chart is the authoritative constellation definition. cert-forge writes cert material to K8s Secrets. NetworkPolicy defines the communication topology. The dev/prod gap is eliminated.
+**Rationale:** Docker Compose is an approximation of the target architecture. It has a 32-network ceiling that forced the ac-net compromise. K8s removes that ceiling and provides the correct primitives — Secrets, NetworkPolicy, init containers, readiness probes — for everything that was being approximated.
+
+**Completed:** 2026-04-14 (approximately 4 hours, engineer-AI partnership)
+
+### What Was Built
+
+**cert-forge K8s Secret integration** (`cert-forge/k8s.go`)
+cert-forge detects its environment via the projected ServiceAccount token. In K8s it writes all cert material — CA cert, enrollment CA cert, enrollment cert+key, star-gazer cert+key — to a K8s Secret via the K8s REST API using stdlib `net/http` only. No client-go, no external dependencies, scratch container stays. In Docker Compose it writes to the volume as before. Detection is automatic — same image, same binary, different behavior based on environment.
+
+**Helm chart** (`charts/seti/`)
+Single chart covering the full 20-container constellation. Environment-specific behavior via values files — `values/dev.yaml` for k3d local development. One chart deploys to dev, staging, and production.
+
+| Resource type | Count |
+|--------------|-------|
+| Deployments | 17 |
+| StatefulSet | 1 (postgres) |
+| Services | 18 |
+| ConfigMaps | 2 (contracts, plots) |
+| Secrets | 3 (seti-certs, postgres credentials, remote-apps) |
+| ServiceAccount + Role + RoleBinding | 1 set (cert-forge) |
+| NetworkPolicy | 22 |
+| Namespace | 1 |
+
+**Startup ordering** (`charts/seti/templates/_init.tpl`)
+Init containers replace `depends_on: condition: service_healthy`. Reusable wait helpers per dependency. K8s holds pods in `Init:` state until all dependencies are ready. Startup is clean, ordered, and observable.
+
+**AC health verification**
+Every service uses `exec: ["/healthcheck"]` for readiness and liveness probes — the same healthcheck binary, the same Redis pub/sub mechanism, the same AC Watchdog verification. cert-forge uses `httpGet` on `/ca` as the sole exception.
+
+**NetworkPolicy** (`charts/seti/templates/network-policies/policies.yaml`)
+22 policies. Default-deny ingress for all pods. Explicit allow rules per service derived from the actual call matrix. Policies are in the chart regardless of environment; enforced automatically by the CNI in staging and production.
+
+**Scripts** (`scripts/`)
+- `k3d-setup.sh` — creates the `seti` cluster, local registry, port mapping
+- `build-push.sh` — builds and pushes all 18 service images
+
+### Deployment Tiers (TCA 2.0)
+
+| Tier | Tool | When | Notes |
+|------|------|------|-------|
+| 0 — Solo Job | Docker Compose (partial stack) | Active Job development | Fast inner loop, no K8s overhead |
+| 1 — Dev Constellation | k3d + Helm | Full constellation testing | `helm upgrade`, `k9s` for observability |
+| 2 — Staging | k3s or managed K8s + ArgoCD | Pre-production validation | NetworkPolicy enforced, ArgoCD drift detection |
+| 3 — Production | k3s (street) or managed K8s + ArgoCD | Live | Same chart, different values |
+
+### Architecture Decisions Recorded
+
+- Docker Compose is Tier 0, not deprecated. Helm chart is the source of truth for the full constellation.
+- cert-forge writes to K8s Secret, not PVC. Narrow-scoped ServiceAccount with `get`, `create`, `update` on secrets only.
+- All `.env` and volume-based secrets become K8s Secrets. Supplied via `--set` at install time. Never in values files.
+- `helm install` requires `-n <namespace>` explicitly. `--create-namespace` alone is insufficient.
+- k3d over Docker Desktop built-in K8s. Named, independent, multi-node clusters. Coexists with Docker Compose without interference. Developers don't toggle Docker Desktop modes between projects.
+- NodePort 30400 + k3d port mapping. `-p "4000:30400@loadbalancer"` at cluster creation. Same `localhost:4000` URL as Docker Compose.
+- ArgoCD for staging and production, not dev. `helm upgrade` is the dev workflow.
+- NetworkPolicy in chart, enforcement deferred to staging. Same chart, no changes required.
+- Startup contract test failures during fresh install are expected and correct. Degraded-healthy fallback is not a bug.
+- ac-net compromise is resolved. NetworkPolicy gives true point-to-point isolation between augur-canis and each service.
+
+### Lessons Learned
+- The shared volume cert approach and ac-net compromise were both Docker Compose artifacts, not architectural choices. K8s removes both cleanly.
+- `helm install` without `-n <namespace>` deploys to `default` regardless of template namespace declarations. Always specify `-n` explicitly.
+- ConfigMaps from contract files are cleaner than volume mounts for read-only config. 440KB fits well under the 1MB limit.
+- Init containers are the correct K8s equivalent of `depends_on: condition: service_healthy`. TCP check (`nc`) confirms port availability; AC handles health verification once the service is running.
+- `exec: ["/healthcheck"]` is the correct probe for all mTLS services. `httpGet` with `scheme: HTTPS` fails the handshake without a client cert. `tcpSocket` bypasses AC entirely.
+- k3d image pull uses `seti-registry:5000` (in-cluster DNS), not `localhost:5000` (host). Push and pull addresses differ. Must be in `values/dev.yaml`.
+- A 20-service polyglot constellation migrated from Docker Compose to K8s in approximately 4 hours via engineer-AI partnership. Traditional team estimate: 2-6 weeks.
+
+### Additional Lessons Learned (Post-Delivery — 2026-04-14)
+
+- k3d enforces NetworkPolicy via its bundled controller. The assumption that flannel does not enforce NetworkPolicy is wrong. Policies are active in dev immediately on application.
+- Redis and augur-canis ingress policies must use the `app.kubernetes.io/part-of: seti` label selector. Enumerating callers is incomplete — init containers create transient access patterns that runtime caller lists don't capture.
+- Services that are universal dependencies (cert-forge, redis, augur-canis, seti-observability) require the label selector approach. Enumerating callers for universal dependencies is always wrong.
+- Self-registration has 10 retry attempts. If NetworkPolicy is wrong at startup, services exhaust retries, give up, and run unregistered. AC marks them `skip: job_not_deployed`. Correct NetworkPolicy from the start is the fix, not more retries.
+- cert-forge restart without CA persistence invalidates the constellation. CA cert and key are now persisted in the K8s Secret. cert-forge loads the existing CA on restart rather than generating a new one.
+- `helm upgrade` does not restart pods on ConfigMap changes. Services that read config at startup require `kubectl rollout restart` to pick up updated ConfigMap content.
+- PlotStep `expected_status` is `int` in the Go struct. A JSON array breaks parsing and silently drops the plot.
+- Plot tests must clean up persistent state they create. Docker Compose's reset behavior masked this assumption. K8s does not reset in-memory state between runs.

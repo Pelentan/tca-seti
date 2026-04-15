@@ -1,0 +1,579 @@
+# NetworkPolicy for the SETI constellation.
+#
+# These policies declare the intended communication topology.
+# They are enforced automatically when the CNI plugin supports NetworkPolicy
+# (Calico, Cilium, etc.). k3d with flannel does not enforce them in dev —
+# that is intentional. The policies are authoritative documentation of the
+# topology regardless of enforcement.
+#
+# Design:
+#   - Default deny all ingress to all pods in the namespace
+#   - Explicit allow rules per service based on actual call relationships
+#   - augur-canis gets unrestricted egress — it must reach every service
+#   - cert-forge accepts ingress from all pods (enrollment is universal)
+#   - Redis and postgres accept ingress only from their legitimate callers
+
+# ---------------------------------------------------------------------------
+# Default deny — ingress
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# ---------------------------------------------------------------------------
+# augur-canis — unrestricted egress so it can reach every service
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: augur-canis-egress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: augur-canis
+  policyTypes:
+    - Egress
+  egress:
+    - {} # Allow all egress from augur-canis
+---
+# ---------------------------------------------------------------------------
+# cert-forge — accepts enrollment and signing calls from all constellation pods
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cert-forge-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: cert-forge
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: seti
+      ports:
+        - port: {{ .Values.certForge.port }}        # sign (constellation mTLS)
+        - port: {{ .Values.certForge.enrollmentPort }} # instance-cert (enrollment mTLS)
+        - port: {{ .Values.certForge.publicPort }}   # /ca (plain HTTP)
+---
+# ---------------------------------------------------------------------------
+# redis — accepts from all constellation pods
+# Every service's healthcheck binary connects to Redis directly.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: seti
+      ports:
+        - port: 6379
+---
+# ---------------------------------------------------------------------------
+# postgres — accepts only from lore
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: lore
+      ports:
+        - port: 5432
+---
+# ---------------------------------------------------------------------------
+# seti-observability — accepts reportEvent() calls from all Jobs
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: seti-observability-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: seti-observability
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: seti
+      ports:
+        - port: {{ .Values.setiObservability.port }}
+---
+# ---------------------------------------------------------------------------
+# augur-canis — accepts from all constellation pods.
+# Every service's init container probes augur-canis:4010 to gate startup.
+# Runtime callers are a subset, but the init container probe runs inside
+# every service pod carrying the seti label.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: augur-canis-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: augur-canis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: seti
+      ports:
+        - port: {{ .Values.augurCanis.port }}
+---
+# ---------------------------------------------------------------------------
+# signal-clearance — accepts only from gateway
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: signal-clearance-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: signal-clearance
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.signalClearance.port }}
+---
+# ---------------------------------------------------------------------------
+# gateway — accepts from external (no podSelector restriction on ingress)
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: {{ .Values.gateway.port }}
+---
+# ---------------------------------------------------------------------------
+# ui — accepts only from gateway and augur-canis
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ui-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: ui
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.ui.port }}
+---
+# ---------------------------------------------------------------------------
+# policy — accepts from gateway, contract-test, signal-aggregator,
+#          plot-test, integration, ai-lien, augur-canis
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: policy-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: policy
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+        - podSelector:
+            matchLabels:
+              app: contract-test
+        - podSelector:
+            matchLabels:
+              app: signal-aggregator
+        - podSelector:
+            matchLabels:
+              app: plot-test
+        - podSelector:
+            matchLabels:
+              app: integration
+        - podSelector:
+            matchLabels:
+              app: ai-lien
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.policy.port }}
+---
+# ---------------------------------------------------------------------------
+# contract-test — accepts from gateway and augur-canis
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: contract-test-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: contract-test
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.contractTest.port }}
+---
+# ---------------------------------------------------------------------------
+# results — accepts from gateway, contract-test, plot-test,
+#           integration, interactions, ai-lien, augur-canis
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: results-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: results
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+        - podSelector:
+            matchLabels:
+              app: contract-test
+        - podSelector:
+            matchLabels:
+              app: plot-test
+        - podSelector:
+            matchLabels:
+              app: integration
+        - podSelector:
+            matchLabels:
+              app: interactions
+        - podSelector:
+            matchLabels:
+              app: ai-lien
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.results.port }}
+---
+# ---------------------------------------------------------------------------
+# signal-aggregator — accepts from gateway, plot-test, policy, augur-canis
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: signal-aggregator-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: signal-aggregator
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+        - podSelector:
+            matchLabels:
+              app: plot-test
+        - podSelector:
+            matchLabels:
+              app: policy
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.signalAggregator.port }}
+---
+# ---------------------------------------------------------------------------
+# plot-store — accepts from gateway, plot-test, integration,
+#              policy, augur-canis
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: plot-store-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: plot-store
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+        - podSelector:
+            matchLabels:
+              app: plot-test
+        - podSelector:
+            matchLabels:
+              app: integration
+        - podSelector:
+            matchLabels:
+              app: policy
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.plotStore.port }}
+---
+# ---------------------------------------------------------------------------
+# plot-test — accepts from gateway and augur-canis
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: plot-test-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: plot-test
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.plotTest.port }}
+---
+# ---------------------------------------------------------------------------
+# interactions — accepts from plot-test and augur-canis
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: interactions-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: interactions
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: plot-test
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.interactions.port }}
+---
+# ---------------------------------------------------------------------------
+# feed-wrangler — accepts from gateway and augur-canis
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: feed-wrangler-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: feed-wrangler
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.feedWrangler.port }}
+---
+# ---------------------------------------------------------------------------
+# integration — accepts from gateway and augur-canis
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: integration-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: integration
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.integration.port }}
+---
+# ---------------------------------------------------------------------------
+# ai-lien — accepts from interactions and augur-canis
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-lien-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: ai-lien
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: interactions
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.aiLien.port }}
+---
+# ---------------------------------------------------------------------------
+# lore — accepts from ai-lien, interactions, augur-canis
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lore-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: lore
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: ai-lien
+        - podSelector:
+            matchLabels:
+              app: interactions
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.lore.port }}
+---
+# ---------------------------------------------------------------------------
+# notifier — accepts from interactions and augur-canis
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notifier-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: notifier
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: interactions
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.notifier.port }}

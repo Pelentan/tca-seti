@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ui
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ui
+  template:
+    metadata:
+      labels:
+        app: ui
+        {{- include "seti.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "seti.waitForCertForge" . | nindent 8 }}
+        {{- include "seti.waitForAugurCanis" . | nindent 8 }}
+      containers:
+        - name: ui
+          image: {{ .Values.registry }}/ui:{{ .Values.ui.tag }}
+          ports:
+            - containerPort: {{ .Values.ui.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.ui.port | quote }}
+            - name: GATEWAY_URL
+              value: "https://gateway:{{ .Values.gateway.port }}"
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            - name: SERVICE_NAME
+              value: "ui"
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: seti-certs
+              mountPath: /certs
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: seti-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ui
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: ui
+spec:
+  selector:
+    app: ui
+  ports:
+    - port: {{ .Values.ui.port }}
+      targetPort: {{ .Values.ui.port }}

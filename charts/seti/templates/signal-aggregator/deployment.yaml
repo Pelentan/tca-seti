@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-aggregator
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: signal-aggregator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signal-aggregator
+  template:
+    metadata:
+      labels:
+        app: signal-aggregator
+        {{- include "seti.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "seti.waitForCertForge" . | nindent 8 }}
+        {{- include "seti.waitForAugurCanis" . | nindent 8 }}
+      containers:
+        - name: signal-aggregator
+          image: {{ .Values.registry }}/signal-aggregator:{{ .Values.signalAggregator.tag }}
+          ports:
+            - containerPort: {{ .Values.signalAggregator.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.signalAggregator.port | quote }}
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            - name: SERVICE_NAME
+              value: "signal-aggregator"
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OBSERVABILITY_URL
+              value: "https://seti-observability:{{ .Values.setiObservability.port }}"
+            - name: POLICY_URL
+              value: "https://policy:{{ .Values.policy.port }}"
+            - name: SETI_INSTANCE_ID
+              value: "tca-seti-primary"
+            - name: STAR_GAZER_CERT
+              value: "/certs/star-gazer.crt"
+            - name: STAR_GAZER_KEY
+              value: "/certs/star-gazer.key"
+            - name: SILENCE_THRESHOLD_SECONDS
+              value: "90"
+            - name: AC_ENDPOINT
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+          volumeMounts:
+            - name: seti-certs
+              mountPath: /certs
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: seti-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signal-aggregator
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: signal-aggregator
+spec:
+  selector:
+    app: signal-aggregator
+  ports:
+    - port: {{ .Values.signalAggregator.port }}
+      targetPort: {{ .Values.signalAggregator.port }}

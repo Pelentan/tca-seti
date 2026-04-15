@@ -268,10 +268,20 @@ func issueInstanceCert(cfg *ForgeConfig, serviceName, instanceID string) (*Insta
 // Static cert generation — star-gazer and other fixed identities
 // ---------------------------------------------------------------------------
 
-func generateStaticCert(cfg *ForgeConfig, svc StaticCertConfig) error {
+// StaticCertMaterial holds the generated cert+key PEM for a static cert.
+type StaticCertMaterial struct {
+	Name    string
+	CertPEM []byte
+	KeyPEM  []byte
+}
+
+// generateStaticCert generates a static cert+key and returns the PEM material.
+// It does not write files — the caller decides where the material goes
+// (K8s Secret in Kubernetes, volume files in Docker Compose).
+func generateStaticCert(cfg *ForgeConfig, svc StaticCertConfig) (*StaticCertMaterial, error) {
 	key, err := rsa.GenerateKey(rand.Reader, cfg.KeyBits)
 	if err != nil {
-		return fmt.Errorf("generate key for %s: %v", svc.Name, err)
+		return nil, fmt.Errorf("generate key for %s: %v", svc.Name, err)
 	}
 
 	notBefore := time.Now().Add(-time.Duration(cfg.CA.BackdateMinutes) * time.Minute)
@@ -294,20 +304,31 @@ func generateStaticCert(cfg *ForgeConfig, svc StaticCertConfig) error {
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, ca.cert, &key.PublicKey, ca.key)
 	if err != nil {
-		return fmt.Errorf("sign cert for %s: %v", svc.Name, err)
+		return nil, fmt.Errorf("sign cert for %s: %v", svc.Name, err)
 	}
 
-	certPath := filepath.Join(outputDir, svc.Name+".crt")
-	keyPath  := filepath.Join(outputDir, svc.Name+".key")
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	})
 
-	if err := writePEM(certPath, "CERTIFICATE", certDER); err != nil {
-		return fmt.Errorf("write cert for %s: %v", svc.Name, err)
-	}
-	if err := writePEM(keyPath, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(key)); err != nil {
-		return fmt.Errorf("write key for %s: %v", svc.Name, err)
-	}
+	log.Printf("[cert-forge] Static cert generated: %s", svc.Name)
+	return &StaticCertMaterial{Name: svc.Name, CertPEM: certPEM, KeyPEM: keyPEM}, nil
+}
 
-	log.Printf("[cert-forge] Static cert written: %s", svc.Name)
+// writeStaticCertFiles writes a static cert+key to the output volume.
+// Only called in Docker Compose mode.
+func writeStaticCertFiles(mat *StaticCertMaterial) error {
+	certPath := filepath.Join(outputDir, mat.Name+".crt")
+	keyPath := filepath.Join(outputDir, mat.Name+".key")
+	if err := os.WriteFile(certPath, mat.CertPEM, 0644); err != nil {
+		return fmt.Errorf("write cert for %s: %v", mat.Name, err)
+	}
+	if err := os.WriteFile(keyPath, mat.KeyPEM, 0600); err != nil {
+		return fmt.Errorf("write key for %s: %v", mat.Name, err)
+	}
+	log.Printf("[cert-forge] Static cert written to volume: %s", mat.Name)
 	return nil
 }
 
@@ -527,30 +548,48 @@ func buildSignMux() *http.ServeMux {
 func main() {
 	log.Printf("[cert-forge] Starting — stdlib only, no external dependencies")
 
+	inK8s := InKubernetes()
+	if inK8s {
+		log.Printf("[cert-forge] Kubernetes mode — cert material will be written to K8s Secret")
+	} else {
+		log.Printf("[cert-forge] Docker mode — cert material will be written to volume")
+	}
+
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		log.Fatalf("[cert-forge] Config error: %v", err)
 	}
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		log.Fatalf("[cert-forge] Cannot create output dir: %v", err)
+
+	// In Docker mode, ensure the output directory exists.
+	// In K8s mode, there is no volume — skip directory creation.
+	if !inK8s {
+		if err := os.MkdirAll(outputDir, 0755); err != nil {
+			log.Fatalf("[cert-forge] Cannot create output dir: %v", err)
+		}
 	}
 
-	// Phase 1: Generate CA
-	generatedCA, err := generateCA(cfg)
-	if err != nil {
-		log.Fatalf("[cert-forge] CA generation failed: %v", err)
+	// Phase 1: Establish CA — load existing from Secret or generate fresh.
+	secretName := cfEnvOr("K8S_SECRET_NAME", "seti-certs")
+	var generatedCA *CA
+	if inK8s {
+		existingCA, err := LoadExistingCA(secretName)
+		if err != nil {
+			log.Printf("[cert-forge] Warning: could not check for existing CA: %v — generating fresh", err)
+		} else if existingCA != nil {
+			generatedCA = existingCA
+		}
+	}
+	if generatedCA == nil {
+		var err error
+		generatedCA, err = generateCA(cfg)
+		if err != nil {
+			log.Fatalf("[cert-forge] CA generation failed: %v", err)
+		}
 	}
 	ca = generatedCA
 	caReadyMu.Lock()
 	caReady = true
 	caReadyMu.Unlock()
-
-	// Write CA public cert to volume
-	caPath := filepath.Join(outputDir, "ca.crt")
-	if err := writePEM(caPath, "CERTIFICATE", ca.certDER); err != nil {
-		log.Fatalf("[cert-forge] Failed to write CA cert: %v", err)
-	}
-	log.Printf("[cert-forge] CA cert written to %s", caPath)
 
 	// Phase 2: Issue cert-forge's own instance cert (for sign + enrollment servers)
 	selfID := os.Getenv("HOSTNAME")
@@ -573,8 +612,50 @@ func main() {
 	if err != nil {
 		log.Fatalf("[cert-forge] Enrollment cert generation failed: %v", err)
 	}
-	if err := writeEnrollmentMaterial(enrollCert); err != nil {
-		log.Fatalf("[cert-forge] Failed to write enrollment material: %v", err)
+
+	// Phase 4: Generate static certs (star-gazer, etc.)
+	staticMaterials := make([]*StaticCertMaterial, 0, len(cfg.StaticCerts))
+	for _, svc := range cfg.StaticCerts {
+		mat, err := generateStaticCert(cfg, svc)
+		if err != nil {
+			log.Fatalf("[cert-forge] %v", err)
+		}
+		staticMaterials = append(staticMaterials, mat)
+	}
+
+	// Phase 5: Write cert material — Secret (K8s) or files (Docker Compose)
+	if inK8s {
+		secretData := map[string][]byte{
+			"ca.crt":            ca.certPEM,
+			"ca.key":            caKeyPEM(ca.key),
+			"enrollment-ca.crt": enrollmentCA.certPEM,
+			"enrollment.crt":    enrollCert.certPEM,
+			"enrollment.key":    enrollCert.keyPEM,
+		}
+		for _, mat := range staticMaterials {
+			secretData[mat.Name+".crt"] = mat.CertPEM
+			secretData[mat.Name+".key"] = mat.KeyPEM
+		}
+		if err := WriteK8sSecret(secretName, secretData); err != nil {
+			log.Fatalf("[cert-forge] Failed to write K8s Secret: %v", err)
+		}
+	} else {
+		// Docker Compose: write all material to the certs volume.
+		caPath := filepath.Join(outputDir, "ca.crt")
+		if err := writePEM(caPath, "CERTIFICATE", ca.certDER); err != nil {
+			log.Fatalf("[cert-forge] Failed to write CA cert: %v", err)
+		}
+		log.Printf("[cert-forge] CA cert written to %s", caPath)
+
+		if err := writeEnrollmentMaterial(enrollCert); err != nil {
+			log.Fatalf("[cert-forge] Failed to write enrollment material: %v", err)
+		}
+
+		for _, mat := range staticMaterials {
+			if err := writeStaticCertFiles(mat); err != nil {
+				log.Fatalf("[cert-forge] %v", err)
+			}
+		}
 	}
 
 	// Build TLS configs — each server has exactly one purpose
@@ -583,7 +664,7 @@ func main() {
 	enrollPool := x509.NewCertPool()
 	enrollPool.AddCert(enrollmentCA.cert)
 
-	signTLS   := buildInstanceTLSConfig(selfIK, caPool, true)   // constellation mTLS
+	signTLS   := buildInstanceTLSConfig(selfIK, caPool, true)    // constellation mTLS
 	enrollTLS := buildInstanceTLSConfig(selfIK, enrollPool, true) // enrollment mTLS
 
 	// Server 1: plain HTTP on publicPort — /ca only (CA cert is public)
@@ -606,16 +687,8 @@ func main() {
 
 	// Server 3: constellation mTLS on port — /sign only
 	log.Printf("[cert-forge] Sign server on :%s (constellation mTLS — /sign only)", port)
-	signServer := &http.Server{Addr: ":" + port, Handler: buildSignMux(), TLSConfig: signTLS}
-
-	// Phase 4: Generate static certs (star-gazer, etc.)
-	for _, svc := range cfg.StaticCerts {
-		if err := generateStaticCert(cfg, svc); err != nil {
-			log.Fatalf("[cert-forge] %v", err)
-		}
-	}
 	log.Printf("[cert-forge] cert-forge fully operational.")
-
+	signServer := &http.Server{Addr: ":" + port, Handler: buildSignMux(), TLSConfig: signTLS}
 	if err := signServer.ListenAndServeTLS("", ""); err != nil {
 		log.Fatalf("[cert-forge] Sign server error: %v", err)
 	}

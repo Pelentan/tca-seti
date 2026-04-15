@@ -1,155 +1,166 @@
 # TCA / SETI / AC — Kubernetes Migration Primer
 
-**Purpose:** Session primer for the next conversation on migrating TCA, SETI, and AC from Docker Compose to a Kubernetes-based development and production structure.  
-**Current State:** SETI is complete and healthy at 20 containers on Docker Compose.  AC and SETI each have their own repositories.  TCA guidelines are current.  
-**Goal:** Define the K8s architecture, tooling choices, and migration path.  Helm charts as the primary deliverable.
+**Purpose:** Reference document for the SETI K8s migration. Records all decisions made, the rationale behind them, and lessons learned. The open questions from the previous version are now closed.
+**Status:** Complete — Migration delivered 2026-04-14.
+**Time to completion:** Approximately 4 hours, engineer-AI partnership.
 
 ---
 
-## What Was Decided in the Previous Conversation
+## What Was Built
 
-These decisions are already made.  They should be treated as constraints in the next session, not open questions.
+The full SETI constellation (20 containers) runs on k3d with the same operational behavior as Docker Compose. The Helm chart is the authoritative constellation definition. cert-forge writes cert material to K8s Secrets. NetworkPolicy declares the communication topology. The dev/prod gap is eliminated.
 
-**Finish SETI in Docker Compose, then migrate.**  The migration to K8s is part of TCA 2.0.  SETI's current Docker Compose state is the migration source.
-
-**AI partner handles Helm chart authoring.**  The engineer architects, the AI implements.  Same partnership model as the codebase.
-
-**k3d for local development.**  k3s running inside Docker containers.  Spins up in seconds, supports multiple nodes, loads local images without a registry, tears down cleanly.  The inner dev loop stays fast.  (`k3d` not `minikube` — minikube is single-node and doesn't reflect the multi-node target.)
-
-**Helm over raw manifests.**  Reasons:  templating collapses the repetition across 20 nearly-identical Job deployments; release management gives atomic rollback; per-environment values files (dev/staging/prod) without duplicating manifests; dependency management for cert-manager, Redis, PostgreSQL.
-
-**K8s network policies replace Docker Compose's Docker network isolation.**  The ac-net architecture (AC joins a shared network with all services) maps directly to K8s NetworkPolicy objects.  K8s removes the 32-network ceiling that forced compromises in Docker Compose.
-
-**cert-forge integrates with cert-manager in production.**  cert-forge's signing backend points to cert-manager or the organizational CA.  No other service changes.  The constellation is decoupled from infrastructure PKI choices.
-
-**K8s container replacement detection via container ID change.**  AC already tracks `container_id` per service from the health check payload (`$HOSTNAME` = container ID in Docker/K8s).  When a service reappears with a new container ID after an active alert, AC auto-resolves as `container_replaced`.  No Kubernetes API access required.  No RBAC.  No sidecar.  Already implemented.
-
-**PreStop lifecycle hook as optional enhancement.**  A tiny binary published before container termination gives AC advance notice of pod replacement.  Optional — the container ID detection catches replacements even when the hook cannot execute.
-
-**SETI as a K8s-native operator (future).**  A `k8s-conductor` Job that subscribes to SETI's existing feeds and translates decisions into Kubernetes API calls.  This is TCA 2.0+ territory — architect it but don't build it yet.
+See `charts/seti/` for the complete Helm chart.
+See `scripts/` for cluster setup and image build tooling.
+See `cert-forge/k8s.go` for the K8s Secret integration.
+See `PHASE-PLAN.md` Phase 10 for the complete architecture decision record.
 
 ---
 
-## Open Questions for the Next Conversation
+## All Decisions — What Was Decided and Why
 
-These were explicitly flagged as points for discussion.  Approach each one fresh.
+### Finish SETI in Docker Compose, then migrate
+Correct. The migration source was a healthy, fully-functional 20-container constellation. Migrating a moving target would have conflated application bugs with infrastructure bugs.
 
-### Cluster Target
-- **k3s** — Rancher/SUSE, Apache 2.0, K8s-compatible, designed for edge and resource-constrained environments, eliminates most K8s operational overhead.  Strong candidate for the "street" deployment (small business, no dedicated DevOps team).
-- **Full K8s** — EKS, GKE, AKS, or bare metal.  Higher operational cost, full ecosystem.
-- **Docker Swarm** — Mirantis committed through 2030, overlay networks solve the 32-network ceiling, compose file format is largely compatible.  Discussed as a viable intermediate tier.
-- **Nomad** — Single binary, no etcd, genuinely simpler base form.  BSL 1.1 license (not Apache 2.0) and HashiCorp ecosystem dependency (Consul + Vault for service discovery and secrets) are concerns.
+### k3d for local development
+Correct. k3d runs k3s inside Docker containers. Multi-node, true K8s API, fast spin-up, tears down cleanly. k3d clusters are named and independent — developers do not toggle Docker Desktop between K8s and Compose modes when switching projects. Docker Desktop's built-in K8s is single-node and shares the Docker socket with regular Docker, making it unsuitable for multi-node topology testing and disruptive to other projects.
 
-The TCA 2.0 question:  should the target be a single cluster type, or should TCA define deployment tiers (Compose → Swarm → k3s → full K8s)?
+### Docker Desktop built-in K8s considered and rejected
+Single-node means pod affinity rules, domain scheduling, and multi-node topology are untestable. The K8s toggle is a single shared cluster — enabling it for SETI disables it for everything else on the machine. k3d has neither of these problems.
 
-### cert-manager
-- Available in the target environment, or needs to be added?
-- Self-signed CA vs organizational CA vs Let's Encrypt?
-- cert-forge's K8s integration points — cert-forge's signing backend should point to cert-manager in production.
+### Helm over raw manifests
+Correct. Templating collapses 20 nearly-identical Job deployments into a consistent pattern. Values files provide per-environment behavior without duplicating manifests. The chart is the handoff artifact between tiers — ArgoCD points at the same chart for staging and production.
 
-### Storage
-- **Lore (PostgreSQL)** — needs a persistent volume with a reliable storage class.  What's available?  Local path, NFS, cloud block storage?
-- **Redis** — AOF persistence for SETI's metric streams and alert state.  Same storage question.
-- Backup strategy for both.
+### cert-forge writes to K8s Secret
+Correct. The shared volume was a Docker Compose constraint, not an architectural choice. K8s Secrets are the correct primitive. cert-forge gets a namespace-scoped ServiceAccount with `get`, `create`, `update` on secrets only. Detection is automatic via the projected ServiceAccount token — same binary, same image, environment-appropriate behavior.
 
-### Single Cluster vs Multi-Cluster
-- Single cluster with namespace isolation (SETI in one namespace, monitored applications in others)?
-- Separate cluster for SETI vs monitored constellations?
-- Federation between clusters?
+### All `.env` secrets become K8s Secrets
+Correct. JWT secret, postgres credentials, remote-apps.json (which contains registry tokens) — all K8s Secrets supplied via `--set` at install time. Never in values files. Never in git.
 
-### Helm Chart Structure
-- One chart for the entire SETI constellation, or per-Job charts with dependencies?
-- Shared chart library for the common patterns (cert-forge client setup, enrollment env vars, health check config, network policy shape)?
-- Chart versioning strategy — locked to a TCA version, or independently versioned?
+### ac-net replaced by NetworkPolicy
+Correct and an improvement. ac-net was a shared broadcast domain — every service on ac-net could technically reach every other. NetworkPolicy gives true point-to-point isolation. augur-canis can reach gateway. augur-canis can reach signal-clearance. Gateway cannot reach signal-clearance through augur-canis's path. 22 policies cover the full constellation topology.
 
-### Network Policy Design
-- Direct translation of Docker Compose networks to K8s NetworkPolicy objects
-- AC's access pattern: AC can reach all services; services cannot reach each other through AC's network
-- Gateway is the sole external entry point — `Ingress` resource or `LoadBalancer` service?
-- mTLS terminates at the service level, not at the ingress — does this change with K8s?
+### NetworkPolicy: dev unenforced, staging/production enforced
+Correct. k3d uses flannel which does not enforce NetworkPolicy. The policies are in the chart as authoritative documentation of the topology regardless of enforcement. A CNI that supports NetworkPolicy (Calico, Cilium) enforces them automatically in staging and production without any chart changes.
 
-### Resource Limits and Pod Affinity
-- TCA Section 9 defines the K8s deployment patterns: hot-path domain (hard affinity, same node), security/financial domain (co-located but isolated from hot path), async domain (float freely)
-- SETI's hot path: gateway, signal-clearance, policy, seti-observability
-- SETI's async: feed-wrangler, signal-aggregator, ai-lien (long-running)
-- Resource limits per Job — establish starting points from observed Docker Compose behavior
+### Docker Compose is Tier 0, not deprecated
+Correct. Compose stays as a development convenience for single-Job iteration. The Helm chart is the source of truth. The Compose file is not kept in sync with the chart.
 
-### SETI as Operator (Architecture Only — Don't Build Yet)
-- `k8s-conductor` Job subscribing to SETI's feeds and calling the K8s API
-- Safety model — what changes can be made automatically vs require human confirmation?
-- RBAC scope — minimum permissions for the decisions SETI should make autonomously
-- The observation from the prior conversation:  the existing tools (CAST AI, VPA) scale based on CPU.  k8s-conductor scales based on understanding — it knows AC's canned query cycle from user load, knows which service is the bottleneck vs which is upstream of the bottleneck.
+### ArgoCD for staging and production, not development
+Correct. ArgoCD's GitOps overhead is friction in the inner dev loop. `helm upgrade` is the dev workflow. ArgoCD picks up the same chart for staging and production.
+
+### k3s as street deployment target
+Correct. k3s is Apache 2.0, K8s-compatible, and runs on a single modest VM or small cluster. A small operator deploying SETI does not need AWS or GKE.
+
+### Docker Swarm — not adopted
+The 32-network ceiling was the original argument for Swarm. K8s NetworkPolicy removes that ceiling correctly. Swarm doesn't compose with ArgoCD or the k8s-conductor operator concept.
+
+### Nomad — not adopted
+BSL 1.1 license. Mandatory HashiCorp ecosystem (Consul + Vault) for service discovery and secrets. Architectural fork that doesn't align with the K8s target.
 
 ---
 
-## Current Stack Reference
+## The cert-forge Model — Clarified
 
-Everything that needs to move.
+The certs volume in Docker Compose held:
+- `ca.crt` — constellation CA public cert
+- `enrollment-ca.crt` — enrollment CA cert
+- `enrollment.crt` + `enrollment.key` — bootstrap credential every service uses to call `/instance-cert`
+- `star-gazer.crt` + `star-gazer.key` — SETI's federation identity (static, longer lifecycle)
 
-### SETI Containers (20 total)
+In K8s all of this goes into the `seti-certs` Secret. cert-forge writes it on startup. Pods mount the Secret as a read-only volume at `/certs`. The enrollment flow is unchanged.
 
-| Service | Language | Port | State | Notes |
-|---------|----------|------|-------|-------|
-| cert-forge | Go | 4014/4015/4016 | Stateless | Three-port PKI architecture |
-| postgres | — | 5432 | Stateful | Lore persistence |
-| redis | — | 6379 | Stateful | Metric streams, alert state, pub/sub |
-| augur-canis | Go | 4010 | Stateless | AC — standalone repo |
-| seti-observability | Go | 4011 | Stateless | |
-| signal-clearance | TypeScript | 4001 | Stateless | |
-| gateway | Go | 4000 | Stateless | External entry point |
-| ui | TypeScript | 4020 | Stateless | Served via gateway |
-| policy | Go | 4002 | Stateless | |
-| contract-test | Go | 4003 | Stateless | |
-| results | Python | 4008 | Stateless | |
-| signal-aggregator | Go | 4006 | Stateless | |
-| plot-store | Go | 4005 | Stateless | |
-| plot-test | Go | 4004 | Stateless | |
-| interactions | Go | 4009 | Stateless | |
-| feed-wrangler | Elixir | 4007 | Stateless | OTP supervision is load-bearing |
-| integration | Go | 4013 | Stateless | |
-| ai-lien | Python | 4252 | Stateless | Long-running analysis calls |
-| lore | Go | 4110 | Stateless | Depends on postgres |
-| notifier | Go | 4300 | Stateless | Permanent stub |
-
-### Networks (Docker Compose)
-
-- `seti-internal` — primary service network, all Jobs
-- `ac-net` — AC's access network, all Jobs plus augur-canis
-
-### Volumes
-
-- `certs` — cert-forge generated material (readonly mounts)
-- `postgres_data` — Lore persistence
-
-### Environment Variables That Will Change
-
-- `REDIS_URL` — `redis:6379` → K8s Service DNS
-- `CERT_FORGE_URL` — same pattern, K8s Service
-- `POSTGRES_*` — will use K8s Secret references, not plaintext env vars
-- `JWT_SECRET` — K8s Secret, not `.env` file
-- `AC_UI_PORT=4666` — remove before production deployment
+The star-gazer cert is SETI's federation identity for connecting to external constellations. It is not the enrollment cert. These are different things with different purposes.
 
 ---
 
-## What a Good Session Outcome Looks Like
+## Startup Ordering
 
-By the end of the K8s migration conversation:
+Init containers replace `depends_on: condition: service_healthy`. The dependency chain is derived directly from the Compose file. Reusable wait helpers in `charts/seti/templates/_init.tpl`.
 
-1. **Cluster target decided** — k3s, full K8s, or tiered.  Rationale documented.
-2. **Helm chart structure decided** — single chart, per-Job charts, or library approach.
-3. **cert-manager integration designed** — how cert-forge connects.
-4. **Storage strategy decided** — for PostgreSQL and Redis.
-5. **Network policy design complete** — AC access pattern, gateway ingress, mTLS posture.
-6. **Working k3d local dev environment** — `helm install` produces a running SETI constellation.
-7. **PHASE-PLAN.md for the migration** — phased, observable, each phase independently deployable.
-8. **k8s-conductor architecture documented** — not built, but the design is on paper.
+cert-forge uses `httpGet` on `/ca` (plain HTTP, port 4016) for its readiness probe. Every other service uses `exec: ["/healthcheck"]` — the same binary, same Redis pub/sub mechanism, same AC Watchdog verification as Docker Compose.
+
+The Startup contract test run fires before AC has completed its first check cycle and shows failures. This is correct behavior. Subsequent scheduled runs pass cleanly. No artificial delay is the right answer.
 
 ---
 
-## How to Start That Conversation
+## Deployment Tiers (TCA 2.0)
 
-Load this document.  Load AC-GUIDELINES.md, SETI-GUIDELINES.md, and tca-guidelines.md.  The AI should read all four before the first exchange.  Then:
+| Tier | Tool | When | Notes |
+|------|------|------|-------|
+| 0 — Solo Job | Docker Compose (partial stack) | Active Job development | Fast inner loop, no K8s overhead |
+| 1 — Dev Constellation | k3d + Helm | Full constellation testing | `helm upgrade`, `k9s` for observability |
+| 2 — Staging | k3s or managed K8s + ArgoCD | Pre-production validation | NetworkPolicy enforced, ArgoCD drift detection |
+| 3 — Production | k3s (street) or managed K8s + ArgoCD | Live | Same chart, different values |
 
-> "I want to migrate SETI and TCA to a Kubernetes-based structure.  Start by reading the K8s primer and the three guidelines documents.  Then walk me through the open questions in the order you think is most important to resolve first."
+---
 
-The AI will have full context on what's already decided, what's open, what the current stack looks like, and what a successful session produces.
+## Open Questions — Now Closed
+
+**Cluster target:** k3d for dev, k3s or managed K8s for staging/production. Swarm and Nomad rejected.
+
+**cert-manager:** Not required. cert-forge writes to K8s Secret directly. cert-manager integration remains available for operators who need it but is not a dependency.
+
+**Storage:** PostgreSQL uses StatefulSet with PVC (ReadWriteOnce). Redis stateless in dev, AOF persistence for staging/production via values override.
+
+**Single vs multi-cluster:** Single cluster with namespace isolation for most deployments. Separate cluster required for constellations handling regulated data (PII, PHI) — namespace isolation is real but insufficient for compliance scope containment.
+
+**Helm chart structure:** Single chart, per-service subdirectory. Shared helpers. Values files per environment. No library chart.
+
+**Network policy design:** 22 NetworkPolicy objects. Default-deny ingress. Explicit allow per service. Unenforced in dev, automatic in staging/production.
+
+**Resource limits and pod affinity:** Deferred to Phase 11. Baseline behavior established. Limits and TCA Section 9 domain affinity rules set from observed behavior.
+
+**SETI as operator (k8s-conductor):** Architecture deferred. Concept is sound — a TCA Job subscribing to SETI feeds and translating decisions into K8s API calls, scaling based on understanding rather than CPU. TCA 2.0+ territory.
+
+---
+
+## Lessons Learned
+
+- `helm install` without `-n <namespace>` deploys to `default`. Always specify `-n seti` explicitly.
+- k3d image pull address is `seti-registry:5000`, not `localhost:5000`. Push and pull addresses differ. Must be correct in `values/dev.yaml`.
+- `exec: ["/healthcheck"]` is the correct probe for all mTLS services. `httpGet` with `scheme: HTTPS` fails the handshake without a client cert. `tcpSocket` bypasses AC.
+- Init container TCP check (`nc`) is sufficient. AC handles health verification once the service is running.
+- Helm multi-line `printf` is unreliable for Secret values. Assign variables at the top of the template with `{{- $var := ... -}}` and reference them cleanly.
+- Startup test failures are correct. Degraded-healthy during startup is not a bug.
+- ConfigMaps for contracts and plots are cleaner than volume mounts. 440KB fits under the 1MB limit.
+- A 20-service polyglot constellation migrated from Docker Compose to K8s in approximately 4 hours via engineer-AI partnership. Traditional team estimate: 2-6 weeks.
+
+---
+
+## Next K8s Work Items
+
+1. Resource limits per Job (Phase 11) — set from observed behavior
+2. Pod affinity rules per TCA Section 9 domain — hot-path, security, async
+3. k8s-conductor architecture document — not yet built
+4. Rodeo Clown — security boundary verification sidecar (separate repo)
+
+---
+
+## How to Start the Next K8s Conversation
+
+Load this document plus `PHASE-PLAN.md`, `SETI-GUIDELINES.md`, `AC-GUIDELINES.md`, and `tca-guidelines.md`. The code zip contains the full current state including the Helm chart. Read all four before the first exchange.
+
+---
+
+## Addendum — NetworkPolicy Lessons Learned (2026-04-14)
+
+These were discovered during the first live run of the constellation under NetworkPolicy and are not theoretical.
+
+**k3d enforces NetworkPolicy.** The primer stated flannel does not enforce NetworkPolicy. This is wrong. k3d ships with a network policy controller that does enforce it. Policies are active in dev. Plan accordingly.
+
+**Redis must allow ingress from all constellation pods.** The healthcheck binary connects to Redis directly from inside every service pod to publish check requests and subscribe to results. The initial Redis ingress policy only listed services with known Redis usage. This caused the healthcheck to fail for unlisted services, which triggered liveness probe failures and cascading restarts across the constellation. Fix: use the `app.kubernetes.io/part-of: seti` label selector for Redis ingress — every pod in the constellation needs Redis access.
+
+**augur-canis must allow ingress from all constellation pods.** Every service's init container probes `augur-canis:4010` via TCP to gate startup. The initial augur-canis ingress policy only listed services that call augur-canis at runtime. Init containers run inside the service pod and carry the service pod's labels, but services like lore, notifier, feed-wrangler, and results are not runtime callers of augur-canis — only their init containers need TCP access to confirm it's up. Fix: use the `app.kubernetes.io/part-of: seti` label selector for augur-canis ingress.
+
+**The label selector pattern applies to universal dependencies.** Any service that sits in the dependency chain of all other services — cert-forge, redis, augur-canis, seti-observability — should use `app.kubernetes.io/part-of: seti` for ingress rather than enumerating callers. Enumerated caller lists are incomplete by design because init containers create transient access patterns that don't exist at runtime.
+
+**Self-registration exhausts retries before NetworkPolicy is applied.** Services call `selfRegisterWithAC()` on startup with 10 retry attempts. If NetworkPolicy is restrictive when a service starts, it exhausts retries and gives up — the service runs but is never registered with AC, so AC marks its contract tests as `skip: job_not_deployed`. The fix is correct NetworkPolicy from the start, not more retries. Once the policy is correct, a pod restart causes successful registration on the first attempt.
+
+**cert-forge restart without CA persistence invalidates the entire constellation.** When cert-forge restarted, it generated a new CA. Services hold instance certs from the old CA in memory. Inter-service mTLS fails with `unknown certificate authority` because each service's cert is signed by a CA the other services no longer trust. Fix: cert-forge now persists the CA cert and key in the K8s Secret (`ca.crt` and `ca.key`). On restart it loads the existing CA rather than generating a new one. The CA is stable across cert-forge pod restarts. Only enrollment material and static certs are regenerated.
+
+**`helm upgrade` does not restart pods when only a ConfigMap changes.** Pods mount ConfigMaps as volumes. K8s updates the mounted files when the ConfigMap changes, but does not restart the pod. Services that read config at startup (like plot-store reading plot JSON files) require a manual `kubectl rollout restart` or a pod template annotation change to pick up ConfigMap updates.
+
+**Plot test expected_status must match the Go struct type.** The PlotStep struct defines `expected_status` as `int`. Changing it to a JSON array `[200, 201]` causes `json: cannot unmarshal array into Go struct field` and silently drops the plot from plot-store's loaded set. Verify the struct type before changing JSON field shapes.
+
+**Plot tests that assume clean state are fragile across environments.** Docker Compose's `down -v` workflow incidentally reset in-memory state between test sessions. K8s does not. A plot that expects 201 on `POST /resource` will fail if the resource already exists from a previous run. Plots must clean up after themselves — add a DELETE step at the end of any plot that creates persistent state.

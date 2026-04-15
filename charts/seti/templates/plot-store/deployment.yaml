@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: plot-store
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: plot-store
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: plot-store
+  template:
+    metadata:
+      labels:
+        app: plot-store
+        {{- include "seti.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "seti.waitForCertForge" . | nindent 8 }}
+        {{- include "seti.waitForAugurCanis" . | nindent 8 }}
+      containers:
+        - name: plot-store
+          image: {{ .Values.registry }}/plot-store:{{ .Values.plotStore.tag }}
+          ports:
+            - containerPort: {{ .Values.plotStore.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.plotStore.port | quote }}
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            - name: SERVICE_NAME
+              value: "plot-store"
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OBSERVABILITY_URL
+              value: "https://seti-observability:{{ .Values.setiObservability.port }}"
+            - name: PLOTS_PATH
+              value: "/contracts/plots"
+          volumeMounts:
+            - name: seti-certs
+              mountPath: /certs
+              readOnly: true
+            - name: contracts
+              mountPath: /contracts/plots/seti
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: seti-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+        - name: contracts
+          configMap:
+            name: seti-plots
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: plot-store
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: plot-store
+spec:
+  selector:
+    app: plot-store
+  ports:
+    - port: {{ .Values.plotStore.port }}
+      targetPort: {{ .Values.plotStore.port }}

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: seti-observability
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: seti-observability
+spec:
+  selector:
+    app: seti-observability
+  ports:
+    - port: {{ .Values.setiObservability.port }}
+      targetPort: {{ .Values.setiObservability.port }}

@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-clearance
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: signal-clearance
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signal-clearance
+  template:
+    metadata:
+      labels:
+        app: signal-clearance
+        {{- include "seti.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "seti.waitForCertForge" . | nindent 8 }}
+        {{- include "seti.waitForSetiObservability" . | nindent 8 }}
+      containers:
+        - name: signal-clearance
+          image: {{ .Values.registry }}/signal-clearance:{{ .Values.signalClearance.tag }}
+          ports:
+            - containerPort: {{ .Values.signalClearance.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.signalClearance.port | quote }}
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            - name: SERVICE_NAME
+              value: "signal-clearance"
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OBSERVABILITY_URL
+              value: "https://seti-observability:{{ .Values.setiObservability.port }}"
+            - name: JWT_SECRET
+              value: {{ required "jwtSecret is required" .Values.jwtSecret }}
+            - name: AUTH_MODE
+              value: {{ .Values.authMode }}
+            - name: OIDC_REDIRECT_URI
+              value: "https://localhost:4000/auth/callback"
+          volumeMounts:
+            - name: seti-certs
+              mountPath: /certs
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["/nodejs/bin/node", "/healthcheck.js"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command: ["/nodejs/bin/node", "/healthcheck.js"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: seti-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signal-clearance
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: signal-clearance
+spec:
+  selector:
+    app: signal-clearance
+  ports:
+    - port: {{ .Values.signalClearance.port }}
+      targetPort: {{ .Values.signalClearance.port }}

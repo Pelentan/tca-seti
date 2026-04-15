@@ -1,0 +1,120 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+        {{- include "seti.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "seti.waitForCertForge" . | nindent 8 }}
+        {{- include "seti.waitForSignalClearance" . | nindent 8 }}
+        {{- include "seti.waitForUI" . | nindent 8 }}
+      containers:
+        - name: gateway
+          image: {{ .Values.registry }}/gateway:{{ .Values.gateway.tag }}
+          ports:
+            - containerPort: {{ .Values.gateway.port }}
+          env:
+            - name: EXTERNAL_PORT
+              value: {{ .Values.gateway.port | quote }}
+            - name: SIGNAL_CLEARANCE_URL
+              value: "https://signal-clearance:{{ .Values.signalClearance.port }}"
+            - name: OBSERVABILITY_URL
+              value: "https://seti-observability:{{ .Values.setiObservability.port }}"
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            - name: SERVICE_NAME
+              value: "gateway"
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: JWT_SECRET
+              value: {{ required "jwtSecret is required" .Values.jwtSecret | quote }}
+            - name: AUTH_MODE
+              value: {{ .Values.authMode | quote }}
+            - name: UI_URL
+              value: "https://ui:{{ .Values.ui.port }}"
+            - name: CONTRACT_TEST_URL
+              value: "https://contract-test:{{ .Values.contractTest.port }}"
+            - name: RESULTS_URL
+              value: "https://results:{{ .Values.results.port }}"
+            - name: PLOT_STORE_URL
+              value: "https://plot-store:{{ .Values.plotStore.port }}"
+            - name: PLOT_TEST_URL
+              value: "https://plot-test:{{ .Values.plotTest.port }}"
+            - name: SIGNAL_AGG_URL
+              value: "https://signal-aggregator:{{ .Values.signalAggregator.port }}"
+            - name: INTEGRATION_URL
+              value: "https://integration:{{ .Values.integration.port }}"
+            - name: POLICY_URL
+              value: "https://policy:{{ .Values.policy.port }}"
+            - name: FEED_WRANGLER_URL
+              value: "https://feed-wrangler:{{ .Values.feedWrangler.port }}"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: seti-certs
+              mountPath: /certs
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: seti-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: gateway
+spec:
+  selector:
+    app: gateway
+  # NodePort in dev — exposes gateway on every k3d node at a fixed port.
+  # Change to ClusterIP + Ingress for staging/production.
+  type: NodePort
+  ports:
+    - port: {{ .Values.gateway.port }}
+      targetPort: {{ .Values.gateway.port }}
+      nodePort: 30400
