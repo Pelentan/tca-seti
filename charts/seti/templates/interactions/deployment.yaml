@@ -22,7 +22,8 @@ spec:
         {{- include "seti.waitForAugurCanis" . | nindent 8 }}
       containers:
         - name: interactions
-          image: {{ .Values.registry }}/interactions:{{ .Values.interactions.tag }}
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}interactions:{{ .Values.interactions.tag }}
+          imagePullPolicy: Always
           ports:
             - containerPort: {{ .Values.interactions.port }}
           env:

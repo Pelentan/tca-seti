@@ -292,3 +292,129 @@ func WriteK8sSecret(secretName string, data map[string][]byte) error {
 	log.Printf("[cert-forge] K8s Secret %s/%s written (%d keys)", namespace, secretName, len(data))
 	return nil
 }
+
+// WriteTLSSecret writes a kubernetes.io/tls typed Secret with the standard
+// tls.crt and tls.key keys. Traefik requires this type for TLS termination —
+// it will not accept Opaque secrets for its own certificate material.
+func WriteTLSSecret(secretName string, certPEM, keyPEM []byte) error {
+	namespace := k8sNamespace()
+	client, err := k8sHTTPClient()
+	if err != nil {
+		return err
+	}
+	token, err := k8sToken()
+	if err != nil {
+		return err
+	}
+
+	secret := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata": map[string]interface{}{
+			"name":      secretName,
+			"namespace": namespace,
+		},
+		"type": "kubernetes.io/tls",
+		"data": map[string]string{
+			"tls.crt": base64.StdEncoding.EncodeToString(certPEM),
+			"tls.key": base64.StdEncoding.EncodeToString(keyPEM),
+		},
+	}
+
+	body, err := json.Marshal(secret)
+	if err != nil {
+		return fmt.Errorf("marshal TLS secret: %v", err)
+	}
+
+	authHeader := "Bearer " + token
+	baseURL := fmt.Sprintf("%s/api/v1/namespaces/%s/secrets", k8sAPIBase, namespace)
+
+	getReq, _ := http.NewRequest(http.MethodGet, baseURL+"/"+secretName, nil)
+	getReq.Header.Set("Authorization", authHeader)
+	getResp, err := client.Do(getReq)
+	if err != nil {
+		return fmt.Errorf("check TLS secret existence: %v", err)
+	}
+	io.Copy(io.Discard, getResp.Body)
+	getResp.Body.Close()
+
+	var method, url string
+	if getResp.StatusCode == http.StatusNotFound {
+		method, url = http.MethodPost, baseURL
+	} else {
+		method, url = http.MethodPut, baseURL+"/"+secretName
+	}
+
+	req, _ := http.NewRequest(method, url, bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("write TLS secret (%s): %v", method, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("write TLS secret status %d: %s", resp.StatusCode, b)
+	}
+
+	log.Printf("[cert-forge] K8s TLS Secret %s/%s written", namespace, secretName)
+	return nil
+}
+
+// PatchDeploymentRestart patches the kubectl.kubernetes.io/restartedAt
+// annotation on a Deployment, triggering a rolling restart. This is the
+// same mechanism kubectl rollout restart uses — no separate controller needed.
+func PatchDeploymentRestart(name, namespace string) error {
+	client, err := k8sHTTPClient()
+	if err != nil {
+		return err
+	}
+	token, err := k8sToken()
+	if err != nil {
+		return err
+	}
+
+	patch := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"template": map[string]interface{}{
+				"metadata": map[string]interface{}{
+					"annotations": map[string]string{
+						"kubectl.kubernetes.io/restartedAt": time.Now().UTC().Format(time.RFC3339),
+					},
+				},
+			},
+		},
+	}
+
+	body, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("marshal patch: %v", err)
+	}
+
+	url := fmt.Sprintf("%s/apis/apps/v1/namespaces/%s/deployments/%s",
+		k8sAPIBase, namespace, name)
+
+	req, err := http.NewRequest(http.MethodPatch, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build patch request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/strategic-merge-patch+json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("patch deployment: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("patch deployment status %d: %s", resp.StatusCode, b)
+	}
+
+	log.Printf("[cert-forge] Deployment %s/%s restart triggered", namespace, name)
+	return nil
+}

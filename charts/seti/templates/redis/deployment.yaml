@@ -20,6 +20,7 @@ spec:
       containers:
         - name: redis
           image: redis:{{ .Values.redis.tag }}
+          imagePullPolicy: Always
           ports:
             - containerPort: 6379
           readinessProbe:

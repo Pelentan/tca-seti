@@ -22,7 +22,8 @@ spec:
         {{- include "seti.waitForPostgres" . | nindent 8 }}
       containers:
         - name: lore
-          image: {{ .Values.registry }}/lore:{{ .Values.lore.tag }}
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}lore:{{ .Values.lore.tag }}
+          imagePullPolicy: Always
           ports:
             - containerPort: {{ .Values.lore.port }}
           env:

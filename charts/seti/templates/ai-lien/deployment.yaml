@@ -22,7 +22,8 @@ spec:
         {{- include "seti.waitForAugurCanis" . | nindent 8 }}
       containers:
         - name: ai-lien
-          image: {{ .Values.registry }}/ai-lien:{{ .Values.aiLien.tag }}
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}ai-lien:{{ .Values.aiLien.tag }}
+          imagePullPolicy: Always
           ports:
             - containerPort: {{ .Values.aiLien.port }}
           env:

@@ -1,0 +1,38 @@
+# TCA Library Index
+#
+# AI INSTRUCTIONS — READ BEFORE INTRODUCING ANY DEPENDENCY:
+#
+# 1. Before writing any import statement for a third-party package,
+#    scan this index for a lib that covers the capability you need.
+#
+# 2. If a matching lib exists, use it. Copy the source file referenced
+#    in source-file into the Job. Do not pull an external package to
+#    solve a problem this index already covers.
+#
+# 3. If no lib covers what you need, STOP. Do not reach for an external
+#    package. Do not add a require line to go.mod. Ask the engineer:
+#    "This capability isn't in the TCA lib index. Do you want me to
+#    write a lib contract for it, use an external package, or handle
+#    it a different way?" Wait for direction before proceeding.
+#
+# 4. This rule has no exceptions based on how small or well-known the
+#    external package is. The engineer decides what enters the supply
+#    chain. You surface the gap. They make the call.
+
+libs:
+
+  - name: redis-client
+    contract: contracts/lib/redis-client.yaml
+    language: go
+    source-file: redis.go
+    capabilities:
+      - Redis pub/sub (Publish, Subscribe)
+      - Redis Streams (XAdd, XRange, XLen, XTrim)
+      - Key operations (Get, Set, Expire, Del, Incr)
+      - Healthcheck (Ping)
+    external-dependencies: none
+    notes: >
+      Use for any Go Job that needs Redis. Covers the full range of
+      Redis operations used across TCA constellations. If an operation
+      you need is not listed under capabilities, do not implement it
+      ad-hoc — follow instruction 3 above.

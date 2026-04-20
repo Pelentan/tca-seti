@@ -23,7 +23,8 @@ spec:
         {{- include "seti.waitForUI" . | nindent 8 }}
       containers:
         - name: gateway
-          image: {{ .Values.registry }}/gateway:{{ .Values.gateway.tag }}
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}gateway:{{ .Values.gateway.tag }}
+          imagePullPolicy: Always
           ports:
             - containerPort: {{ .Values.gateway.port }}
           env:
@@ -77,6 +78,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            {{- if .Values.gateway.externalHostname }}
+            - name: GATEWAY_EXTERNAL_HOSTNAME
+              value: {{ .Values.gateway.externalHostname | quote }}
+            {{- end }}
           volumeMounts:
             - name: seti-certs
               mountPath: /certs
@@ -111,10 +116,7 @@ metadata:
 spec:
   selector:
     app: gateway
-  # NodePort in dev — exposes gateway on every k3d node at a fixed port.
-  # Change to ClusterIP + Ingress for staging/production.
-  type: NodePort
+  type: ClusterIP
   ports:
     - port: {{ .Values.gateway.port }}
       targetPort: {{ .Values.gateway.port }}
-      nodePort: 30400

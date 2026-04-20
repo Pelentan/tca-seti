@@ -22,7 +22,8 @@ spec:
         {{- include "seti.waitForSetiObservability" . | nindent 8 }}
       containers:
         - name: signal-clearance
-          image: {{ .Values.registry }}/signal-clearance:{{ .Values.signalClearance.tag }}
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}signal-clearance:{{ .Values.signalClearance.tag }}
+          imagePullPolicy: Always
           ports:
             - containerPort: {{ .Values.signalClearance.port }}
           env:

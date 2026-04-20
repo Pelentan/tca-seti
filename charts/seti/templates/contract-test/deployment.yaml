@@ -22,7 +22,8 @@ spec:
         {{- include "seti.waitForAugurCanis" . | nindent 8 }}
       containers:
         - name: contract-test
-          image: {{ .Values.registry }}/contract-test:{{ .Values.contractTest.tag }}
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}contract-test:{{ .Values.contractTest.tag }}
+          imagePullPolicy: Always
           ports:
             - containerPort: {{ .Values.contractTest.port }}
           env:

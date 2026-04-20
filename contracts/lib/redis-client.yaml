@@ -1,0 +1,311 @@
+tca-lib: 1.0.0
+
+info:
+  name: redis-client
+  description: |
+    Thin RESP3 client for Redis operations used by TCA Jobs.
+    Covers pub/sub, streams (XADD/XRANGE/XREVRANGE/XLEN/XTRIM),
+    key operations (GET/SET/EXPIRE/DEL/INCR/KEYS/PING), and
+    pipelined batching. No external dependencies — stdlib net package only.
+
+    This library follows TCA immutability discipline. Once a function
+    reaches production use, its signature, behavior, and error contract
+    are frozen. New functions may be added. Existing functions are never
+    removed, renamed, or have their signatures changed. A caller written
+    against version 1.0.0 must compile and behave correctly against any
+    later version without modification.
+
+    This rule exists because library consumers, unlike HTTP callers, have
+    no runtime negotiation mechanism. A changed function signature is a
+    silent breaking change that surfaces as a compile error in every Job
+    that uses the library — potentially across multiple constellations.
+    Treat every function signature as a contract endpoint. Freeze it the
+    moment it ships.
+  version: 1.0.0
+  language: go
+  source-file: redis.go
+
+x-tca-lib-constraints:
+  external-dependencies: none
+  stdlib-only: true
+  notes: >
+    This library must never introduce external dependencies. The import
+    list is stdlib only: net, bufio, fmt, context, time, strings, strconv.
+    If a capability requires an external package, that is a signal to
+    reconsider whether the capability belongs in this library or whether
+    the Job should implement it directly.
+
+    Violations of the zero-external-dependencies constraint are contract
+    violations, not style choices. A PR that adds a require line to go.mod
+    must be rejected regardless of the justification.
+
+functions:
+  - name: NewRedisClient
+    signature: "NewRedisClient(addr string) *RedisClient"
+    description: >
+      Creates a new client. Does not open a connection — connections
+      are established on first use. The client is safe for concurrent use.
+    errors: none
+
+  - name: Ping
+    signature: "Ping(ctx context.Context) error"
+    description: >
+      Sends a PING to Redis and verifies the PONG response. Use for
+      healthcheck verification that Redis is reachable and responding.
+    errors:
+      - condition: Redis unreachable
+        behavior: returns error
+      - condition: unexpected response
+        behavior: returns error with response detail
+      - condition: context cancelled
+        behavior: returns context error immediately
+
+  - name: Publish
+    signature: "Publish(ctx context.Context, channel, message string) error"
+    description: Publishes a message to a Redis pub/sub channel.
+    errors:
+      - condition: Redis unreachable
+        behavior: returns error, does not retry
+      - condition: context cancelled
+        behavior: returns context error immediately
+
+  - name: Subscribe
+    signature: "Subscribe(ctx context.Context, channel string) (<-chan string, error)"
+    description: >
+      Subscribes to a channel. Returns a read channel that receives
+      messages. The channel is closed when the context is cancelled
+      or the connection is lost. Caller is responsible for retry on
+      connection loss — check if the returned channel is closed and
+      resubscribe.
+    errors:
+      - condition: Redis unreachable
+        behavior: returns nil channel and error
+      - condition: connection lost after subscribe
+        behavior: message channel is closed, no error returned — caller detects via closed channel
+
+  - name: Get
+    signature: "Get(ctx context.Context, key string) (string, bool, error)"
+    description: >
+      Returns the value for a key. The bool is false if the key does
+      not exist — this is not an error condition. Callers must check
+      the bool before using the string value.
+    errors:
+      - condition: key does not exist
+        behavior: returns empty string, false, nil — not an error
+      - condition: Redis unreachable
+        behavior: returns empty string, false, error
+
+  - name: Set
+    signature: "Set(ctx context.Context, key, value string, ttl time.Duration) error"
+    description: >
+      Sets a key to a value. A ttl of 0 sets the key with no expiry.
+      A positive ttl sets the key and applies EXPIRE in the same
+      operation.
+    errors:
+      - condition: Redis unreachable
+        behavior: returns error
+
+  - name: Expire
+    signature: "Expire(ctx context.Context, key string, ttl time.Duration) error"
+    description: >
+      Sets a TTL on an existing key independently of its value. Use
+      when the key was set without a TTL and expiry needs to be applied
+      after the fact. No-op if the key does not exist.
+    errors:
+      - condition: Redis unreachable
+        behavior: returns error
+      - condition: key does not exist
+        behavior: returns nil — not an error
+
+  - name: Del
+    signature: "Del(ctx context.Context, keys ...string) error"
+    description: >
+      Deletes one or more keys. Non-existent keys are silently ignored.
+      Returns error only on Redis failure, not on missing keys.
+    errors:
+      - condition: Redis unreachable
+        behavior: returns error
+
+  - name: Incr
+    signature: "Incr(ctx context.Context, key string) (int64, error)"
+    description: >
+      Atomically increments a key by 1 and returns the new value.
+      If the key does not exist, it is created with value 0 before
+      incrementing — result is 1 on first call.
+    errors:
+      - condition: Redis unreachable
+        behavior: returns 0, error
+      - condition: key exists but is not an integer
+        behavior: returns 0, error
+
+  - name: Keys
+    signature: "Keys(ctx context.Context, pattern string) ([]string, error)"
+    description: >
+      Returns all keys matching a glob-style pattern. Uses the Redis
+      KEYS command — O(N) blocking scan over the full keyspace.
+      Acceptable for AC's operational scale. Do not use in hot paths
+      or on keyspaces with millions of keys.
+
+      Common patterns: "ac:job:*", "ac:state:*:last_seen",
+      "ac:metrics:*:latency". Returns an empty slice if no keys match —
+      this is not an error.
+    errors:
+      - condition: no keys match
+        behavior: returns empty slice, nil — not an error
+      - condition: Redis unreachable
+        behavior: returns nil, error
+
+  - name: XAdd
+    signature: "XAdd(ctx context.Context, stream string, maxLen int64, fields map[string]string) (string, error)"
+    description: >
+      Appends an entry to a Redis Stream. maxLen caps the stream length
+      using MAXLEN ~ (approximate trimming — Redis may retain slightly
+      more than maxLen entries for performance). A maxLen of 0 disables
+      trimming. Returns the Redis-generated entry ID.
+    errors:
+      - condition: Redis unreachable
+        behavior: returns empty string, error
+
+  - name: XRange
+    signature: "XRange(ctx context.Context, stream, start, stop string) ([]StreamEntry, error)"
+    description: >
+      Returns entries from a stream between start and stop IDs inclusive.
+      Use "-" for the earliest entry and "+" for the latest. Returns an
+      empty slice if the stream does not exist — this is not an error.
+    errors:
+      - condition: stream does not exist
+        behavior: returns empty slice, nil — not an error
+      - condition: Redis unreachable
+        behavior: returns nil, error
+
+  - name: XRevRangeN
+    signature: "XRevRangeN(ctx context.Context, stream, start, stop string, count int64) ([]StreamEntry, error)"
+    description: >
+      Returns up to count entries from a stream in reverse order (newest
+      first) between start and stop IDs. Use "+" for start and "-" for
+      stop to read from the tail. Used by detectors to read the most
+      recent N samples without scanning the full stream.
+
+      Returns entries in reverse chronological order — index 0 is the
+      newest entry.
+    errors:
+      - condition: stream does not exist
+        behavior: returns empty slice, nil — not an error
+      - condition: Redis unreachable
+        behavior: returns nil, error
+
+  - name: XLen
+    signature: "XLen(ctx context.Context, stream string) (int64, error)"
+    description: >
+      Returns the number of entries in a stream. Returns 0 if the stream
+      does not exist — this is not an error.
+    errors:
+      - condition: stream does not exist
+        behavior: returns 0, nil — not an error
+      - condition: Redis unreachable
+        behavior: returns 0, error
+
+  - name: XTrim
+    signature: "XTrim(ctx context.Context, stream string, maxLen int64) error"
+    description: >
+      Trims a stream to at most maxLen entries, removing the oldest
+      entries first. Uses exact trimming (MAXLEN without ~). Use when
+      precise length control is required. For high-throughput streams
+      where approximate trimming is acceptable, prefer the maxLen
+      parameter in XAdd.
+    errors:
+      - condition: stream does not exist
+        behavior: returns nil — not an error
+      - condition: Redis unreachable
+        behavior: returns error
+
+  - name: NewPipeline
+    signature: "NewPipeline() *Pipeliner"
+    description: >
+      Returns a Pipeliner for batching multiple commands in a single
+      network round-trip. The caller queues operations on the Pipeliner
+      and calls Exec to send them all at once.
+
+      Pipelining is batching, not a transaction. Commands are sent
+      together but are not atomic — if one command fails, preceding
+      commands have already executed and subsequent commands still
+      execute. Use when the goal is reducing round-trips, not
+      guaranteeing all-or-nothing semantics.
+    errors: none
+
+pipeliner-methods:
+  description: >
+    Methods available on *Pipeliner. Pipeliner queues commands locally —
+    no network I/O until Exec is called. Each queue method returns the
+    Pipeliner itself for chaining, but callers are not required to chain.
+    Errors from individual queued commands are returned in the ExecResult
+    slice from Exec, not from the queue methods themselves.
+
+  - name: Set
+    signature: "Set(key, value string, ttl time.Duration) *Pipeliner"
+    description: Queues a SET command. ttl of 0 means no expiry.
+
+  - name: Del
+    signature: "Del(keys ...string) *Pipeliner"
+    description: Queues a DEL command for one or more keys.
+
+  - name: Publish
+    signature: "Publish(channel, message string) *Pipeliner"
+    description: Queues a PUBLISH command.
+
+  - name: XAdd
+    signature: "XAdd(stream string, maxLen int64, fields map[string]string) *Pipeliner"
+    description: Queues an XADD command.
+
+  - name: Exec
+    signature: "Exec(ctx context.Context) ([]ExecResult, error)"
+    description: >
+      Sends all queued commands to Redis in a single round-trip and
+      returns results. The error return covers connection-level failures
+      only — a failed connection means no commands executed. Per-command
+      errors are in the ExecResult slice. Callers must check ExecResult
+      entries for command-level failures.
+
+      After Exec, the Pipeliner is reset and may be reused.
+    errors:
+      - condition: Redis unreachable
+        behavior: returns nil, error — no commands executed
+      - condition: individual command failure
+        behavior: returned in ExecResult slice, other commands unaffected
+
+types:
+  - name: RedisClient
+    description: >
+      Opaque client type. Callers hold a *RedisClient and call methods
+      on it. Internal connection management is not part of the public
+      interface and must not be relied upon.
+
+  - name: StreamEntry
+    description: A single entry read from a Redis Stream.
+    fields:
+      - name: ID
+        type: string
+        description: >
+          Redis-generated millisecond-precision stream ID in the form
+          "{milliseconds}-{sequence}". Suitable for use as a cursor in
+          subsequent XRange or XRevRangeN calls.
+      - name: Fields
+        type: "map[string]string"
+        description: Entry field/value pairs as written by XAdd.
+
+  - name: Pipeliner
+    description: >
+      Opaque pipeline type returned by NewPipeline. Callers queue
+      operations via its methods and flush with Exec. Safe for reuse
+      after Exec. Not safe for concurrent use — create one Pipeliner
+      per goroutine if concurrent pipelines are needed.
+
+  - name: ExecResult
+    description: Result of a single command within a pipeline Exec.
+    fields:
+      - name: Err
+        type: error
+        description: >
+          Non-nil if this specific command failed. nil if it succeeded.
+          Check this for every result entry when command-level error
+          handling matters.

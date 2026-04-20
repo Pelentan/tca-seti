@@ -7,10 +7,22 @@
     "valid_days": 3650,
     "backdate_minutes": 5
   },
+  "traefik_ca_secret": "seti-traefik-ca",
   "services": [
-    { "name": "star-gazer", "sans": ["star-gazer", "localhost"] }
+    { "name": "star-gazer", "sans": ["star-gazer", "localhost"] },
+    { "name": "seti-traefik", "sans": ["seti.tca.local"], "tls_secret": "seti-traefik-tls" }
   ],
   "output_dir": "/certs",
   "key_bits": 2048,
-  "valid_days": 3650
+  "valid_days": 3650,
+  "rotation": {
+    "instance_interval_days": 30,
+    "ca_interval_days": 30,
+    "ca_overlap_hours": 24,
+    "strategy": "simultaneous",
+    "deployments": [
+      { "name": "postgres", "namespace": "seti" },
+      { "name": "redis",    "namespace": "seti" }
+    ]
+  }
 }

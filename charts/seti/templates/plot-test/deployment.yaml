@@ -26,7 +26,8 @@ spec:
         {{- include "seti.waitForInteractions" . | nindent 8 }}
       containers:
         - name: plot-test
-          image: {{ .Values.registry }}/plot-test:{{ .Values.plotTest.tag }}
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}plot-test:{{ .Values.plotTest.tag }}
+          imagePullPolicy: Always
           ports:
             - containerPort: {{ .Values.plotTest.port }}
           env:

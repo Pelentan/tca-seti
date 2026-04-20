@@ -22,7 +22,8 @@ spec:
         {{- include "seti.waitForAugurCanis" . | nindent 8 }}
       containers:
         - name: ui
-          image: {{ .Values.registry }}/ui:{{ .Values.ui.tag }}
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}ui:{{ .Values.ui.tag }}
+          imagePullPolicy: Always
           ports:
             - containerPort: {{ .Values.ui.port }}
           env:

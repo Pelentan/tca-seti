@@ -6,6 +6,10 @@ namespace: seti
 # Image registry — override in dev with k3d local registry
 registry: localhost:5000
 
+# Image name prefix — set to "seti-" in dev to avoid registry collisions
+# with other constellations. Empty string in production (dedicated registry).
+imagePrefix: ""
+
 # Secret name cert-forge writes to and all services mount
 certSecretName: seti-certs
 
@@ -17,7 +21,6 @@ certForge:
 
 redis:
   tag: "7-alpine"
-  # K8s Service DNS — same name resolves within the namespace
   url: "redis:6379"
 
 setiObservability:
@@ -92,10 +95,7 @@ ui:
 gateway:
   tag: latest
   port: 4000
+  externalHostname: ""
 
-# JWT secret — supply at install time, never in values files
-# --set jwtSecret=yoursecret
 jwtSecret: ""
-
-# Auth mode — dev uses stub auth
 authMode: "dev"

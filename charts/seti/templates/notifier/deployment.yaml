@@ -22,7 +22,8 @@ spec:
         {{- include "seti.waitForSetiObservability" . | nindent 8 }}
       containers:
         - name: notifier
-          image: {{ .Values.registry }}/notifier:{{ .Values.notifier.tag }}
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}notifier:{{ .Values.notifier.tag }}
+          imagePullPolicy: Always
           ports:
             - containerPort: {{ .Values.notifier.port }}
           env:

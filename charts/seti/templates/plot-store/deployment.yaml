@@ -22,7 +22,8 @@ spec:
         {{- include "seti.waitForAugurCanis" . | nindent 8 }}
       containers:
         - name: plot-store
-          image: {{ .Values.registry }}/plot-store:{{ .Values.plotStore.tag }}
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}plot-store:{{ .Values.plotStore.tag }}
+          imagePullPolicy: Always
           ports:
             - containerPort: {{ .Values.plotStore.port }}
           env:

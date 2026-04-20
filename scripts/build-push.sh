@@ -2,6 +2,8 @@
 # scripts/build-push.sh
 #
 # Builds Docker images and pushes them to the k3d local registry.
+# All images are prefixed with "seti-" to avoid collisions with other
+# constellations sharing the same registry.
 # Run from the project root.
 #
 # Usage:
@@ -11,9 +13,11 @@
 set -euo pipefail
 
 REGISTRY="localhost:5000"
+PREFIX="seti-"
 TAG="${1:-dev}"
 
 # All services. Format: "service-name:dockerfile-path:build-context"
+# Images are pushed as seti-<service-name>:<tag>
 SERVICES=(
   "cert-forge:cert-forge/Dockerfile:."
   "seti-observability:seti-observability/Dockerfile:."
@@ -35,14 +39,14 @@ SERVICES=(
   "gateway:gateway/Dockerfile:."
 )
 
-echo "Building and pushing to ${REGISTRY} (tag: ${TAG})"
+echo "Building and pushing to ${REGISTRY} (prefix: ${PREFIX}, tag: ${TAG})"
 echo ""
 
 for entry in "${SERVICES[@]}"; do
   IFS=':' read -r name dockerfile context <<< "${entry}"
-  image="${REGISTRY}/${name}:${TAG}"
+  image="${REGISTRY}/${PREFIX}${name}:${TAG}"
 
-  echo "--- ${name} ---"
+  echo "--- ${PREFIX}${name} ---"
   docker build -t "${image}" -f "${dockerfile}" "${context}"
   docker push "${image}"
   echo ""

@@ -22,7 +22,8 @@ spec:
         {{- include "seti.waitForRedis" . | nindent 8 }}
       containers:
         - name: augur-canis
-          image: {{ .Values.registry }}/augur-canis:{{ .Values.augurCanis.tag }}
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}augur-canis:{{ .Values.augurCanis.tag }}
+          imagePullPolicy: Always
           ports:
             - containerPort: {{ .Values.augurCanis.port }}
           env:

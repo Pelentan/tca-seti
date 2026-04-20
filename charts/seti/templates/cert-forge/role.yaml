@@ -11,3 +11,8 @@ rules:
     verbs: ["get", "create", "update"]
     # resourceNames cannot be combined with "create" (resource doesn't exist yet),
     # so scope is limited to the namespace. The namespace itself provides isolation.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]
+    # patch is required for rotation — cert-forge patches restartedAt annotations
+    # to trigger rolling restarts of stateful workloads after cert rotation.

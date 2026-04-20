@@ -21,7 +21,8 @@ spec:
         {{- include "seti.waitForCertForge" . | nindent 8 }}
       containers:
         - name: seti-observability
-          image: {{ .Values.registry }}/seti-observability:{{ .Values.setiObservability.tag }}
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}seti-observability:{{ .Values.setiObservability.tag }}
+          imagePullPolicy: Always
           ports:
             - containerPort: {{ .Values.setiObservability.port }}
           env:

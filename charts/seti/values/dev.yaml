@@ -2,8 +2,12 @@
 # k3d local development overrides.
 # Usage: helm install seti ./charts/seti -f charts/seti/values/dev.yaml
 
-# k3d registry — push via localhost:5000, pull via seti-registry:5000
-registry: seti-registry:5000
+# k3d registry — push via localhost:5000, pull via tca-registry:5000
+registry: tca-registry:5000
+
+# Image name prefix — prevents collision with other constellations
+# in the shared registry. Images are pushed as seti-<service>:dev
+imagePrefix: seti-
 
 certForge:
   tag: dev
@@ -67,3 +71,6 @@ gateway:
   tag: dev
 
 authMode: "dev"
+gateway:
+  tag: dev
+  externalHostname: "seti.tca.local"

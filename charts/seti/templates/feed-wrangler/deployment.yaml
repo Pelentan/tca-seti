@@ -22,7 +22,8 @@ spec:
         {{- include "seti.waitForAugurCanis" . | nindent 8 }}
       containers:
         - name: feed-wrangler
-          image: {{ .Values.registry }}/feed-wrangler:{{ .Values.feedWrangler.tag }}
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}feed-wrangler:{{ .Values.feedWrangler.tag }}
+          imagePullPolicy: Always
           ports:
             - containerPort: {{ .Values.feedWrangler.port }}
           env:

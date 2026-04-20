@@ -537,8 +537,8 @@ func persistSuiteResult(ctx context.Context, suite *ContractSuiteResult) {
 		log.Printf("[augur-canis] Failed to marshal suite result: %v", err)
 		return
 	}
-	rdb.Set(ctx, fmt.Sprintf("ac:contract-suite:%s", suite.RunID), payload, 24*time.Hour)
-	rdb.Publish(ctx, "tca:ac-contract-suite", payload)
+	rdb.Set(ctx, fmt.Sprintf("ac:contract-suite:%s", suite.RunID), string(payload), 24*time.Hour)
+	rdb.Publish(ctx, "tca:ac-contract-suite", string(payload))
 
 	// Publish individual results to the existing contract-results channel
 	// so they surface in Results Job alongside contract-test Job runs
@@ -657,7 +657,7 @@ func handleRecentSuiteResults(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	ctx := context.Background()
 
-	keys, err := rdb.Keys(ctx, "ac:contract-suite:*").Result()
+	keys, err := rdb.Keys(ctx, "ac:contract-suite:*")
 	if err != nil || len(keys) == 0 {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"results": []interface{}{},
@@ -673,7 +673,7 @@ func handleRecentSuiteResults(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	raw, _ := rdb.Get(ctx, latest).Result()
+	raw, _, _ := rdb.Get(ctx, latest)
 	var suite ContractSuiteResult
 	if err := json.Unmarshal([]byte(raw), &suite); err != nil {
 		json.NewEncoder(w).Encode(map[string]interface{}{"results": []interface{}{}})
@@ -782,7 +782,7 @@ func handleContractSuitesList(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	ctx := context.Background()
 
-	keys, err := rdb.Keys(ctx, "ac:contract-suite:*").Result()
+	keys, err := rdb.Keys(ctx, "ac:contract-suite:*")
 	if err != nil || len(keys) == 0 {
 		json.NewEncoder(w).Encode(map[string]interface{}{"suites": []interface{}{}})
 		return
@@ -801,8 +801,8 @@ func handleContractSuitesList(w http.ResponseWriter, r *http.Request) {
 
 	suites := make([]SuiteSummary, 0, len(keys))
 	for _, key := range keys {
-		raw, err := rdb.Get(ctx, key).Result()
-		if err != nil {
+		raw, ok, err := rdb.Get(ctx, key)
+		if !ok || err != nil {
 			continue
 		}
 		var suite ContractSuiteResult
@@ -843,8 +843,8 @@ func handleContractSuiteDetail(w http.ResponseWriter, r *http.Request) {
 	runID := strings.TrimPrefix(r.URL.Path, "/contract-suites/")
 	runID = strings.TrimSuffix(runID, "/")
 
-	raw, err := rdb.Get(context.Background(), fmt.Sprintf("ac:contract-suite:%s", runID)).Result()
-	if err != nil {
+	raw, ok, err := rdb.Get(context.Background(), fmt.Sprintf("ac:contract-suite:%s", runID))
+	if !ok || err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(map[string]string{
 			"code": "NOT_FOUND", "message": fmt.Sprintf("Suite %s not found or expired", runID),

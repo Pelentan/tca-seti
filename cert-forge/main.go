@@ -46,8 +46,8 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	port           = envOr("PORT", "4014")
-	enrollmentPort = envOr("ENROLLMENT_PORT", "4015")
+	port           = envOr("PORT", "3020")
+	enrollmentPort = envOr("ENROLLMENT_PORT", "3021")
 	outputDir      = envOr("CERTS_DIR", "/certs")
 	configPath     = envOr("CONFIG_PATH", "/forge.json")
 )
@@ -73,16 +73,32 @@ type CAConfig struct {
 }
 
 type StaticCertConfig struct {
-	Name string   `json:"name"`
-	SANs []string `json:"sans"`
+	Name      string   `json:"name"`
+	SANs      []string `json:"sans"`
+	TLSSecret string   `json:"tls_secret,omitempty"` // if set, also write a kubernetes.io/tls Secret for Traefik
+}
+
+type RotationDeployment struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+}
+
+type RotationConfig struct {
+	InstanceIntervalDays int                  `json:"instance_interval_days"`
+	CAIntervalDays       int                  `json:"ca_interval_days"`
+	CAOverlapHours       int                  `json:"ca_overlap_hours"`
+	Strategy             string               `json:"strategy"`
+	Deployments          []RotationDeployment `json:"deployments"`
 }
 
 type ForgeConfig struct {
-	CA          CAConfig           `json:"ca"`
-	StaticCerts []StaticCertConfig `json:"services"`
-	OutputDir   string             `json:"output_dir"`
-	KeyBits     int                `json:"key_bits"`
-	ValidDays   int                `json:"valid_days"`
+	CA              CAConfig           `json:"ca"`
+	StaticCerts     []StaticCertConfig `json:"services"`
+	OutputDir       string             `json:"output_dir"`
+	KeyBits         int                `json:"key_bits"`
+	ValidDays       int                `json:"valid_days"`
+	TraefikCASecret string             `json:"traefik_ca_secret,omitempty"`
+	Rotation        RotationConfig     `json:"rotation"`
 }
 
 func loadConfig(path string) (*ForgeConfig, error) {
@@ -100,6 +116,10 @@ func loadConfig(path string) (*ForgeConfig, error) {
 	if cfg.KeyBits == 0 { cfg.KeyBits = 2048 }
 	if cfg.ValidDays == 0 { cfg.ValidDays = 3650 }
 	if cfg.OutputDir != "" { outputDir = cfg.OutputDir }
+	if cfg.Rotation.InstanceIntervalDays == 0 { cfg.Rotation.InstanceIntervalDays = 30 }
+	if cfg.Rotation.CAIntervalDays == 0 { cfg.Rotation.CAIntervalDays = 30 }
+	if cfg.Rotation.CAOverlapHours == 0 { cfg.Rotation.CAOverlapHours = 24 }
+	if cfg.Rotation.Strategy == "" { cfg.Rotation.Strategy = "simultaneous" }
 	return &cfg, nil
 }
 
@@ -196,7 +216,19 @@ func generateCA(cfg *ForgeConfig) (*CA, error) {
 // Instance cert generation — called per service startup
 // ---------------------------------------------------------------------------
 
-func issueInstanceCert(cfg *ForgeConfig, serviceName, instanceID string) (*InstanceKey, error) {
+// SubjectOverride allows callers to specify optional DN fields beyond
+// CN/O/C which cert-forge derives from config. Any non-empty field here
+// overrides the default. CN is always set — if override CN is empty,
+// the standard "serviceName-instanceID" pattern is used.
+type SubjectOverride struct {
+	CommonName         string
+	OrganizationalUnit string
+	Locality           string
+	Province           string
+	SANs               []string
+}
+
+func issueInstanceCert(cfg *ForgeConfig, serviceName, instanceID string, override *SubjectOverride) (*InstanceKey, error) {
 	caReadyMu.RLock()
 	ready := caReady
 	caReadyMu.RUnlock()
@@ -210,22 +242,42 @@ func issueInstanceCert(cfg *ForgeConfig, serviceName, instanceID string) (*Insta
 	}
 
 	instanceCN := fmt.Sprintf("%s-%s", serviceName, instanceID)
+	if override != nil && override.CommonName != "" {
+		instanceCN = override.CommonName
+	}
+
+	subject := pkix.Name{
+		CommonName:   instanceCN,
+		Organization: []string{cfg.CA.Organization},
+		Country:      []string{cfg.CA.Country},
+	}
+	if override != nil && override.OrganizationalUnit != "" {
+		subject.OrganizationalUnit = []string{override.OrganizationalUnit}
+	}
+	if override != nil && override.Locality != "" {
+		subject.Locality = []string{override.Locality}
+	}
+	if override != nil && override.Province != "" {
+		subject.Province = []string{override.Province}
+	}
+
+	sans := []string{serviceName, instanceCN, "localhost"}
+	if override != nil && len(override.SANs) > 0 {
+		sans = override.SANs
+	}
+
 	notBefore := time.Now().Add(-time.Duration(cfg.CA.BackdateMinutes) * time.Minute)
 	notAfter := time.Now().Add(time.Duration(cfg.ValidDays) * 24 * time.Hour)
 
 	template := &x509.Certificate{
-		SerialNumber: newSerial(),
-		Subject: pkix.Name{
-			CommonName:   instanceCN,
-			Organization: []string{cfg.CA.Organization},
-			Country:      []string{cfg.CA.Country},
-		},
+		SerialNumber:          newSerial(),
+		Subject:               subject,
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
-		DNSNames:              []string{serviceName, instanceCN, "localhost"},
+		DNSNames:              sans,
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, ca.cert, &key.PublicKey, ca.key)
@@ -378,8 +430,13 @@ func handleInstanceCert(cfg *ForgeConfig) http.HandlerFunc {
 		}
 
 		var req struct {
-			ServiceName string `json:"service_name"`
-			InstanceID  string `json:"instance_id"`
+			ServiceName        string   `json:"service_name"`
+			InstanceID         string   `json:"instance_id"`
+			CommonName         string   `json:"common_name,omitempty"`
+			OrganizationalUnit string   `json:"organizational_unit,omitempty"`
+			Locality           string   `json:"locality,omitempty"`
+			Province           string   `json:"province,omitempty"`
+			SANs               []string `json:"sans,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
@@ -390,7 +447,18 @@ func handleInstanceCert(cfg *ForgeConfig) http.HandlerFunc {
 			return
 		}
 
-		ik, err := issueInstanceCert(cfg, req.ServiceName, req.InstanceID)
+		var override *SubjectOverride
+		if req.CommonName != "" || req.OrganizationalUnit != "" || req.Locality != "" || req.Province != "" || len(req.SANs) > 0 {
+			override = &SubjectOverride{
+				CommonName:         req.CommonName,
+				OrganizationalUnit: req.OrganizationalUnit,
+				Locality:           req.Locality,
+				Province:           req.Province,
+				SANs:               req.SANs,
+			}
+		}
+
+		ik, err := issueInstanceCert(cfg, req.ServiceName, req.InstanceID, override)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -545,6 +613,112 @@ func buildSignMux() *http.ServeMux {
 // main
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Rotation — instance cert rotation and CA rotation
+// ---------------------------------------------------------------------------
+
+// rollDeployments patches the restartedAt annotation on all listed Deployments.
+// Only meaningful in Kubernetes mode — no-op in Docker Compose.
+func rollDeployments(cfg *RotationConfig) {
+	if cfg.Strategy != "simultaneous" {
+		log.Printf("[cert-forge] rotation: strategy %q not yet implemented — falling back to simultaneous", cfg.Strategy)
+	}
+	for _, d := range cfg.Deployments {
+		if err := PatchDeploymentRestart(d.Name, d.Namespace); err != nil {
+			log.Printf("[cert-forge] rotation: failed to restart %s/%s: %v", d.Namespace, d.Name, err)
+		}
+	}
+}
+
+// startRotationLoop runs the instance cert and CA rotation tickers.
+// Blocks forever — run in a goroutine.
+func startRotationLoop(cfg *ForgeConfig, inK8s bool, secretName string) {
+	if !inK8s {
+		log.Printf("[cert-forge] rotation: not in Kubernetes — rotation loop inactive")
+		return
+	}
+	if len(cfg.Rotation.Deployments) == 0 {
+		log.Printf("[cert-forge] rotation: no deployments configured — rotation loop inactive")
+		return
+	}
+
+	instanceTicker := time.NewTicker(time.Duration(cfg.Rotation.InstanceIntervalDays) * 24 * time.Hour)
+	caTicker       := time.NewTicker(time.Duration(cfg.Rotation.CAIntervalDays) * 24 * time.Hour)
+	defer instanceTicker.Stop()
+	defer caTicker.Stop()
+
+	log.Printf("[cert-forge] rotation: instance every %dd, CA every %dd, strategy=%s, deployments=%d",
+		cfg.Rotation.InstanceIntervalDays,
+		cfg.Rotation.CAIntervalDays,
+		cfg.Rotation.Strategy,
+		len(cfg.Rotation.Deployments),
+	)
+
+	for {
+		select {
+		case <-instanceTicker.C:
+			log.Printf("[cert-forge] rotation: instance cert rotation firing")
+			rollDeployments(&cfg.Rotation)
+			log.Printf("[cert-forge] rotation: instance cert rotation complete")
+
+		case <-caTicker.C:
+			log.Printf("[cert-forge] rotation: CA rotation firing")
+
+			// Generate new CA
+			newCA, err := generateCA(cfg)
+			if err != nil {
+				log.Printf("[cert-forge] rotation: CA generation failed: %v — skipping rotation", err)
+				continue
+			}
+
+			// Overlap window: new CA is live immediately for /instance-cert issuance.
+			// Services that re-enroll during the overlap get certs signed by the new CA.
+			// /ca returns the new CA cert so services can build trust pools against it.
+			caReadyMu.Lock()
+			oldCA := ca
+			ca = newCA
+			caReadyMu.Unlock()
+
+			log.Printf("[cert-forge] rotation: new CA active (CN=%s), overlap window %dh",
+				newCA.cert.Subject.CommonName, cfg.Rotation.CAOverlapHours)
+
+			// Write new CA to K8s Secret so services can fetch it on restart.
+			// Read existing secret and update ca.crt and ca.key in place —
+			// enrollment material and static certs are preserved.
+			existingData, err := ReadK8sSecret(secretName)
+			if err != nil {
+				log.Printf("[cert-forge] rotation: could not read existing secret: %v", err)
+			} else if existingData != nil {
+				existingData["ca.crt"] = newCA.certPEM
+				existingData["ca.key"] = caKeyPEM(newCA.key)
+				if err := WriteK8sSecret(secretName, existingData); err != nil {
+					log.Printf("[cert-forge] rotation: failed to write new CA to secret: %v", err)
+				}
+			}
+
+			// Update Traefik CA secret if configured.
+			if cfg.TraefikCASecret != "" {
+				if err := WriteK8sSecret(cfg.TraefikCASecret, map[string][]byte{
+					"tls.ca": newCA.certPEM,
+				}); err != nil {
+					log.Printf("[cert-forge] rotation: failed to update Traefik CA secret: %v", err)
+				}
+			}
+
+			// Overlap window — services fetch new CA and build trust pools.
+			log.Printf("[cert-forge] rotation: entering CA overlap window (%dh) — old CA still valid",
+				cfg.Rotation.CAOverlapHours)
+			time.Sleep(time.Duration(cfg.Rotation.CAOverlapHours) * time.Hour)
+
+			// Overlap window expired — old CA retired, roll all deployments.
+			_ = oldCA // old CA is no longer referenced; GC will collect it
+			log.Printf("[cert-forge] rotation: overlap window expired — rolling deployments")
+			rollDeployments(&cfg.Rotation)
+			log.Printf("[cert-forge] rotation: CA rotation complete")
+		}
+	}
+}
+
 func main() {
 	log.Printf("[cert-forge] Starting — stdlib only, no external dependencies")
 
@@ -559,6 +733,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("[cert-forge] Config error: %v", err)
 	}
+	log.Printf("[cert-forge] Rotation config: instance=%dd ca=%dd overlap=%dh strategy=%s deployments=%d",
+		cfg.Rotation.InstanceIntervalDays,
+		cfg.Rotation.CAIntervalDays,
+		cfg.Rotation.CAOverlapHours,
+		cfg.Rotation.Strategy,
+		len(cfg.Rotation.Deployments),
+	)
 
 	// In Docker mode, ensure the output directory exists.
 	// In K8s mode, there is no volume — skip directory creation.
@@ -569,7 +750,7 @@ func main() {
 	}
 
 	// Phase 1: Establish CA — load existing from Secret or generate fresh.
-	secretName := cfEnvOr("K8S_SECRET_NAME", "seti-certs")
+	secretName := cfEnvOr("K8S_SECRET_NAME", "vox-certs")
 	var generatedCA *CA
 	if inK8s {
 		existingCA, err := LoadExistingCA(secretName)
@@ -596,7 +777,7 @@ func main() {
 	if selfID == "" {
 		selfID = "local"
 	}
-	selfIK, err := issueInstanceCert(cfg, "cert-forge", selfID)
+	selfIK, err := issueInstanceCert(cfg, "cert-forge", selfID, nil)
 	if err != nil {
 		log.Fatalf("[cert-forge] Self cert issuance failed: %v", err)
 	}
@@ -639,6 +820,27 @@ func main() {
 		if err := WriteK8sSecret(secretName, secretData); err != nil {
 			log.Fatalf("[cert-forge] Failed to write K8s Secret: %v", err)
 		}
+
+		// Write kubernetes.io/tls Secrets for any static cert that declared tls_secret.
+		// Traefik requires this type for TLS termination — it will not read Opaque secrets.
+		for i, svc := range cfg.StaticCerts {
+			if svc.TLSSecret == "" {
+				continue
+			}
+			mat := staticMaterials[i]
+			if err := WriteTLSSecret(svc.TLSSecret, mat.CertPEM, mat.KeyPEM); err != nil {
+				log.Fatalf("[cert-forge] Failed to write TLS Secret for %s: %v", svc.Name, err)
+			}
+		}
+
+		// Write the CA cert as tls.ca for Traefik ServersTransport backend verification.
+		if cfg.TraefikCASecret != "" {
+			if err := WriteK8sSecret(cfg.TraefikCASecret, map[string][]byte{
+				"tls.ca": ca.certPEM,
+			}); err != nil {
+				log.Fatalf("[cert-forge] Failed to write Traefik CA Secret: %v", err)
+			}
+		}
 	} else {
 		// Docker Compose: write all material to the certs volume.
 		caPath := filepath.Join(outputDir, "ca.crt")
@@ -668,7 +870,7 @@ func main() {
 	enrollTLS := buildInstanceTLSConfig(selfIK, enrollPool, true) // enrollment mTLS
 
 	// Server 1: plain HTTP on publicPort — /ca only (CA cert is public)
-	publicPort := cfEnvOr("PUBLIC_PORT", "4016")
+	publicPort := cfEnvOr("PUBLIC_PORT", "3022")
 	go func() {
 		log.Printf("[cert-forge] Public server on :%s (plain HTTP — /ca only)", publicPort)
 		if err := http.ListenAndServe(":"+publicPort, buildPublicMux()); err != nil {
@@ -684,6 +886,9 @@ func main() {
 			log.Fatalf("[cert-forge] Enrollment server error: %v", err)
 		}
 	}()
+
+	// Start rotation loop — runs forever in background, no-op in Docker Compose
+	go startRotationLoop(cfg, inK8s, secretName)
 
 	// Server 3: constellation mTLS on port — /sign only
 	log.Printf("[cert-forge] Sign server on :%s (constellation mTLS — /sign only)", port)

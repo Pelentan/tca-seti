@@ -22,7 +22,8 @@ spec:
         {{- include "seti.waitForRedis" . | nindent 8 }}
       containers:
         - name: cert-forge
-          image: {{ .Values.registry }}/cert-forge:{{ .Values.certForge.tag }}
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}cert-forge:{{ .Values.certForge.tag }}
+          imagePullPolicy: Always
           ports:
             - name: sign
               containerPort: {{ .Values.certForge.port }}
