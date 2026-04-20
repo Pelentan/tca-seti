@@ -1,8 +1,8 @@
 # tca-seti — Phase Plan
 
 **Status:** In Progress
-**Last Updated:** 2026-04-12
-**Next Action:** Phase 9 — Interactions triage routing (three paths), AI-lien Lore integration, Results fast-path write. Notifier is deployed and healthy.
+**Last Updated:** 2026-04-20
+**Next Action:** Resume Phase 9 — replace golang-jwt/jwt/v5 with stdlib HMAC/SHA256 JWT implementation across gateway and policy. Then close Phase 9 with Interactions triage routing, AI-lien Lore integration, Results fast-path write.
 
 ---
 
@@ -261,6 +261,37 @@ React/TS    — UI (served by Go static file server)
 
 ### Lessons Learned
 *Populated when phase completes.*
+
+---
+
+## Phase S1 — Supply Chain: All third-party library dependencies eliminated from Go Jobs
+
+**Status:** Complete
+**Deliverable:** Zero third-party Go library dependencies across the entire SETI constellation. All Go Jobs use stdlib only. go-redis replaced with a TCA stdlib Redis client in every Job. golang-jwt pending replacement in gateway and policy.
+**Rationale:** Every external library is a supply chain vector. go-redis introduced transitive dependencies (bsm, cespare/xxhash, dgryski) with no operational benefit at SETI's scale. The TCA Redis client is stdlib-only, contract-backed, and each Job owns its copy — the three-year lifecycle makes it fully replaceable at the Job boundary.
+
+### What Was Done
+
+- Designed and implemented `TCA redis-client` library (`redis.go`) — stdlib `net` only, RESP2 wire protocol, full pub/sub + streams + pipeline support. Contract at `contracts/lib/redis-client.yaml`.
+- Replaced go-redis in: `augur-canis`, `seti-observability`, `gateway`, `contract-test`, `policy`, `plot-test`, `signal-aggregator`, `healthcheck`.
+- `signal-aggregator/redis.go` extended with `SubscribeMulti` — multiple-channel subscribe on a single connection, needed for SETI's own event stream subscriptions.
+- `watchdog` removed entirely — superseded by augur-canis, which now owns the full health check lifecycle.
+- `healthcheck` Dockerfile stage updated across all 14 Job Dockerfiles — `go mod download` and `go.sum` COPY removed from the embedded healthcheck build stage.
+- Stale go-redis entries removed from `lore/go.sum`.
+- `golang-jwt/jwt/v5` identified as third-party (community fork, not official Go team) — replacement with stdlib HMAC/SHA256 JWT deferred to Phase S2.
+
+### Lessons Learned
+- The TCA lib copy-per-Job model is correct. Each Job owns its redis.go, can extend it for its needs (SubscribeMulti), and the contract guarantees behavioral compatibility. The apparent redundancy is intentional isolation.
+- go-redis brought three transitive dependencies whose sole function was hashing and test framework support — none of which SETI uses. Removing one library removed four.
+- Supply chain work surfaces dead code. watchdog was carried through multiple phases because it built cleanly. The redis replacement exposed it as an orphan.
+
+---
+
+## Phase S2 — Supply Chain: golang-jwt replaced with stdlib JWT
+
+**Status:** Pending
+**Deliverable:** gateway and policy use stdlib `crypto/hmac`, `crypto/sha256`, and `encoding/base64` for HS256 JWT signing and verification. Zero third-party Go dependencies across the full constellation.
+**Rationale:** golang-jwt/jwt is a community-maintained fork, not an official Go package. The name is misleading. HS256 over stdlib is 30 lines of code.
 
 ---
 

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/redis/go-redis/v9"
 )
 
 // ---------------------------------------------------------------------------
@@ -126,13 +125,13 @@ func issueServiceAccountJWT(account *ServiceAccount) (string, error) {
 // Redis client
 // ---------------------------------------------------------------------------
 
-var rdb *redis.Client
+var rdb *RedisClient
 
 func connectRedis() {
 	for i := 0; i < 10; i++ {
-		rdb = redis.NewClient(&redis.Options{Addr: redisURL})
+		rdb = NewRedisClient(redisURL)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, err := rdb.Ping(ctx).Result()
+		err := rdb.Ping(ctx)
 		cancel()
 		if err == nil {
 			log.Printf("[policy] Connected to Redis at %s", redisURL)

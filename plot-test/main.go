@@ -14,8 +14,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // ---------------------------------------------------------------------------
@@ -276,14 +274,14 @@ var (
 	runs      = map[string]*PlotRun{}
 	totalRuns atomic.Int64
 	startTime = time.Now()
-	rdb       *redis.Client
+	rdb       *RedisClient
 )
 
 func connectRedis() {
-	rdb = redis.NewClient(&redis.Options{Addr: redisURL})
+	rdb = NewRedisClient(redisURL)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := rdb.Ping(ctx).Err(); err != nil {
+	if err := rdb.Ping(ctx); err != nil {
 		log.Printf("[plot-test] Redis not available: %v — whiff buffer disabled", err)
 		rdb = nil
 	} else {
@@ -299,30 +297,24 @@ func writeStepWhiff(applicationID, runID string, step PlotStep, result StepResul
 	}
 	go func() {
 		key := "seti:whiff:" + applicationID
-		args := &redis.XAddArgs{
-			Stream: key,
-			MaxLen: 10000,
-			Approx: true,
-			ID:     "*",
-			Values: map[string]interface{}{
-				"application_id":     applicationID,
-				"run_id":             runID,
-				"step_number":        fmt.Sprintf("%d", result.StepNumber),
-				"description":        result.Description,
-				"method":             result.RequestMethod,
-				"path":               step.Path,
-				"expected_status":    fmt.Sprintf("%d", result.ExpectedStatus),
-				"actual_status":      fmt.Sprintf("%d", result.ActualStatus),
-				"passed":             fmt.Sprintf("%v", result.Passed),
-				"chain_passed":       fmt.Sprintf("%v", result.ChainPassed),
-				"assertions_passed":  fmt.Sprintf("%d", result.AssertionsPassed),
-				"assertions_failed":  fmt.Sprintf("%d", result.AssertionsFailed),
-				"latency_ms":         fmt.Sprintf("%d", result.LatencyMs),
-				"attempts_count":     fmt.Sprintf("%d", result.AttemptsCount),
-				"recorded_at":        result.ExecutedAt,
-			},
+		fields := map[string]string{
+			"application_id":    applicationID,
+			"run_id":            runID,
+			"step_number":       fmt.Sprintf("%d", result.StepNumber),
+			"description":       result.Description,
+			"method":            result.RequestMethod,
+			"path":              step.Path,
+			"expected_status":   fmt.Sprintf("%d", result.ExpectedStatus),
+			"actual_status":     fmt.Sprintf("%d", result.ActualStatus),
+			"passed":            fmt.Sprintf("%v", result.Passed),
+			"chain_passed":      fmt.Sprintf("%v", result.ChainPassed),
+			"assertions_passed": fmt.Sprintf("%d", result.AssertionsPassed),
+			"assertions_failed": fmt.Sprintf("%d", result.AssertionsFailed),
+			"latency_ms":        fmt.Sprintf("%d", result.LatencyMs),
+			"attempts_count":    fmt.Sprintf("%d", result.AttemptsCount),
+			"recorded_at":       result.ExecutedAt,
 		}
-		if err := rdb.XAdd(context.Background(), args).Err(); err != nil {
+		if _, err := rdb.XAdd(context.Background(), key, 10000, fields); err != nil {
 			log.Printf("[plot-test] whiff buffer write failed for %s step %d: %v",
 				applicationID, result.StepNumber, err)
 		}

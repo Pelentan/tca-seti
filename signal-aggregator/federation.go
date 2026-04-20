@@ -17,8 +17,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // ---------------------------------------------------------------------------
@@ -291,8 +289,7 @@ func connectFederatedApp(appID, acEndpoint, feedRedisURL string) error {
 // ---------------------------------------------------------------------------
 
 func runFederatedFeed(ctx context.Context, app *FederatedApp) {
-	rdb := redis.NewClient(&redis.Options{Addr: app.RedisURL})
-	defer rdb.Close()
+	rdb := NewRedisClient(app.RedisURL)
 
 	for {
 		select {
@@ -301,25 +298,31 @@ func runFederatedFeed(ctx context.Context, app *FederatedApp) {
 		default:
 		}
 
-		pubsub := rdb.Subscribe(ctx, app.FeedChannel)
-		ch := pubsub.Channel()
+		subCtx, subCancel := context.WithCancel(ctx)
+		ch, err := rdb.Subscribe(subCtx, app.FeedChannel)
+		if err != nil {
+			subCancel()
+			log.Printf("[federation] Subscribe failed for %s — retrying in 2s: %v", app.AppID, err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
 		log.Printf("[federation] Subscribed to %s for %s", app.FeedChannel, app.AppID)
 
 		for {
 			select {
 			case <-ctx.Done():
-				pubsub.Close()
+				subCancel()
 				return
 			case msg, ok := <-ch:
 				if !ok {
+					subCancel()
 					goto reconnect
 				}
-				processFederatedEvent(app.AppID, msg.Payload)
+				processFederatedEvent(app.AppID, msg)
 			}
 		}
 
 	reconnect:
-		pubsub.Close()
 		log.Printf("[federation] Feed dropped for %s — reconnecting in 2s", app.AppID)
 		time.Sleep(2 * time.Second)
 	}

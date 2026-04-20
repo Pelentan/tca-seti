@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -9,14 +10,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/redis/go-redis/v9"
-	"bufio"
-	"regexp"
 )
 
 // ---------------------------------------------------------------------------
@@ -325,13 +323,13 @@ var (
 // Redis coordination
 // ---------------------------------------------------------------------------
 
-var rdb *redis.Client
+var rdb *RedisClient
 
 func connectRedis() {
 	for i := 0; i < 10; i++ {
-		rdb = redis.NewClient(&redis.Options{Addr: redisURL})
+		rdb = NewRedisClient(redisURL)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, err := rdb.Ping(ctx).Result()
+		err := rdb.Ping(ctx)
 		cancel()
 		if err == nil {
 			log.Printf("[contract-test] Connected to Redis at %s", redisURL)
@@ -488,24 +486,37 @@ func executeRun(applicationID string) (*TestRun, error) {
 		resultChannel := fmt.Sprintf("tca:contract-results")
 
 		// Subscribe to result channel before publishing
-		sub := rdb.Subscribe(ctx, resultChannel)
+		subCtx, subCancel := context.WithCancel(ctx)
+		ch, err := rdb.Subscribe(subCtx, resultChannel)
+		if err != nil {
+			subCancel()
+			run.FailedTests++
+			run.Results = append(run.Results, TestResult{
+				TestName:      tc.TestName,
+				ServiceName:   tc.ServiceName,
+				Passed:        false,
+				FailureReason: fmt.Sprintf("Failed to subscribe to result channel: %v", err),
+				ExecutedAt:    time.Now().UTC().Format(time.RFC3339),
+			})
+			continue
+		}
 
 		// Publish test request to AC
 		payload, _ := json.Marshal(map[string]interface{}{
-			"request_id":               requestID,
-			"service_name":             tc.ServiceName,
-			"method":                   tc.Method,
-			"path":                     tc.Path,
-			"headers":                  headers,
-			"body":                     tc.Body,
-			"expected_status":          tc.ExpectedStatus,
-						"test_name":                tc.TestName,
-			"contract_version":         tc.ContractVersion,
-			"published_at":             time.Now().UTC().Format(time.RFC3339),
+			"request_id":       requestID,
+			"service_name":     tc.ServiceName,
+			"method":           tc.Method,
+			"path":             tc.Path,
+			"headers":          headers,
+			"body":             tc.Body,
+			"expected_status":  tc.ExpectedStatus,
+			"test_name":        tc.TestName,
+			"contract_version": tc.ContractVersion,
+			"published_at":     time.Now().UTC().Format(time.RFC3339),
 		})
 
-		if err := rdb.Publish(ctx, "tca:contract-requests", payload).Err(); err != nil {
-			sub.Close()
+		if err := rdb.Publish(ctx, "tca:contract-requests", string(payload)); err != nil {
+			subCancel()
 			run.FailedTests++
 			run.Results = append(run.Results, TestResult{
 				TestName:      tc.TestName,
@@ -518,16 +529,15 @@ func executeRun(applicationID string) (*TestRun, error) {
 		}
 
 		// Wait for result
-		resultCtx, cancel := context.WithTimeout(ctx, resultTimeout)
-		ch := sub.Channel()
+		resultCtx, resultCancel := context.WithTimeout(ctx, resultTimeout)
 		var result TestResult
 
-		waitLoop:
+	waitLoop:
 		for {
 			select {
 			case msg := <-ch:
 				var acResult map[string]interface{}
-				if err := json.Unmarshal([]byte(msg.Payload), &acResult); err != nil {
+				if err := json.Unmarshal([]byte(msg), &acResult); err != nil {
 					continue
 				}
 				// Correlate by request_id
@@ -564,8 +574,8 @@ func executeRun(applicationID string) (*TestRun, error) {
 			}
 		}
 
-		cancel()
-		sub.Close()
+		resultCancel()
+		subCancel()
 
 		if result.Passed {
 			run.PassedTests++

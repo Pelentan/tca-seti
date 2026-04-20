@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/redis/go-redis/v9"
 )
 
 // ---------------------------------------------------------------------------
@@ -280,21 +279,23 @@ func broadcastSSE(msg string) {
 }
 
 func startRedisSubscriber() {
-	rdb := redis.NewClient(&redis.Options{Addr: redisURL})
-
 	go func() {
+		rdb := NewRedisClient(redisURL)
 		for {
-			ctx := context.Background()
-			sub := rdb.Subscribe(ctx, "seti:events")
-			ch := sub.Channel()
-			log.Printf("[gateway] Subscribed to seti:events")
-
-			for msg := range ch {
-				broadcastSSE(msg.Payload)
+			ctx, cancel := context.WithCancel(context.Background())
+			ch, err := rdb.Subscribe(ctx, "seti:events")
+			if err != nil {
+				cancel()
+				log.Printf("[gateway] Redis subscribe failed — retrying in 2s: %v", err)
+				time.Sleep(2 * time.Second)
+				continue
 			}
-
+			log.Printf("[gateway] Subscribed to seti:events")
+			for msg := range ch {
+				broadcastSSE(msg)
+			}
+			cancel()
 			log.Printf("[gateway] seti:events subscription dropped — reconnecting in 2s")
-			sub.Close()
 			time.Sleep(2 * time.Second)
 		}
 	}()
