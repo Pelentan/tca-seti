@@ -98,6 +98,15 @@ func (c *RedisClient) reset() {
 	}
 }
 
+// Close closes the underlying TCP connection. Call during graceful shutdown
+// after all in-flight operations have completed.
+func (c *RedisClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reset()
+	return nil
+}
+
 // do sends a command and reads one reply, holding the mutex.
 func (c *RedisClient) do(ctx context.Context, args ...string) (interface{}, error) {
 	c.mu.Lock()
@@ -258,6 +267,19 @@ func isNilReply(v interface{}) bool {
 	return v == nil
 }
 
+// isTimeoutError returns true if err represents a network deadline/timeout.
+// Handles both net.Error and os.SyscallError wrapping (Go 1.22+ on Linux).
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if ne, ok := err.(net.Error); ok {
+		return ne.Timeout()
+	}
+	// Fallback: os.SyscallError wraps the timeout on some platforms
+	return strings.Contains(err.Error(), "i/o timeout")
+}
+
 // ---------------------------------------------------------------------------
 // Key operations
 // ---------------------------------------------------------------------------
@@ -394,7 +416,7 @@ func (c *RedisClient) Subscribe(ctx context.Context, channel string) (<-chan str
 			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 			reply, err := readReply(rw.Reader)
 			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if isTimeoutError(err) {
 					continue // deadline — check ctx and retry
 				}
 				return // real error — close channel
@@ -654,7 +676,7 @@ func (c *RedisClient) SubscribeMulti(ctx context.Context, channels ...string) (<
 			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 			reply, err := readReply(rw.Reader)
 			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if isTimeoutError(err) {
 					continue
 				}
 				return

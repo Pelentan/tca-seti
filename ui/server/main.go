@@ -59,9 +59,12 @@ func main() {
 	log.Printf("[ui] Gateway URL: %s", gatewayURL)
 	log.Printf("[ui] Zero open ports — all connections require client certificate")
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[ui] Server error: %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[ui] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {

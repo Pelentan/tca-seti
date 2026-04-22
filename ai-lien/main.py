@@ -27,7 +27,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 from urllib.parse import urlparse
 from urllib.request import urlopen, Request as URLRequest
-import requests
+import urllib.request
+import urllib.error
 
 logging.basicConfig(level=logging.INFO, format='[ai-lien] %(message)s')
 log = logging.getLogger(__name__)
@@ -282,15 +283,18 @@ def ollama_generate(ollama_url: str, model: str, prompt: str, timeout: int = 120
     """Call Ollama /api/generate and return the full response text."""
     start = time.time()
     try:
-        resp = requests.post(
+        body = json.dumps({'model': model, 'prompt': prompt, 'stream': False}).encode()
+        req = urllib.request.Request(
             f'{ollama_url}/api/generate',
-            json={'model': model, 'prompt': prompt, 'stream': False},
-            timeout=timeout,
+            data=body,
+            headers={'Content-Type': 'application/json'},
+            method='POST',
         )
-        resp.raise_for_status()
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
         latency = int((time.time() - start) * 1000)
         log.info(f'Ollama response: {latency}ms, model={model}')
-        return resp.json().get('response', '')
+        return data.get('response', '')
     except Exception as e:
         latency = int((time.time() - start) * 1000)
         raise RuntimeError(f'Ollama call failed after {latency}ms: {e}')
@@ -640,4 +644,6 @@ if __name__ == '__main__':
     log.info('Lore: reads baselines/incidents before analysis, writes trend points/incidents after')
     log.info('Active provider: fetched from Policy on every request — no local config')
 
+    from shutdown import register_shutdown
+    register_shutdown(server)
     server.serve_forever()

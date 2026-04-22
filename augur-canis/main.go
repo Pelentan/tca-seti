@@ -194,11 +194,19 @@ type CheckResult struct {
 	StubActive        bool   `json:"stub_active"`
 }
 
+var checkShutdown context.CancelFunc
+
 func handleCheckRequests() {
-	ctx := context.Background()
+	outerCtx, outerCancel := context.WithCancel(context.Background())
+	checkShutdown = outerCancel
 
 	for {
-		ch, err := rdb.Subscribe(ctx, checkRequestsChannel)
+		select {
+		case <-outerCtx.Done():
+			return
+		default:
+		}
+		ch, err := rdb.Subscribe(outerCtx, checkRequestsChannel)
 		if err != nil {
 			log.Printf("[augur-canis] Failed to subscribe to %s: %v — retrying in 2s", checkRequestsChannel, err)
 			time.Sleep(2 * time.Second)
@@ -1279,7 +1287,10 @@ func main() {
 	log.Printf("[augur-canis] Initial barks: %d", maxInitialBarks)
 	log.Printf("[augur-canis] Contract tests: %d tests, interval %ds", len(setiContractTests), contractTestIntervalSec)
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[augur-canis] Server error: %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[augur-canis] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }

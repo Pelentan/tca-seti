@@ -18,50 +18,88 @@ spec:
         app: postgres
         {{- include "seti.labels" . | nindent 8 }}
     spec:
-      containers:
+      # fsGroup 70 — postgres user uid in Alpine image.
+      # Ensures the seti-certs Secret volume files are group-readable
+      # by postgres so it can load ssl_key_file without permission errors.
+      securityContext:
+        fsGroup: 70
+      initContainers:
+        {{- include "seti.waitForPostgresPassword" . | nindent 8 }}
+      terminationGracePeriodSeconds: 30
+      containers
         - name: postgres
           image: postgres:{{ .Values.postgres.tag }}
           ports:
             - containerPort: 5432
           env:
             - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: seti-postgres-credentials
-                  key: POSTGRES_USER
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: seti-postgres-credentials
-                  key: POSTGRES_PASSWORD
+              value: {{ .Values.postgres.user | default "postgres" | quote }}
+            - name: POSTGRES_PASSWORD_FILE
+              value: /certs/postgres-password
             - name: POSTGRES_DB
-              valueFrom:
-                secretKeyRef:
-                  name: seti-postgres-credentials
-                  key: POSTGRES_DB
+              value: {{ .Values.postgres.db | default "lore" | quote }}
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
+            # Point postgres at the ConfigMap-mounted postgresql.conf
+            - name: POSTGRES_OPTIONS
+              value: "-c config_file=/etc/postgresql/postgresql.conf"
+          command:
+            - docker-entrypoint.sh
+            - postgres
+            - -c
+            - config_file=/etc/postgresql/postgresql.conf
           volumeMounts:
             - name: postgres-data
               mountPath: /var/lib/postgresql/data
+            - name: seti-certs
+              mountPath: /certs
+              readOnly: true
+            - name: postgres-config
+              mountPath: /etc/postgresql/pg_hba.conf
+              subPath: pg_hba.conf
+              readOnly: true
+            - name: postgres-config
+              mountPath: /etc/postgresql/pg_ident.conf
+              subPath: pg_ident.conf
+              readOnly: true
+            - name: postgres-config
+              mountPath: /etc/postgresql/postgresql.conf
+              subPath: postgresql.conf
+              readOnly: true
+            - name: postgres-config
+              mountPath: /docker-entrypoint-initdb.d/init.sql
+              subPath: init.sql
+              readOnly: true
           readinessProbe:
             exec:
               command:
-                - sh
-                - -c
-                - pg_isready -U $(POSTGRES_USER) -d $(POSTGRES_DB)
+                - pg_isready
+                - -U
+                - {{ .Values.postgres.user | default "postgres" }}
+                - -d
+                - {{ .Values.postgres.db | default "lore" }}
             initialDelaySeconds: 5
             periodSeconds: 5
             failureThreshold: 10
           livenessProbe:
             exec:
               command:
-                - sh
-                - -c
-                - pg_isready -U $(POSTGRES_USER) -d $(POSTGRES_DB)
+                - pg_isready
+                - -U
+                - {{ .Values.postgres.user | default "postgres" }}
+                - -d
+                - {{ .Values.postgres.db | default "lore" }}
             initialDelaySeconds: 30
             periodSeconds: 15
             failureThreshold: 3
+      volumes:
+        - name: seti-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+            defaultMode: 0640
+        - name: postgres-config
+          configMap:
+            name: seti-postgres-config
   volumeClaimTemplates:
     - metadata:
         name: postgres-data
@@ -88,5 +126,4 @@ spec:
   ports:
     - port: 5432
       targetPort: 5432
-  # ClusterIP — postgres is never accessible outside the namespace
   type: ClusterIP

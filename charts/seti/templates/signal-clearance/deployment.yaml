@@ -20,6 +20,7 @@ spec:
       initContainers:
         {{- include "seti.waitForCertForge" . | nindent 8 }}
         {{- include "seti.waitForSetiObservability" . | nindent 8 }}
+      terminationGracePeriodSeconds: 20
       containers:
         - name: signal-clearance
           image: {{ .Values.registry }}/{{ .Values.imagePrefix }}signal-clearance:{{ .Values.signalClearance.tag }}
@@ -53,8 +54,8 @@ spec:
                   fieldPath: metadata.name
             - name: OBSERVABILITY_URL
               value: "https://seti-observability:{{ .Values.setiObservability.port }}"
-            - name: JWT_SECRET
-              value: {{ required "jwtSecret is required" .Values.jwtSecret }}
+            - name: JWT_SECRET_FILE
+              value: /certs/jwt-secret
             - name: AUTH_MODE
               value: {{ .Values.authMode }}
             - name: OIDC_REDIRECT_URI

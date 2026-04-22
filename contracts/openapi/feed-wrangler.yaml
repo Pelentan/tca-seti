@@ -93,6 +93,19 @@ x-tca-observability:
     management. Redis pub/sub operations are not HTTP and are
     instrumented via structured logging only.
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - otp-supervisor-shutdown
+      - unsubscribe-seti-events-channel
+      - close-redis
+      - exit-0
+    notes: >
+      feed-wrangler uses OTP supervision. SIGTERM triggers the supervisor shutdown sequence, which calls terminate/2 on each GenServer in reverse dependency order. The Redis subscription (Redix.PubSub on seti:events) is closed as part of the FeedWrangler.Redis GenServer termination.
+
 servers:
   - url: https://feed-wrangler:4007
     description: Internal SETI network (mTLS enforced)

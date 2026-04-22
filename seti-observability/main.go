@@ -269,7 +269,10 @@ func main() {
 	log.Printf("[observability] Publishing to Redis channel: seti:events")
 	log.Printf("[observability] Known callers: %d services", len(knownServices))
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[observability] Server error: %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[observability] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }

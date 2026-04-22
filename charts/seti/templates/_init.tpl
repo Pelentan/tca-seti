@@ -17,6 +17,30 @@ the seti-certs Secret has been written before the pod starts.
       echo "cert-forge ready."
 {{- end }}
 
+{{/*
+Wait for the postgres-password file to appear in the seti-certs Secret mount.
+cert-forge writes this file during startup; the kubelet Secret sync may lag
+behind the cert-forge HTTP endpoint becoming available.
+*/}}
+{{- define "seti.waitForPostgresPassword" -}}
+- name: wait-for-postgres-password
+  image: busybox:1.36
+  command:
+    - sh
+    - -c
+    - |
+      echo "Waiting for postgres-password in /certs..."
+      until [ -s /certs/postgres-password ]; do
+        echo "postgres-password not yet available, retrying in 2s..."
+        sleep 2
+      done
+      echo "postgres-password ready."
+  volumeMounts:
+    - name: seti-certs
+      mountPath: /certs
+      readOnly: true
+{{- end }}
+
 {{- define "seti.waitForPostgres" -}}
 - name: wait-for-postgres
   image: busybox:1.36

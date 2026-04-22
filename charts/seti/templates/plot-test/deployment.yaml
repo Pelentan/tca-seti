@@ -24,6 +24,7 @@ spec:
         {{- include "seti.waitForSignalAggregator" . | nindent 8 }}
         {{- include "seti.waitForResults" . | nindent 8 }}
         {{- include "seti.waitForInteractions" . | nindent 8 }}
+      terminationGracePeriodSeconds: 20
       containers:
         - name: plot-test
           image: {{ .Values.registry }}/{{ .Values.imagePrefix }}plot-test:{{ .Values.plotTest.tag }}

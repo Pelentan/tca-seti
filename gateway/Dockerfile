@@ -2,8 +2,7 @@
 FROM golang:1.22-bookworm AS builder
 
 WORKDIR /app
-COPY gateway/go.mod gateway/go.sum ./
-RUN go mod download
+COPY gateway/go.mod ./
 COPY gateway/*.go .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o gateway .
 

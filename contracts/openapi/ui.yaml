@@ -84,6 +84,18 @@ x-tca-observability:
     not reported here — the Gateway reports those from its own
     observability instrumentation.
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - exit-0
+    notes: >
+      ui is a static file server with no persistent downstream connections. The mTLS server is stopped, in-flight requests drain, and the process exits.
+
 servers:
   - url: https://seti.cluster.internal
     description: UI served via Gateway external port (TLS)

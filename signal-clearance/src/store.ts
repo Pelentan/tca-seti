@@ -1,4 +1,3 @@
-import { v4 as uuidv4 } from 'uuid';
 import {
   WranglerRecord,
   ClearanceLevel,
@@ -62,7 +61,7 @@ export function upsertWrangler(params: {
   }
 
   const record: WranglerRecord = {
-    wrangler_id: `wrnglr-${uuidv4().split('-')[0]}`,
+    wrangler_id: `wrnglr-${crypto.randomUUID().split('-')[0]}`,
     display_name: params.displayName,
     ad_identity: params.adIdentity,
     clearance_level: params.clearanceLevel,

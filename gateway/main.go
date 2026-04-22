@@ -12,8 +12,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/golang-jwt/jwt/v5"
 )
 
 // ---------------------------------------------------------------------------
@@ -21,7 +19,7 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	jwtSecret         = []byte(mustEnv("JWT_SECRET"))
+	jwtSecret         = mustReadSecretFile("JWT_SECRET_FILE")
 	signalClearanceURL = envOr("SIGNAL_CLEARANCE_URL", "https://signal-clearance:4001")
 	observabilityURL  = envOr("OBSERVABILITY_URL", "https://seti-observability:4011")
 	redisURL          = envOr("REDIS_URL", "redis:6379")
@@ -45,6 +43,25 @@ func mustEnv(key string) string {
 		log.Fatalf("[gateway] Required env var %s is not set", key)
 	}
 	return v
+}
+
+// mustReadSecretFile reads a secret value from the file path given by the
+// named environment variable. Used for secrets written by cert-forge to
+// the /certs volume rather than passed as plain env vars.
+func mustReadSecretFile(envKey string) []byte {
+	path := os.Getenv(envKey)
+	if path == "" {
+		log.Fatalf("[gateway] Required env var %s is not set", envKey)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("[gateway] Failed to read secret file %s: %v", path, err)
+	}
+	data = []byte(strings.TrimSpace(string(data)))
+	if len(data) == 0 {
+		log.Fatalf("[gateway] Secret file %s is empty", path)
+	}
+	return data
 }
 
 func envOr(key, def string) string {
@@ -104,28 +121,8 @@ func reportEvent(callee, method, path string, status int, latencyMs int64) {
 // JWT claims
 // ---------------------------------------------------------------------------
 
-type SETIClaims struct {
-	WranglerID     string `json:"wrangler_id"`
-	ClearanceLevel string `json:"clearance_level"`
-	jwt.RegisteredClaims
-}
-
-func validateJWT(tokenStr string) (*SETIClaims, error) {
-	token, err := jwt.ParseWithClaims(tokenStr, &SETIClaims{},
-		func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-			}
-			return jwtSecret, nil
-		})
-	if err != nil {
-		return nil, err
-	}
-	claims, ok := token.Claims.(*SETIClaims)
-	if !ok || !token.Valid {
-		return nil, fmt.Errorf("invalid token claims")
-	}
-	return claims, nil
+func validateJWT(tokenStr string) (*JWTClaims, error) {
+	return VerifyJWT(tokenStr, jwtSecret)
 }
 
 func bearerToken(r *http.Request) string {
@@ -278,11 +275,20 @@ func broadcastSSE(msg string) {
 	}
 }
 
+var redisShutdown context.CancelFunc
+
 func startRedisSubscriber() {
+	outerCtx, outerCancel := context.WithCancel(context.Background())
+	redisShutdown = outerCancel
 	go func() {
 		rdb := NewRedisClient(redisURL)
 		for {
-			ctx, cancel := context.WithCancel(context.Background())
+			select {
+			case <-outerCtx.Done():
+				return
+			default:
+			}
+			ctx, cancel := context.WithCancel(outerCtx)
 			ch, err := rdb.Subscribe(ctx, "seti:events")
 			if err != nil {
 				cancel()
@@ -653,7 +659,10 @@ func main() {
 	}
 
 	log.Printf("[gateway] Listening on :%s (TLS external, mTLS upstream)", externalPort)
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[gateway] Server error: %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[gateway] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }

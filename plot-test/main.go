@@ -798,9 +798,12 @@ func main() {
 	log.Printf("[plot-test] Plot Store: %s | Signal Aggregator: %s | Interactions: %s",
 		plotStoreURL, signalAggURL, interactionsURL)
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[plot-test] %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[plot-test] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }
 
 // ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ spec:
       initContainers:
         {{- include "seti.waitForCertForge" . | nindent 8 }}
         {{- include "seti.waitForAugurCanis" . | nindent 8 }}
+      terminationGracePeriodSeconds: 20
       containers:
         - name: results
           image: {{ .Values.registry }}/{{ .Values.imagePrefix }}results:{{ .Values.results.tag }}

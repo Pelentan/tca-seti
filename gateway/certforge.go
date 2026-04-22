@@ -271,13 +271,13 @@ func signPayload(mat *CertMaterial, payload []byte) (string, error) {
 func selfRegisterWithAC(mat *CertMaterial, networkEndpoint string) {
 	acURL := cfEnvOr("AUGUR_CANIS_URL", "https://augur-canis:4010")
 
-	for attempt := 1; attempt <= 10; attempt++ {
+	for attempt := 1; ; attempt++ {
 		timestamp := time.Now().UTC().Format(time.RFC3339)
 		payload   := mat.ServiceName + networkEndpoint + mat.Fingerprint + timestamp
 
 		sig, err := signPayload(mat, []byte(payload))
 		if err != nil {
-			log.Printf("[%s] selfRegister: signing failed (attempt %d/10): %v", mat.ServiceName, attempt, err)
+			log.Printf("[%s] selfRegister: signing failed (attempt %d): %v", mat.ServiceName, attempt, err)
 			time.Sleep(3 * time.Second)
 			continue
 		}
@@ -313,7 +313,7 @@ func selfRegisterWithAC(mat *CertMaterial, networkEndpoint string) {
 
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("[%s] selfRegister: AC unreachable (attempt %d/10): %v", mat.ServiceName, attempt, err)
+			log.Printf("[%s] selfRegister: AC unreachable (attempt %d): %v", mat.ServiceName, attempt, err)
 			time.Sleep(3 * time.Second)
 			continue
 		}
@@ -325,10 +325,9 @@ func selfRegisterWithAC(mat *CertMaterial, networkEndpoint string) {
 			log.Printf("[%s] selfRegister: registered with AC (status=%s)", mat.ServiceName, ack["status"])
 			return
 		}
-		log.Printf("[%s] selfRegister: AC returned %d (attempt %d/10)", mat.ServiceName, resp.StatusCode, attempt)
+		log.Printf("[%s] selfRegister: AC returned %d (attempt %d)", mat.ServiceName, resp.StatusCode, attempt)
 		time.Sleep(3 * time.Second)
 	}
-	log.Printf("[%s] selfRegister: giving up after 10 attempts", mat.ServiceName)
 }
 
 func cfEnvOr(key, def string) string {

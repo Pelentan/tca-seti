@@ -57,6 +57,24 @@ defmodule FeedWrangler.EventSubscriber do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
+  # ---------------------------------------------------------------------------
+  # Graceful shutdown — x-tca-lifecycle
+  #
+  # OTP calls terminate/2 when the supervisor shuts down this GenServer.
+  # Explicitly stop the Redix connections so the Redis server sees a clean
+  # disconnect rather than a timeout. The supervisor handles SIGTERM via
+  # Application.stop/1 — no signal handling needed here.
+  # ---------------------------------------------------------------------------
+
+  def terminate(_reason, %{pub_sub: pub_sub, pub_conn: pub_conn}) do
+    if pub_sub,  do: Redix.PubSub.stop(pub_sub)
+    if pub_conn, do: Redix.stop(pub_conn)
+    Logger.info("[feed-wrangler] EventSubscriber terminated — Redis connections closed")
+    :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
+
   defp fan_out(_event, nil), do: :ok
   defp fan_out(event, pub_conn) do
     feeds = FeedWrangler.FeedRegistry.all()

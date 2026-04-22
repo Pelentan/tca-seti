@@ -56,9 +56,13 @@ func main() {
 	defer cancel()
 
 	// Subscribe to result channel BEFORE publishing request to avoid race
-	// where AC publishes before we subscribe
+	// where AC publishes before we subscribe.
+	// Use an independent context for the subscription — the timeout ctx cancelling
+	// would close the channel before the select can handle ctx.Done() cleanly.
 	resultChannel := fmt.Sprintf("tca:check-results:%s", requestID)
-	ch, err := rdb.Subscribe(ctx, resultChannel)
+	subCtx, subCancel := context.WithCancel(context.Background())
+	defer subCancel()
+	ch, err := rdb.Subscribe(subCtx, resultChannel)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[healthcheck] Failed to subscribe to result channel: %v\n", err)
 		// Fall back to Redis connectivity check

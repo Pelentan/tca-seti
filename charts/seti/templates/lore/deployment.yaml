@@ -20,6 +20,7 @@ spec:
       initContainers:
         {{- include "seti.waitForCertForge" . | nindent 8 }}
         {{- include "seti.waitForPostgres" . | nindent 8 }}
+      terminationGracePeriodSeconds: 20
       containers:
         - name: lore
           image: {{ .Values.registry }}/{{ .Values.imagePrefix }}lore:{{ .Values.lore.tag }}
@@ -31,11 +32,12 @@ spec:
               value: {{ .Values.lore.port | quote }}
             - name: SERVICE_NAME
               value: "lore"
-            - name: DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: seti-postgres-credentials
-                  key: DATABASE_URL
+            - name: DATABASE_CERT
+              value: /certs/lore-db.crt
+            - name: DATABASE_KEY
+              value: /certs/lore-db.key
+            - name: DATABASE_CA
+              value: /certs/ca.crt
             - name: REDIS_URL
               value: {{ .Values.redis.url | quote }}
             - name: PUBLIC_PORT
@@ -80,6 +82,7 @@ spec:
         - name: seti-certs
           secret:
             secretName: {{ .Values.certSecretName }}
+            defaultMode: 0600
 ---
 apiVersion: v1
 kind: Service

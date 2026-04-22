@@ -619,7 +619,10 @@ func main() {
 	log.Printf("[signal-aggregator] Listening on :%s (mTLS, TLS 1.3)", port)
 	log.Printf("[signal-aggregator] Self-subscribed to seti — watching tca:events and tca:augur-canis")
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[signal-aggregator] %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[signal-aggregator] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }

@@ -85,6 +85,18 @@ x-tca-observability:
     diagnostic calls (stubbed), and external on-call platform APIs
     (stubbed). All must be reported when implemented.
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - exit-0
+    notes: >
+      interactions holds no persistent downstream connections. In-flight escalation routing requests complete within the drain window. AI-lien calls initiated during the drain window complete or time out before exit.
+
 servers:
   - url: https://interactions:4009
     description: Internal SETI network (mTLS enforced)

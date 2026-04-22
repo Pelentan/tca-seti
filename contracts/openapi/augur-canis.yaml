@@ -157,6 +157,21 @@ x-tca-observability:
     Watchdog check traffic visible in the SETI observability stream
     separately from normal application traffic.
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - unsubscribe-check-requests-channel
+      - stop-health-feed-publisher
+      - close-redis
+      - exit-0
+    notes: >
+      augur-canis holds a Redis subscription on tca:check-requests and publishes to tca:augur-canis. The subscription loop must be cancelled before the Redis connection closes to avoid a blocked goroutine on shutdown.
+
 servers:
   - url: https://augur-canis:4010
     description: Internal SETI network (mTLS enforced) — admin API only

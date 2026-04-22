@@ -45,6 +45,20 @@ defmodule FeedWrangler.Application do
     result
   end
 
+  # ---------------------------------------------------------------------------
+  # Graceful shutdown — x-tca-lifecycle
+  #
+  # OTP calls stop/1 after the supervision tree has been shut down.
+  # SIGTERM → BEAM runtime → Application.stop/1 → Supervisor shutdown cascade
+  # → EventSubscriber.terminate/2 → Redis disconnect.
+  # No explicit signal handling needed — OTP handles it correctly.
+  # ---------------------------------------------------------------------------
+
+  def stop(_state) do
+    Logger.info("[feed-wrangler] Application stopped — shutdown complete")
+    :ok
+  end
+
   defp build_cowboy_opts(port, cert_mat) do
     if cert_mat do
       Logger.info("[feed-wrangler] mTLS certs from cert-forge — starting HTTPS")

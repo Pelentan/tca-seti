@@ -71,6 +71,7 @@ All TCA contracts are OpenAPI 3.1 YAML. Every contract must define:
 - The `servers` block referencing the service name (not a hardcoded IP or port)
 - The `x-tca-observability` block (see Section 6)
 - The `x-tca-security` block (see Section 7)
+- The `x-tca-lifecycle` block (see Section 8)
 
 No other paths or response codes are implemented. If the contract doesn't define it, the Job doesn't return it.
 
@@ -156,7 +157,97 @@ Zero-trust structure is built in from commit zero even when the policy engine is
 
 ---
 
-## 8. The Three-Year Lifecycle
+## 8. Graceful Shutdown — `x-tca-lifecycle`
+
+Every Job contract must include the `x-tca-lifecycle` extension block. Every Job implementation must handle SIGTERM gracefully. This is a structural requirement, not optional cleanup.
+
+### Why This Matters
+
+Kubernetes sends SIGTERM to a pod before termination. If the Job does not catch SIGTERM and drain, the pod exits immediately — mid-request, mid-subscription, mid-write. Callers receive connection errors. Observability events are dropped. Database transactions may be left open. This is not a Kubernetes problem; it is an implementation gap.
+
+The correct shutdown sequence:
+1. Receive SIGTERM
+2. Stop accepting new connections
+3. Drain in-flight requests (with a deadline)
+4. Close downstream connections (Redis, database, subscriptions)
+5. Exit 0
+
+Kubernetes waits `terminationGracePeriodSeconds` (explicit in every Deployment — never rely on the default) before sending SIGKILL. The drain timeout must be less than this period.
+
+### The `x-tca-lifecycle` Contract Block
+
+```yaml
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - close-redis
+      - close-database        # only if the Job has a database connection
+      - unsubscribe-channels  # only if the Job holds Redis subscriptions
+      - exit-0
+```
+
+The steps are **Job-specific** — they reflect exactly what that Job has open. Do not copy steps from another Job's contract. A Job with no database connection does not declare `close-database`. A Job with no Redis subscriptions does not declare `unsubscribe-channels`. The contract is a truthful description of what actually happens on shutdown.
+
+An AI encountering the `x-tca-lifecycle` block implements the specified shutdown sequence without being asked. The steps in the block are not documentation — they are requirements.
+
+### Language Patterns
+
+**Go:**
+```go
+quit := make(chan os.Signal, 1)
+signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+<-quit
+ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+defer cancel()
+server.Shutdown(ctx)  // drains in-flight HTTP requests
+rdb.Close()           // close Redis connection
+db.Close()            // close database connection if applicable
+```
+
+**TypeScript (Node.js):**
+```typescript
+process.on('SIGTERM', async () => {
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  redisClient.disconnect();
+  process.exit(0);
+});
+```
+
+**Python:**
+```python
+import signal, sys
+
+def shutdown(signum, frame):
+    server.server_close()
+    redis_client.close()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, shutdown)
+```
+
+**Elixir:**
+OTP supervision handles SIGTERM correctly by default — the supervisor calls `terminate/2` on each process in reverse dependency order. Jobs using OTP supervision (feed-wrangler) do not need additional signal handling. Verify that `terminate/2` is implemented on any GenServer that holds external connections (Redis, HTTP).
+
+### Kubernetes `terminationGracePeriodSeconds`
+
+Every Deployment must declare `terminationGracePeriodSeconds` explicitly. The value must be greater than the drain timeout declared in the contract. Standard values:
+
+| Job type | drain-timeout-seconds | terminationGracePeriodSeconds |
+|----------|-----------------------|-------------------------------|
+| Standard (HTTP only) | 15 | 20 |
+| With Redis subscription | 15 | 20 |
+| With active DB connections | 15 | 20 |
+| Long-running job executor | 30 | 35 |
+
+Never use the K8s default (30s) — declare it explicitly so the relationship between the drain timeout and the kill deadline is visible and intentional.
+
+---
+
+## 9. The Three-Year Lifecycle
 
 Every Job is designed to be completely rewritten within three years. Design decisions should reflect this.
 
@@ -176,7 +267,7 @@ The practical test for whether a Job is well-bounded: can it be completely rewri
 
 ---
 
-## 9. Kubernetes Deployment Patterns
+## 10. Kubernetes Deployment Patterns
 
 ### The Core Rule
 Pods are the atomic unit in K8s — you cannot scale containers within a Pod independently. Never co-locate services in a single Pod to solve a latency problem. Use Pod Affinity to keep latency-sensitive services on the same node while keeping them in separate Pods.
@@ -200,7 +291,7 @@ Affinity rules keep services close. Spread constraints keep them distributed acr
 
 ---
 
-## 10. Dependency and Build Discipline
+## 11. Dependency and Build Discipline
 
 ### Lockfiles Are Non-Negotiable
 Every package manager produces a lockfile. Every lockfile is committed. Every Dockerfile uses the lockfile-respecting install command.
@@ -290,7 +381,7 @@ Check the current npm version before writing any Node.js Dockerfile. Zero warnin
 
 ---
 
-## 11. Logging Standards
+## 12. Logging Standards
 
 ### Stdout Only
 Services write to stdout and stderr. No file output inside containers. Where that output goes is an infrastructure concern, not an application concern — the application is fully decoupled from the logging destination.
@@ -317,7 +408,7 @@ Container logs are the first diagnostic tool when something is wrong. If a Job i
 
 ---
 
-## 12. Service Exposure
+## 13. Service Exposure
 
 Nothing is externally exposed that does not need to be.
 
@@ -329,7 +420,7 @@ The gateway is the single external entry point. TLS terminates there. JWT valida
 
 ---
 
-## 13. Data Pipeline Design
+## 14. Data Pipeline Design
 
 ### Async Pipelines Require Complete Field Contracts
 When data moves through an async pipeline — stream, queue, worker, storage — every field must be defined and populated at the point of entry. A missing field is not a runtime error at the point of omission; it is a silent contract violation that fails at the far end of the pipeline with no obvious connection to the origin. TCA Vox: `ForwardedVote` was missing `submittedAt` when sent to redis-handler. Redis-handler's validation rejected every vote silently in a background goroutine. The votes appeared to succeed at the API layer. Nothing ever persisted. Define all pipeline fields contractually and validate them at entry.
@@ -342,7 +433,7 @@ Consumer groups created with position `"0"` replay all existing messages from st
 
 ---
 
-## 14. UI Routing in Single-Page Applications
+## 15. UI Routing in Single-Page Applications
 
 ### Route Guards Must Be Symmetric
 When multiple effects or hooks both trigger page-loading logic, they must reference the same skip list. TCA Vox had two `useEffect` hooks that both called `loadPage` with separate skip lists that diverged over time — routes added to one were missed in the other, causing 400 errors on navigation. One canonical skip list, referenced by all effects that need it.
@@ -355,7 +446,7 @@ If an application uses short-lived JWTs plus refresh tokens, the UI must attempt
 
 ---
 
-## 15. SQL and Database Discipline
+## 16. SQL and Database Discipline
 
 ### PostgreSQL Column Alias Rules
 PostgreSQL does not allow referencing a column alias in `GROUP BY` or `WHERE` in the same query. `SELECT x AS value ... GROUP BY value` fails with "column 'value' does not exist." Use the full expression: `GROUP BY answers::json->>0`. This is a known divergence from MySQL and SQLite. All AI-generated PostgreSQL queries must use full expressions in GROUP BY, never aliases.
@@ -368,7 +459,7 @@ Never use `type: number` in an OpenAPI contract for a financial value. Floating 
 
 ---
 
-## 16. Third-Party Rendering Libraries (Vega-Lite)
+## 17. Third-Party Rendering Libraries (Vega-Lite)
 
 ### vconcat Spec Rules
 When composing multiple Vega-Lite charts into a single `vconcat` spec:
@@ -385,7 +476,7 @@ A `layer` spec with one mark on an ordinal x-axis and another on a quantitative 
 
 ---
 
-## 17. Configuration Object Design
+## 18. Configuration Object Design
 
 ### Nest Before Callers Exist
 When a config object accumulates more than 4-5 fields, restructure from flat to nested before callers exist. Flat configs become unmaintainable as they grow. TCA Vox report config started flat and had to be restructured into `style.page`, `style.title`, and `layout` sections mid-development. The restructure required updating every caller. Nested structure is cheaper to add before callers than to retrofit after.
@@ -398,7 +489,7 @@ When a request payload shape changes in a breaking way, keep the old shape worki
 
 ---
 
-## 18. What We've Learned (Running Log)
+## 19. What We've Learned (Running Log)
 
 Most recent first. Add entries as lessons are established — not on every commit, but when a principle is proven or a painful mistake earns its place here.
 
@@ -533,7 +624,7 @@ When the real implementation replaces a stub, no caller changes. That is the tes
 
 ---
 
-## 19. Phase Planning — When in Doubt, Phase It Out
+## 20. Phase Planning — When in Doubt, Phase It Out
 
 For projects larger than a handful of Jobs, build order is an architectural decision that deserves the same deliberate treatment as Job decomposition. The wrong build sequence produces a constellation that cannot be meaningfully tested until it is mostly complete. The right sequence produces a working system at every phase boundary — each phase delivers something observable, verifiable, and useful on its own.
 
@@ -615,7 +706,7 @@ The AI partner maintains PHASE-PLAN.md as source of truth alongside the code. Wh
 
 ---
 
-## 20. Augur Canis — Standard TCA Component
+## 21. Augur Canis — Standard TCA Component
 
 Augur Canis (AC) is a health and behavioral monitoring service for TCA constellations.  It is also a standalone product with its own repository.  Every TCA constellation includes an Augur Canis instance.
 
@@ -685,7 +776,7 @@ Full setup reference: [AC-GUIDELINES.md](AC-GUIDELINES.md).
 
 ---
 
-## 21. cert-forge — PKI Abstraction Layer
+## 22. cert-forge — PKI Abstraction Layer
 
 Every TCA constellation needs certificates. The naive approach — generating all certificates in an init container and distributing them via a shared Docker volume — has a fundamental flaw: every service can read every other service's private key material. A single compromised container exposes the entire constellation's PKI.
 
@@ -838,7 +929,7 @@ All four implementations follow the same flow: fetch CA cert → request instanc
 
 ---
 
-## 22. SETI — Standard TCA Monitoring Constellation
+## 23. SETI — Standard TCA Monitoring Constellation
 
 S.E.T.I. (Search for Erroneous Tessellated Interactions) is the monitoring constellation for TCA applications.  It sits outside the constellations it monitors and watches them through the Augur Canis contract test layer, the Plot test behavioral layer, and the Observability event stream.
 
@@ -871,7 +962,7 @@ The adoption path:  AC first (standalone, one dependency, self-registration snip
 
 ---
 
-## 23. Testing Philosophy — Three Layers
+## 24. Testing Philosophy — Three Layers
 
 TCA testing has three distinct layers.  Each serves a different purpose and requires a different author.
 
@@ -923,7 +1014,7 @@ TCA testing has three distinct layers.  Each serves a different purpose and requ
 
 ---
 
-## 24. Rodeo Clown (Future — Security Boundary Verification)
+## 25. Rodeo Clown (Future — Security Boundary Verification)
 
 Rodeo Clown is a planned SETI sidecar for security boundary verification.  Named deliberately — a Rodeo Clown operates outside the normal structure and absorbs hits.
 

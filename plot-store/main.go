@@ -709,7 +709,10 @@ func main() {
 	log.Printf("[plot-store] Listening on :%s (mTLS, TLS 1.3)", port)
 	log.Printf("[plot-store] Storage: in-memory (Phase 3 — swap PostgreSQL in Phase 4)")
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[plot-store] %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[plot-store] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }

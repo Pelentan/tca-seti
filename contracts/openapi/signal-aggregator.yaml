@@ -104,6 +104,21 @@ x-tca-observability:
     registry reads on startup and registration change events) and
     to the Feed Wr4ngler (forwarding matched events to live feeds).
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - unsubscribe-all-federation-channels
+      - unsubscribe-seti-events-channel
+      - close-redis
+      - exit-0
+    notes: >
+      signal-aggregator holds multiple Redis subscriptions: seti:events for its own constellation, plus one channel per federated application. All subscriptions must be cancelled in order before the Redis connection closes. Federation subscriptions are cancelled first, then the local constellation subscription.
+
 servers:
   - url: https://signal-aggregator:4006
     description: Internal SETI network (mTLS enforced)

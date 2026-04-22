@@ -83,6 +83,19 @@ x-tca-observability:
     critical test path. If Observability Job is unreachable, log locally
     and continue.
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - close-redis
+      - exit-0
+    notes: >
+      contract-test publishes to Redis for run coordination but holds no subscriptions. In-flight test runs are not interrupted — the drain window allows active runs to reach a terminal state before shutdown.
+
 servers:
   - url: https://contract-test:4003
     description: Internal SETI network (mTLS enforced)

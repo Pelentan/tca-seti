@@ -19,6 +19,7 @@ spec:
     spec:
       initContainers:
         {{- include "seti.waitForCertForge" . | nindent 8 }}
+      terminationGracePeriodSeconds: 20
       containers:
         - name: seti-observability
           image: {{ .Values.registry }}/{{ .Values.imagePrefix }}seti-observability:{{ .Values.setiObservability.tag }}

@@ -99,6 +99,19 @@ x-tca-observability:
     observability stream — they show which Plots are executing and
     how the target application responds.
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - close-redis
+      - exit-0
+    notes: >
+      plot-test publishes step results to Redis streams but holds no subscriptions. Active plot test executions should be allowed to reach a terminal step before shutdown — the 15-second drain window covers the typical step execution time.
+
 servers:
   - url: https://plot-test:4004
     description: Internal SETI network (mTLS enforced)

@@ -284,7 +284,10 @@ func main() {
 	log.Printf("[integration] Versioned read-only API — /v1 surface")
 	log.Printf("[integration] Policy: %s | Results: %s", policyURL, resultsURL)
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[integration] %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[integration] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }

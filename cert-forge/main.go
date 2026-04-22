@@ -750,8 +750,9 @@ func main() {
 	}
 
 	// Phase 1: Establish CA — load existing from Secret or generate fresh.
-	secretName := cfEnvOr("K8S_SECRET_NAME", "vox-certs")
+	secretName := cfEnvOr("K8S_SECRET_NAME", "seti-certs")
 	var generatedCA *CA
+	freshCA := false
 	if inK8s {
 		existingCA, err := LoadExistingCA(secretName)
 		if err != nil {
@@ -766,6 +767,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("[cert-forge] CA generation failed: %v", err)
 		}
+		freshCA = true
 	}
 	ca = generatedCA
 	caReadyMu.Lock()
@@ -804,6 +806,15 @@ func main() {
 		staticMaterials = append(staticMaterials, mat)
 	}
 
+	// Phase 4b: Symmetric secrets — postgres password and JWT secret.
+	// Generated once on first startup, persisted in the K8s Secret or on the
+	// certs volume. Loaded from storage on every subsequent startup so they
+	// are stable across cert-forge restarts.
+	postgresPassword, jwtSecret, err := loadOrGenerateSymmetricSecrets(inK8s, secretName)
+	if err != nil {
+		log.Fatalf("[cert-forge] Failed to establish symmetric secrets: %v", err)
+	}
+
 	// Phase 5: Write cert material — Secret (K8s) or files (Docker Compose)
 	if inK8s {
 		secretData := map[string][]byte{
@@ -812,6 +823,8 @@ func main() {
 			"enrollment-ca.crt": enrollmentCA.certPEM,
 			"enrollment.crt":    enrollCert.certPEM,
 			"enrollment.key":    enrollCert.keyPEM,
+			"postgres-password": postgresPassword,
+			"jwt-secret":        jwtSecret,
 		}
 		for _, mat := range staticMaterials {
 			secretData[mat.Name+".crt"] = mat.CertPEM
@@ -819,6 +832,16 @@ func main() {
 		}
 		if err := WriteK8sSecret(secretName, secretData); err != nil {
 			log.Fatalf("[cert-forge] Failed to write K8s Secret: %v", err)
+		}
+
+		// If we generated a fresh CA, roll all constellation deployments so
+		// they re-enroll and pick up the new CA cert. Without this, pods
+		// started before the Secret was written would have stale trust pools.
+		if freshCA && len(cfg.Rotation.Deployments) > 0 {
+			log.Printf("[cert-forge] Fresh CA — rolling %d deployments to pick up new CA cert", len(cfg.Rotation.Deployments))
+			// Small delay to ensure the Secret is fully propagated before pods restart
+			time.Sleep(5 * time.Second)
+			rollDeployments(&cfg.Rotation)
 		}
 
 		// Write kubernetes.io/tls Secrets for any static cert that declared tls_secret.
@@ -852,6 +875,19 @@ func main() {
 		if err := writeEnrollmentMaterial(enrollCert); err != nil {
 			log.Fatalf("[cert-forge] Failed to write enrollment material: %v", err)
 		}
+
+		// Write symmetric secrets as plain files on the certs volume
+		pgPassPath := filepath.Join(outputDir, "postgres-password")
+		if err := os.WriteFile(pgPassPath, postgresPassword, 0600); err != nil {
+			log.Fatalf("[cert-forge] Failed to write postgres-password: %v", err)
+		}
+		log.Printf("[cert-forge] postgres-password written to %s", pgPassPath)
+
+		jwtSecretPath := filepath.Join(outputDir, "jwt-secret")
+		if err := os.WriteFile(jwtSecretPath, jwtSecret, 0600); err != nil {
+			log.Fatalf("[cert-forge] Failed to write jwt-secret: %v", err)
+		}
+		log.Printf("[cert-forge] jwt-secret written to %s", jwtSecretPath)
 
 		for _, mat := range staticMaterials {
 			if err := writeStaticCertFiles(mat); err != nil {

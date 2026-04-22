@@ -1,7 +1,6 @@
-import express, { Request, Response, NextFunction } from 'express';
-import cookieParser from 'cookie-parser';
 import https from 'https';
-import { v4 as uuidv4 } from 'uuid';
+import { App } from './router.js';
+import type { TCARequest as Request, TCAResponse as Response } from './router.js';
 import { buildMTLSOptions, obtainCerts } from './certforge.js';
 import { selfRegister } from './selfregister.js';
 import { reportEvent } from './observability.js';
@@ -42,10 +41,9 @@ import {
 } from './oidc.js';
 import { SignalScope, WranglerType } from './types.js';
 import { devAuthRouter, seedDevGroupMappings } from './devAuth.js';
+import { registerShutdown } from './shutdown.js';
 
-const app = express();
-app.use(express.json());
-app.use(cookieParser());
+const app = new App();
 
 const PORT = parseInt(process.env.PORT || '4001', 10);
 
@@ -88,7 +86,7 @@ app.get('/auth/oidc/authorize', async (req: Request, res: Response) => {
       return;
     }
 
-    const state = uuidv4();
+    const state = crypto.randomUUID();
     pendingStates.set(state, { created_at: Date.now() });
 
     const redirectUrl = buildAuthorizationURL(config, state);
@@ -437,7 +435,7 @@ app.post('/clearance/validate', (req: Request, res: Response) => {
   }
 
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-  const clearanceToken = `ct-${uuidv4()}`;
+  const clearanceToken = `ct-${crypto.randomUUID()}`;
 
   res.json({
     wrangler_id,
@@ -603,7 +601,7 @@ async function main() {
 
   await obtainCerts();
   const tlsOptions = buildMTLSOptions();
-  const server = https.createServer(tlsOptions, app);
+  const server = https.createServer(tlsOptions, (req, res) => app.dispatch(req, res));
 
   server.listen(PORT, () => {
     console.log(`[signal-clearance] Listening on :${PORT} (mTLS, TLS 1.3)`);
@@ -611,6 +609,8 @@ async function main() {
     console.log(`[signal-clearance] Auth mode: ${authMode}`);
     setTimeout(() => selfRegister(), 3000);
   });
+
+  registerShutdown(server);
 }
 
 main().catch(err => {

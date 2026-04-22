@@ -56,8 +56,19 @@ x-tca-security:
 
     cert-forge generates its own certificate on first startup before the HTTP
     server comes up. The bootstrap sequence is: generate own cert in memory →
-    start mTLS server using that cert → generate CA → write CA to volume →
-    generate static certs (star-gazer, etc.) → ready.
+    start mTLS server using that cert → generate CA → load or generate symmetric
+    secrets (postgres-password, jwt-secret) → write all material to Secret →
+    generate static certs (star-gazer, postgres-server, lore-db, etc.) → ready.
+
+    Static certs generated:
+      star-gazer       — federation identity for Signal Aggregator (SANs: star-gazer, localhost)
+      seti-traefik     — Traefik TLS termination cert (SAN: seti.tca.local)
+      postgres-server  — PostgreSQL server TLS cert (SANs: postgres, localhost)
+      lore-db          — lore client cert for PostgreSQL X.509 auth (CN=lore-db)
+
+    Symmetric secrets generated on first startup, persisted in the K8s Secret:
+      postgres-password — superuser password for emergency DBA access only
+      jwt-secret        — HMAC-SHA256 signing key for SETI JWTs
 
 x-tca-observability:
   report-outbound-calls: false
@@ -115,6 +126,18 @@ x-tca-rotation:
     The same ServiceAccount used to write cert Secrets is used for this —
     no additional RBAC is required beyond patch permission on Deployments
     in the constellation namespace.
+
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - exit-0
+    notes: >
+      cert-forge holds no persistent downstream connections. Its three servers (sign, enrollment, public) are stopped in order. In-flight certificate issuance requests complete within the drain window. The in-memory CA and enrollment CA are discarded on exit — they are regenerated from the K8s Secret on next startup.
 
 servers:
   - url: https://cert-forge:3020

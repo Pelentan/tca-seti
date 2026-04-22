@@ -74,6 +74,20 @@ x-tca-observability:
     Results Job's primary traffic is inbound writes from test Jobs
     and outbound reads for Feed Wr4ngler and Signal Aggregator.
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - unsubscribe-result-channels
+      - close-redis
+      - exit-0
+    notes: >
+      results holds Redis subscriptions on tca:check-results:* channels. The subscription must be cancelled before the Redis connection closes. In-flight result writes complete within the drain window.
+
 servers:
   - url: https://results:4008
     description: Internal SETI network (mTLS enforced)

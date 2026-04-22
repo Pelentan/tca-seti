@@ -21,10 +21,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -32,6 +34,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -417,4 +420,78 @@ func PatchDeploymentRestart(name, namespace string) error {
 
 	log.Printf("[cert-forge] Deployment %s/%s restart triggered", namespace, name)
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Symmetric secrets — postgres password and JWT signing secret.
+//
+// Generated once on first startup and persisted in the K8s Secret or on
+// the certs volume. Loaded from storage on every subsequent startup so
+// they survive cert-forge restarts without changing value.
+//
+// Both are 32 random bytes encoded as lowercase hex (64 characters).
+// ---------------------------------------------------------------------------
+
+// loadOrGenerateSymmetricSecrets returns the postgres password and JWT secret,
+// loading from storage if they already exist or generating fresh values if not.
+func loadOrGenerateSymmetricSecrets(inK8s bool, secretName string) (postgresPassword, jwtSecret []byte, err error) {
+	if inK8s {
+		// Try to load existing values from the Secret
+		existing, err := ReadK8sSecret(secretName)
+		if err != nil {
+			log.Printf("[cert-forge] Could not read existing Secret for symmetric secrets: %v — generating fresh", err)
+		}
+		if existing != nil {
+			if v, ok := existing["postgres-password"]; ok && len(v) > 0 {
+				postgresPassword = v
+				log.Printf("[cert-forge] Loaded existing postgres-password from Secret")
+			}
+			if v, ok := existing["jwt-secret"]; ok && len(v) > 0 {
+				jwtSecret = v
+				log.Printf("[cert-forge] Loaded existing jwt-secret from Secret")
+			}
+		}
+	} else {
+		// Docker Compose: try to load from files on the certs volume
+		pgPath := filepath.Join(outputDir, "postgres-password")
+		jwtPath := filepath.Join(outputDir, "jwt-secret")
+
+		if data, err := os.ReadFile(pgPath); err == nil && len(data) > 0 {
+			postgresPassword = data
+			log.Printf("[cert-forge] Loaded existing postgres-password from volume")
+		}
+		if data, err := os.ReadFile(jwtPath); err == nil && len(data) > 0 {
+			jwtSecret = data
+			log.Printf("[cert-forge] Loaded existing jwt-secret from volume")
+		}
+	}
+
+	// Generate any missing values
+	if len(postgresPassword) == 0 {
+		postgresPassword, err = generateSymmetricSecret()
+		if err != nil {
+			return nil, nil, fmt.Errorf("generate postgres-password: %w", err)
+		}
+		log.Printf("[cert-forge] Generated new postgres-password")
+	}
+	if len(jwtSecret) == 0 {
+		jwtSecret, err = generateSymmetricSecret()
+		if err != nil {
+			return nil, nil, fmt.Errorf("generate jwt-secret: %w", err)
+		}
+		log.Printf("[cert-forge] Generated new jwt-secret")
+	}
+
+	return postgresPassword, jwtSecret, nil
+}
+
+// generateSymmetricSecret returns 32 cryptographically random bytes as
+// a lowercase hex string (64 characters). Suitable for passwords and
+// HMAC signing secrets.
+func generateSymmetricSecret() ([]byte, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return nil, fmt.Errorf("rand: %w", err)
+	}
+	return []byte(hex.EncodeToString(raw)), nil
 }

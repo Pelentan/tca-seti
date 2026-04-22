@@ -112,6 +112,18 @@ x-tca-stub:
     - AWS SNS: publish prompt to configured topic ARN
     - Slack: POST to webhook URL with prompt as text field
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - exit-0
+    notes: >
+      notifier is a stub in the open source distribution. Its shutdown is trivial — stop the mTLS server, drain in-flight requests, exit. Production implementations that hold notification provider connections must extend this sequence to close those connections.
+
 servers:
   - url: https://notifier:4300
     description: Internal SETI network (mTLS enforced)

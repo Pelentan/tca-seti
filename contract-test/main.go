@@ -771,9 +771,12 @@ func main() {
 	log.Printf("[contract-test] Contracts path: %s", contractsPath)
 	log.Printf("[contract-test] Test requests route through AC via tca:contract-requests")
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[contract-test] Server error: %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[contract-test] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }
 
 // ---------------------------------------------------------------------------

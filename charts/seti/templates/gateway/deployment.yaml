@@ -21,6 +21,7 @@ spec:
         {{- include "seti.waitForCertForge" . | nindent 8 }}
         {{- include "seti.waitForSignalClearance" . | nindent 8 }}
         {{- include "seti.waitForUI" . | nindent 8 }}
+      terminationGracePeriodSeconds: 20
       containers:
         - name: gateway
           image: {{ .Values.registry }}/{{ .Values.imagePrefix }}gateway:{{ .Values.gateway.tag }}
@@ -52,8 +53,8 @@ spec:
               value: {{ .Values.certForge.enrollmentPort | quote }}
             - name: AUGUR_CANIS_URL
               value: "https://augur-canis:{{ .Values.augurCanis.port }}"
-            - name: JWT_SECRET
-              value: {{ required "jwtSecret is required" .Values.jwtSecret | quote }}
+            - name: JWT_SECRET_FILE
+              value: /certs/jwt-secret
             - name: AUTH_MODE
               value: {{ .Values.authMode | quote }}
             - name: UI_URL

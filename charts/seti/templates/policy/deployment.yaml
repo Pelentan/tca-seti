@@ -20,6 +20,7 @@ spec:
       initContainers:
         {{- include "seti.waitForCertForge" . | nindent 8 }}
         {{- include "seti.waitForAugurCanis" . | nindent 8 }}
+      terminationGracePeriodSeconds: 20
       containers:
         - name: policy
           image: {{ .Values.registry }}/{{ .Values.imagePrefix }}policy:{{ .Values.policy.tag }}
@@ -53,8 +54,8 @@ spec:
                   fieldPath: metadata.name
             - name: OBSERVABILITY_URL
               value: "https://seti-observability:{{ .Values.setiObservability.port }}"
-            - name: JWT_SECRET
-              value: {{ required "jwtSecret is required" .Values.jwtSecret }}
+            - name: JWT_SECRET_FILE
+              value: /certs/jwt-secret
             - name: CONTRACTS_PATH
               value: "/contracts/openapi"
             - name: SELF_GATEWAY_URL

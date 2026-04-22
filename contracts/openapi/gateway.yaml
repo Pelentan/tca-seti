@@ -83,6 +83,21 @@ x-tca-observability:
     The Gateway is the highest-traffic reporter in the constellation —
     fire-and-forget discipline is especially important here.
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - close-sse-client-connections
+      - unsubscribe-seti-events-channel
+      - close-redis
+      - exit-0
+    notes: >
+      gateway holds SSE client connections and a Redis subscription on seti:events. SSE clients must be explicitly closed before the Redis subscription is cancelled — clients still reading from closed channels cause goroutine leaks. The mTLS upstream proxy connections drain with the HTTP server.
+
 servers:
   - url: https://seti.cluster.internal
     description: External SETI gateway (TLS, JWT required on authenticated routes)

@@ -36,3 +36,46 @@ libs:
       Redis operations used across TCA constellations. If an operation
       you need is not listed under capabilities, do not implement it
       ad-hoc — follow instruction 3 above.
+
+  - name: jwks-client
+    contract: contracts/lib/jwks-client.yaml
+    language: typescript
+    source-file: jwks.ts
+    capabilities:
+      - JWKS endpoint fetch and caching
+      - RS256 JWT signature verification (crypto.subtle)
+      - Key rotation handling (unknown kid triggers re-fetch)
+      - Rate-limited JWKS refresh (DoS prevention)
+      - Pluggable cache backend (in-memory default, Redis adapter optional)
+    external-dependencies: none
+    notes: >
+      Use for any TypeScript Job that needs to verify OIDC ID tokens from
+      an external identity provider. Replaces the jose npm package.
+      RS256 only — algorithm agility is a security risk, not a feature.
+      For horizontally scaled deployments, implement the JWKSCache interface
+      backed by Redis (see contract for reference adapter). For single-pod
+      deployments, use the default in-memory cache. If an algorithm other
+      than RS256 is required, do not extend this lib — create a new contract
+      for the new algorithm.
+
+  - name: router
+    contract: contracts/lib/router.yaml
+    language: typescript
+    source-file: router.ts
+    capabilities:
+      - HTTP method routing (GET, POST, PUT, DELETE)
+      - URL parameter extraction (:param syntax)
+      - JSON body parsing
+      - Cookie parsing (request) and setting (response)
+      - Sub-router mounting with path prefix
+      - 404 and 500 error handling
+    external-dependencies: none
+    notes: >
+      Use for any TypeScript Job that needs HTTP routing. Replaces express
+      and cookie-parser. Handler interface is intentionally compatible with
+      express (req, res pattern, same property names) so migrating from
+      express requires only changing the app setup — handler bodies are
+      unchanged. Does not implement middleware chains — cross-cutting concerns
+      go in handler helper functions. If a capability not listed under
+      capabilities is needed, surface the gap to the engineer before reaching
+      for express.
