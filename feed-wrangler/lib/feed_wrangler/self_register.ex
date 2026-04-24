@@ -64,7 +64,7 @@ defmodule FeedWrangler.SelfRegister do
     File.rm(tmp_payload)
     File.rm(tmp_sig)
 
-    body = Jason.encode!(%{
+    body = JSON.encode!(%{
       service_name:     @service_name,
       network_endpoint: @endpoint,
       cert_fingerprint: fingerprint,
@@ -87,7 +87,7 @@ defmodule FeedWrangler.SelfRegister do
     ], stderr_to_stdout: true)
 
     if exit_code == 0 do
-      case Jason.decode(response) do
+      case JSON.decode(response) do
         {:ok, ack} ->
           Logger.info("[feed-wrangler] selfRegister: registered with AC (status=#{ack["status"]})")
         _ ->

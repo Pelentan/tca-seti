@@ -1,0 +1,57 @@
+{
+  "name": "Interactions Notification Flow",
+  "description": "Exercises the two interactions endpoints available through the gateway \u2014 escalation and regeneration notification. Both are fire-and-forget (202 accepted). This plot is intentionally thin \u2014 interactions is a placeholder for a richer notification and escalation system. When escalate and notify/regeneration gain real processing logic, the response bodies will change and this plot will need to be replaced with one that verifies the downstream effects.",
+  "application_id": "seti",
+  "author": "seti",
+  "version": "1.0.0",
+  "tags": [
+    "interactions",
+    "escalation",
+    "notifications"
+  ],
+  "steps": [
+    {
+      "step_number": 1,
+      "description": "Submit an escalation event \u2014 fire-and-forget, 202 accepted. When escalate gains real processing this step will need to verify downstream effects.",
+      "method": "POST",
+      "path": "/interactions/escalate",
+      "body": {
+        "application_id": "seti",
+        "run_id": "plot-test-run",
+        "severity": "warning",
+        "message": "Plot test escalation \u2014 ignore"
+      },
+      "expected_status": 202,
+      "expected_chain": [
+        {
+          "caller": "gateway",
+          "callee": "interactions",
+          "method": "POST",
+          "path": "/escalate"
+        }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 2,
+      "description": "Submit a regeneration notification \u2014 fire-and-forget, 202 accepted. When notify/regeneration gains real processing this step will need to verify downstream effects.",
+      "method": "POST",
+      "path": "/interactions/notify/regeneration",
+      "body": {
+        "application_id": "seti",
+        "plot_id": "",
+        "reason": "Plot test notification \u2014 ignore"
+      },
+      "expected_status": 202,
+      "expected_chain": [
+        {
+          "caller": "gateway",
+          "callee": "interactions",
+          "method": "POST",
+          "path": "/notify/regeneration"
+        }
+      ],
+      "verify_within_seconds": 10
+    }
+  ]
+}

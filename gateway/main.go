@@ -35,6 +35,8 @@ var (
 	feedWranglerURL   = envOr("FEED_WRANGLER_URL", "https://feed-wrangler:4007")
 	policyURL         = envOr("POLICY_URL",       "https://policy:4002")
 	augurCanisURL     = envOr("AUGUR_CANIS_URL",  "https://augur-canis:4010")
+	loreURL           = envOr("LORE_URL",         "https://lore:4110")
+	interactionsURL   = envOr("INTERACTIONS_URL", "https://interactions:4009")
 )
 
 func mustEnv(key string) string {
@@ -603,6 +605,28 @@ func main() {
 	mux.HandleFunc("/available-applications/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		proxyTo(policyURL, r.URL.Path)(w, r)
 	}))
+
+	// Lore — trend-points, incidents, patterns, corrections, baselines
+	mux.HandleFunc("/lore/trend-points", requireAuth(proxyTo(loreURL, "/trend-points")))
+	mux.HandleFunc("/lore/trend-points/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		proxyTo(loreURL, strings.TrimPrefix(r.URL.Path, "/lore"))(w, r)
+	}))
+	mux.HandleFunc("/lore/incidents", requireAuth(proxyTo(loreURL, "/incidents")))
+	mux.HandleFunc("/lore/incidents/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		proxyTo(loreURL, strings.TrimPrefix(r.URL.Path, "/lore"))(w, r)
+	}))
+	mux.HandleFunc("/lore/patterns", requireAuth(proxyTo(loreURL, "/patterns")))
+	mux.HandleFunc("/lore/patterns/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		proxyTo(loreURL, strings.TrimPrefix(r.URL.Path, "/lore"))(w, r)
+	}))
+	mux.HandleFunc("/lore/corrections", requireAuth(proxyTo(loreURL, "/corrections")))
+	mux.HandleFunc("/lore/baselines/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		proxyTo(loreURL, strings.TrimPrefix(r.URL.Path, "/lore"))(w, r)
+	}))
+
+	// Interactions — escalations and regeneration notifications
+	mux.HandleFunc("POST /interactions/escalate", requireAuth(proxyTo(interactionsURL, "/escalate")))
+	mux.HandleFunc("POST /interactions/notify/regeneration", requireAuth(proxyTo(interactionsURL, "/notify/regeneration")))
 
 	// All other routes — proxy to UI service (serves the React SPA)
 	// The UI handles client-side routing for /dev-login, /, /dashboard, etc.

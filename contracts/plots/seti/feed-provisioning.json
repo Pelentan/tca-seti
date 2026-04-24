@@ -1,9 +1,9 @@
 {
   "name": "Feed Provisioning",
-  "description": "Creates a signal feed via Feed Wr4ngler and verifies it exists. Tests the scoped signal delivery provisioning path. Feed Wr4ngler is the Elixir OTP service — this plot also verifies the Elixir runtime is stable.",
+  "description": "Creates a signal feed via Feed Wr4ngler, verifies it exists, then deletes it. Tests the scoped signal delivery provisioning path end-to-end. Feed Wr4ngler is the Elixir OTP service — this plot also verifies the Elixir runtime is stable.",
   "application_id": "seti",
   "author": "seti",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "tags": ["feed-wrangler", "elixir", "feeds"],
   "steps": [
     {
@@ -17,6 +17,9 @@
         "filters": []
       },
       "expected_status": 201,
+      "capture": [
+        { "name": "feed_id", "path": "feed_id" }
+      ],
       "expected_chain": [
         { "caller": "gateway", "callee": "feed-wrangler", "method": "POST", "path": "/feeds" }
       ],
@@ -32,6 +35,13 @@
         { "caller": "gateway", "callee": "feed-wrangler", "method": "GET", "path": "/feeds" }
       ],
       "verify_within_seconds": 10
+    },
+    {
+      "step_number": 3,
+      "description": "Delete the test feed — no orphans",
+      "method": "DELETE",
+      "path": "/feeds/{feed_id}",
+      "expected_status": 200
     }
   ]
 }

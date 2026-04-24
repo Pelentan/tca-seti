@@ -458,6 +458,22 @@ func handleGetApplication(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	if r.Method == http.MethodDelete {
+		mu.Lock()
+		delete(applications, appID)
+		// Remove associated service account
+		delete(accounts, fmt.Sprintf("svc-%s", appID))
+		mu.Unlock()
+		log.Printf("[policy] Application deleted: %s", appID)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":         "ok",
+			"message":        fmt.Sprintf("Application %s deleted", appID),
+			"application_id": appID,
+		})
+		return
+	}
+
 	json.NewEncoder(w).Encode(app)
 }
 

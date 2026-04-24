@@ -94,13 +94,14 @@ type PlotStep struct {
 	ExpectCallChain []ExpectedCall      `json:"expect_call_chain,omitempty"`
 
 	// Legacy flat format — backward compatible
-	Method         string            `json:"method,omitempty"`
-	Path           string            `json:"path,omitempty"`
-	Headers        map[string]string `json:"headers,omitempty"`
-	Body           interface{}       `json:"body,omitempty"`
-	ExpectedStatus int               `json:"expected_status,omitempty"`
-	ExpectedChain  []ExpectedCall    `json:"expected_chain,omitempty"`
-	VerifyWithin   int               `json:"verify_within_seconds,omitempty"`
+	Method           string            `json:"method,omitempty"`
+	Path             string            `json:"path,omitempty"`
+	Headers          map[string]string `json:"headers,omitempty"`
+	Body             interface{}       `json:"body,omitempty"`
+	ExpectedStatus   int               `json:"expected_status,omitempty"`
+	ExpectedStatuses []int             `json:"expected_statuses,omitempty"` // any one match passes; overrides expected_status
+	ExpectedChain    []ExpectedCall    `json:"expected_chain,omitempty"`
+	VerifyWithin     int               `json:"verify_within_seconds,omitempty"`
 }
 
 // Normalize resolves dual-format fields into canonical flat fields.
@@ -126,6 +127,9 @@ func (s *PlotStep) Normalize(captures map[string]string) {
 		s.Path = applyCaptures(s.Path, captures)
 		if bodyStr, ok := s.Body.(string); ok {
 			s.Body = applyCaptures(bodyStr, captures)
+		}
+		for i := range s.ExpectedChain {
+			s.ExpectedChain[i].Path = applyCaptures(s.ExpectedChain[i].Path, captures)
 		}
 	}
 }
@@ -506,6 +510,9 @@ func isRetryable(status int, err error) bool {
 	if err != nil {
 		return true // network-level failure: connection refused, timeout, DNS
 	}
+	if status == http.StatusNotImplemented {
+		return false // 501 Not Implemented is permanent, not transient
+	}
 	return status >= 500 // 5xx: pod degraded or mid-recycle
 }
 
@@ -608,6 +615,22 @@ func executeRun(plotID, applicationID string) *PlotRun {
 			RequestBody:    step.Body,
 			ResponseBody:   responseBody,
 		}
+		// When only expected_statuses is used, populate ExpectedStatus with
+		// the actual status if it matched (so the UI shows a clean pass),
+		// or the first listed value if it didn't (so the UI shows a real mismatch).
+		if step.ExpectedStatus == 0 && len(step.ExpectedStatuses) > 0 {
+			matched := false
+			for _, s := range step.ExpectedStatuses {
+				if actualStatus == s {
+					stepResult.ExpectedStatus = actualStatus
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				stepResult.ExpectedStatus = step.ExpectedStatuses[0]
+			}
+		}
 
 		if attempts > 1 {
 			log.Printf("[plot-test] Step %d required %d attempts", step.StepNumber, attempts)
@@ -619,6 +642,14 @@ func executeRun(plotID, applicationID string) *PlotRun {
 			stepResult.FailureReason = execErr.Error()
 		} else {
 			statusPassed := actualStatus == step.ExpectedStatus
+		if !statusPassed && len(step.ExpectedStatuses) > 0 {
+			for _, s := range step.ExpectedStatuses {
+				if actualStatus == s {
+					statusPassed = true
+					break
+				}
+			}
+		}
 
 			// Extract capture values from response body for use in subsequent steps
 			for _, cap := range step.Capture {
@@ -656,8 +687,13 @@ func executeRun(plotID, applicationID string) *PlotRun {
 			assertionsPassed2 := assertionsFailed == 0
 			stepResult.Passed = statusPassed && chainPassed && assertionsPassed2
 			if !statusPassed {
-				stepResult.FailureReason = fmt.Sprintf("Expected status %d, got %d",
-					step.ExpectedStatus, actualStatus)
+				if len(step.ExpectedStatuses) > 0 {
+					stepResult.FailureReason = fmt.Sprintf("Expected one of %v, got %d",
+						step.ExpectedStatuses, actualStatus)
+				} else {
+					stepResult.FailureReason = fmt.Sprintf("Expected status %d, got %d",
+						step.ExpectedStatus, actualStatus)
+				}
 			} else if !assertionsPassed2 {
 				stepResult.FailureReason = fmt.Sprintf("%d assertion(s) failed", assertionsFailed)
 			} else if !chainPassed {

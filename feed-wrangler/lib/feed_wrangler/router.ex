@@ -6,7 +6,7 @@ defmodule FeedWrangler.Router do
 
   plug Plug.Parsers,
     parsers: [:json],
-    json_decoder: Jason
+    json_decoder: JSON
 
   plug :match
   plug :dispatch
@@ -81,6 +81,6 @@ defmodule FeedWrangler.Router do
   defp send_json(conn, status, body) do
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(body))
+    |> send_resp(status, JSON.encode!(body))
   end
 end

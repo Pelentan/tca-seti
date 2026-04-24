@@ -1,0 +1,32 @@
+{
+  "name": "Signal Aggregator Subscription Access",
+  "description": "Verifies that the signal aggregator's subscription registry and event stream are accessible through the gateway. Subscriptions hold the per-feed delivery routing state — confirming they are readable validates that signal routing infrastructure is operational. Signal events confirm the event bus is live.",
+  "application_id": "seti",
+  "author": "seti",
+  "version": "1.0.0",
+  "tags": ["signal-aggregator", "subscriptions", "events"],
+  "steps": [
+    {
+      "step_number": 1,
+      "description": "List active subscriptions from Signal Aggregator",
+      "method": "GET",
+      "path": "/subscriptions",
+      "expected_status": 200,
+      "expected_chain": [
+        { "caller": "gateway", "callee": "signal-aggregator", "method": "GET", "path": "/subscriptions" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 2,
+      "description": "Query recent signal events — confirms the event bus is live and gateway routes correctly",
+      "method": "GET",
+      "path": "/signal-events",
+      "expected_status": 200,
+      "expected_chain": [
+        { "caller": "gateway", "callee": "signal-aggregator", "method": "GET", "path": "/events" }
+      ],
+      "verify_within_seconds": 10
+    }
+  ]
+}

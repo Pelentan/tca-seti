@@ -86,13 +86,14 @@ type PlotStep struct {
 	ExpectCallChain  []ExpectedCall      `json:"expect_call_chain,omitempty"`
 
 	// Legacy flat format — still accepted for backward compatibility
-	Method         string            `json:"method,omitempty"`
-	Path           string            `json:"path,omitempty"`
-	Headers        map[string]string `json:"headers,omitempty"`
-	Body           interface{}       `json:"body,omitempty"`
-	ExpectedStatus int               `json:"expected_status,omitempty"`
-	ExpectedChain  []ExpectedCall    `json:"expected_chain,omitempty"`
-	VerifyWithin   int               `json:"verify_within_seconds,omitempty"`
+	Method           string            `json:"method,omitempty"`
+	Path             string            `json:"path,omitempty"`
+	Headers          map[string]string `json:"headers,omitempty"`
+	Body             interface{}       `json:"body,omitempty"`
+	ExpectedStatus   int               `json:"expected_status,omitempty"`
+	ExpectedStatuses []int             `json:"expected_statuses,omitempty"` // any one match passes
+	ExpectedChain    []ExpectedCall    `json:"expected_chain,omitempty"`
+	VerifyWithin     int               `json:"verify_within_seconds,omitempty"`
 }
 
 // Normalize resolves the dual-format PlotStep into canonical fields.

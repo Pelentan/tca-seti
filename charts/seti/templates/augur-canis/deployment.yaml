@@ -27,9 +27,12 @@ spec:
           imagePullPolicy: Always
           ports:
             - containerPort: {{ .Values.augurCanis.port }}
+            - containerPort: {{ .Values.augurCanis.uiPort }}
           env:
             - name: PORT
               value: {{ .Values.augurCanis.port | quote }}
+            - name: AC_UI_PORT
+              value: {{ .Values.augurCanis.uiPort | quote }}
             - name: REDIS_URL
               value: {{ .Values.redis.url | quote }}
             - name: SERVICE_NAME
@@ -105,5 +108,9 @@ spec:
   selector:
     app: augur-canis
   ports:
-    - port: {{ .Values.augurCanis.port }}
+    - name: mtls
+      port: {{ .Values.augurCanis.port }}
       targetPort: {{ .Values.augurCanis.port }}
+    - name: ui
+      port: {{ .Values.augurCanis.uiPort }}
+      targetPort: {{ .Values.augurCanis.uiPort }}

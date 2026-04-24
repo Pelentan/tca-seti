@@ -447,7 +447,7 @@ paths:
   # RESULTS — proxied to Results via Feed Wr4ngler clearance check
   # ---------------------------------------------------------------------------
 
-  /results/contract:
+  /contract-results:
     get:
       tags: [results]
       summary: Query Contract Test results
@@ -515,7 +515,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
-  /results/plot:
+  /plot-results:
     get:
       tags: [results]
       summary: Query Plot Test results
@@ -902,3 +902,131 @@ components:
         message:
           type: string
           example: "JWT clearance level 'connie-wr4ngler' does not grant access to anomaly feeds"
+
+  # ---------------------------------------------------------------------------
+  # Lore — proxied from lore:4110 via /lore/* prefix
+  # ---------------------------------------------------------------------------
+
+  /lore/trend-points:
+    get:
+      tags: [lore]
+      summary: List trend-points
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: Trend-point list }
+        '401': { description: Unauthorized }
+    post:
+      tags: [lore]
+      summary: Record a trend-point
+      security: [{ BearerAuth: [] }]
+      responses:
+        '201': { description: Recorded }
+        '400': { description: Invalid input }
+        '401': { description: Unauthorized }
+
+  /lore/incidents:
+    get:
+      tags: [lore]
+      summary: List incidents
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: Incident list }
+        '401': { description: Unauthorized }
+    post:
+      tags: [lore]
+      summary: Open an incident
+      security: [{ BearerAuth: [] }]
+      responses:
+        '201': { description: Created }
+        '400': { description: Invalid input }
+        '401': { description: Unauthorized }
+
+  /lore/incidents/{incident_id}/resolve:
+    post:
+      tags: [lore]
+      summary: Resolve an incident
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: incident_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Resolved }
+        '404': { description: Not found }
+        '401': { description: Unauthorized }
+
+  /lore/patterns:
+    get:
+      tags: [lore]
+      summary: List patterns
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: Pattern list }
+        '401': { description: Unauthorized }
+    post:
+      tags: [lore]
+      summary: Record a pattern
+      security: [{ BearerAuth: [] }]
+      responses:
+        '201': { description: Created }
+        '400': { description: Invalid input }
+        '401': { description: Unauthorized }
+
+  /lore/corrections:
+    get:
+      tags: [lore]
+      summary: List corrections (stub — 501 until implemented)
+      security: [{ BearerAuth: [] }]
+      responses:
+        '501': { description: Not implemented }
+        '401': { description: Unauthorized }
+    post:
+      tags: [lore]
+      summary: Submit a correction (stub — 501 until implemented)
+      security: [{ BearerAuth: [] }]
+      responses:
+        '501': { description: Not implemented }
+        '401': { description: Unauthorized }
+
+  /lore/baselines/{application_id}/{job_name}:
+    get:
+      tags: [lore]
+      summary: Get baseline for a job
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: application_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: job_name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Baseline }
+        '404': { description: Not found }
+        '401': { description: Unauthorized }
+
+  # ---------------------------------------------------------------------------
+  # Interactions — proxied from interactions:4009 via /interactions/* prefix
+  # ---------------------------------------------------------------------------
+
+  /interactions/escalate:
+    post:
+      tags: [interactions]
+      summary: Escalate an event
+      security: [{ BearerAuth: [] }]
+      responses:
+        '202': { description: Accepted }
+        '400': { description: Invalid input }
+        '401': { description: Unauthorized }
+
+  /interactions/notify/regeneration:
+    post:
+      tags: [interactions]
+      summary: Notify of regeneration event
+      security: [{ BearerAuth: [] }]
+      responses:
+        '202': { description: Accepted }
+        '401': { description: Unauthorized }

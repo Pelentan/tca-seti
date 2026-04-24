@@ -75,6 +75,10 @@ spec:
               value: "https://policy:{{ .Values.policy.port }}"
             - name: FEED_WRANGLER_URL
               value: "https://feed-wrangler:{{ .Values.feedWrangler.port }}"
+            - name: LORE_URL
+              value: "https://lore:{{ .Values.lore.port }}"
+            - name: INTERACTIONS_URL
+              value: "https://interactions:{{ .Values.interactions.port }}"
             - name: HOSTNAME
               valueFrom:
                 fieldRef:

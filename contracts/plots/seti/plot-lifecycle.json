@@ -28,6 +28,9 @@
         ]
       },
       "expected_status": 201,
+      "capture": [
+        { "name": "created_plot_id", "path": "plot_id" }
+      ],
       "expected_chain": [
         { "caller": "gateway", "callee": "plot-store", "method": "POST", "path": "/plots" }
       ],
@@ -41,6 +44,17 @@
       "expected_status": 200,
       "expected_chain": [
         { "caller": "gateway", "callee": "plot-store", "method": "GET", "path": "/plots" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 3,
+      "description": "Delete the lifecycle verification plot — no orphans",
+      "method": "DELETE",
+      "path": "/plots/{created_plot_id}",
+      "expected_status": 200,
+      "expected_chain": [
+        { "caller": "gateway", "callee": "plot-store", "method": "DELETE", "path": "/plots/{created_plot_id}" }
       ],
       "verify_within_seconds": 10
     }

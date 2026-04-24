@@ -426,7 +426,7 @@ spec:
         - port: {{ .Values.plotTest.port }}
 ---
 # ---------------------------------------------------------------------------
-# interactions — accepts from plot-test and augur-canis
+# interactions — accepts from gateway, plot-test and augur-canis
 # ---------------------------------------------------------------------------
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -441,6 +441,9 @@ spec:
     - Ingress
   ingress:
     - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
         - podSelector:
             matchLabels:
               app: plot-test
@@ -526,7 +529,7 @@ spec:
         - port: {{ .Values.aiLien.port }}
 ---
 # ---------------------------------------------------------------------------
-# lore — accepts from ai-lien, interactions, augur-canis
+# lore — accepts from gateway, ai-lien, interactions, augur-canis
 # ---------------------------------------------------------------------------
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -541,6 +544,9 @@ spec:
     - Ingress
   ingress:
     - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
         - podSelector:
             matchLabels:
               app: ai-lien

@@ -926,6 +926,13 @@ func main() {
 	// Start rotation loop — runs forever in background, no-op in Docker Compose
 	go startRotationLoop(cfg, inK8s, secretName)
 
+	// Self-register with Augur Canis — fires after a short delay to let
+	// the sign server bind.  Uses in-memory selfIK — no file reads needed.
+	go func() {
+		time.Sleep(5 * time.Second)
+		selfRegisterWithAC(selfIK, caPool)
+	}()
+
 	// Server 3: constellation mTLS on port — /sign only
 	log.Printf("[cert-forge] Sign server on :%s (constellation mTLS — /sign only)", port)
 	log.Printf("[cert-forge] cert-forge fully operational.")

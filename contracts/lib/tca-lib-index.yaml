@@ -37,6 +37,23 @@ libs:
       you need is not listed under capabilities, do not implement it
       ad-hoc — follow instruction 3 above.
 
+  - name: redis-elixir
+    contract: contracts/lib/redis-elixir.yaml
+    language: elixir
+    source-file: redis.ex
+    capabilities:
+      - Redis pub/sub subscribe (event-driven, spawned process, push messages to pid)
+      - Redis pub/sub publish (PUBLISH command via command connection)
+      - Synchronous command connections (any RESP2 request/response command)
+    external-dependencies: none
+    notes: >
+      Use for any Elixir Job that needs Redis.  Replaces the redix hex
+      package.  Two connection modes are intentionally separate — command
+      connections for request/response, subscriber process for push messages.
+      GenServer-safe: subscribe/4 does not block a GenServer handler with a
+      receive/after loop.  If an operation you need is not listed under
+      capabilities, do not implement it ad-hoc — follow instruction 3 above.
+
   - name: jwks-client
     contract: contracts/lib/jwks-client.yaml
     language: typescript

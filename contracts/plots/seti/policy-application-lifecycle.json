@@ -1,0 +1,58 @@
+{
+  "name": "Policy Application Lifecycle",
+  "description": "Registers a test application with Policy, retrieves it, then deletes it. Exercises the full application management lifecycle through the gateway. Policy derives application_id deterministically from display_name ('Plot Test Application' → 'plot-test-application'), so no capture is needed and the plot is fully idempotent — step 1 cleans up any orphan from a prior run before registering fresh.",
+  "application_id": "seti",
+  "author": "seti",
+  "version": "2.0.0",
+  "tags": ["policy", "applications", "lifecycle"],
+  "steps": [
+    {
+      "step_number": 1,
+      "description": "Pre-cleanup — delete any orphaned test application from a prior run. 200 = cleaned up, 404 = nothing to clean, both pass.",
+      "method": "DELETE",
+      "path": "/applications/plot-test-application",
+      "expected_statuses": [200, 404]
+    },
+    {
+      "step_number": 2,
+      "description": "Register the test application — ID is derived as 'plot-test-application'",
+      "method": "POST",
+      "path": "/applications/register",
+      "body": {
+        "display_name": "Plot Test Application",
+        "gateway_url": "https://plot-test:4004",
+        "redis_url": "redis:6379",
+        "repository_url": "https://github.com/plot-test/app",
+        "contracts_path": "contracts/",
+        "environments": ["development"]
+      },
+      "expected_status": 201,
+      "expected_chain": [
+        { "caller": "gateway", "callee": "policy", "method": "POST", "path": "/applications/register" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 3,
+      "description": "Retrieve the registered application by its deterministic ID",
+      "method": "GET",
+      "path": "/applications/plot-test-application",
+      "expected_status": 200,
+      "expected_chain": [
+        { "caller": "gateway", "callee": "policy", "method": "GET", "path": "/applications/plot-test-application" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 4,
+      "description": "Delete the test application — no orphans",
+      "method": "DELETE",
+      "path": "/applications/plot-test-application",
+      "expected_status": 200,
+      "expected_chain": [
+        { "caller": "gateway", "callee": "policy", "method": "DELETE", "path": "/applications/plot-test-application" }
+      ],
+      "verify_within_seconds": 10
+    }
+  ]
+}

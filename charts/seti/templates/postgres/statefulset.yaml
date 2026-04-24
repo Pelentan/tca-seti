@@ -26,7 +26,7 @@ spec:
       initContainers:
         {{- include "seti.waitForPostgresPassword" . | nindent 8 }}
       terminationGracePeriodSeconds: 30
-      containers
+      containers:
         - name: postgres
           image: postgres:{{ .Values.postgres.tag }}
           ports:

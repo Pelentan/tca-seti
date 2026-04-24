@@ -41,6 +41,7 @@ lore:
 augurCanis:
   tag: latest
   port: 4010
+  uiPort: 4099
 
 signalClearance:
   tag: latest

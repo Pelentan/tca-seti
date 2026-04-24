@@ -1,0 +1,44 @@
+{
+  "name": "Augur Canis On-Demand Suite",
+  "description": "Triggers an on-demand AC contract test suite via the gateway admin route and verifies the trigger is accepted. Confirms that the gateway correctly proxies admin commands to Augur Canis and that AC's on-demand suite mechanism is operational. The suite itself runs asynchronously — this plot tests the trigger path, not the suite results.",
+  "application_id": "seti",
+  "author": "seti",
+  "version": "1.0.0",
+  "tags": ["augur-canis", "contract-tests", "admin"],
+  "steps": [
+    {
+      "step_number": 1,
+      "description": "Confirm AC is healthy and reporting registered jobs before triggering",
+      "method": "GET",
+      "path": "/augur-canis/health",
+      "expected_status": 200,
+      "expected_chain": [
+        { "caller": "gateway", "callee": "augur-canis", "method": "GET", "path": "/health" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 2,
+      "description": "Trigger on-demand contract test suite via gateway admin route — returns accepted immediately",
+      "method": "POST",
+      "path": "/augur-canis/run-contract-tests",
+      "body": {},
+      "expected_status": 200,
+      "expected_chain": [
+        { "caller": "gateway", "callee": "augur-canis", "method": "POST", "path": "/run-contract-tests" }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 3,
+      "description": "List recent contract suite results — confirms AC persists suite runs after trigger",
+      "method": "GET",
+      "path": "/augur-canis/contract-suites",
+      "expected_status": 200,
+      "expected_chain": [
+        { "caller": "gateway", "callee": "augur-canis", "method": "GET", "path": "/contract-suites" }
+      ],
+      "verify_within_seconds": 15
+    }
+  ]
+}
