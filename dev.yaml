@@ -1,0 +1,82 @@
+# charts/seti/values/dev.yaml
+# k3d local development overrides.
+# Usage: helm install seti ./charts/seti -f charts/seti/values/dev.yaml
+
+# k3d registry — push via localhost:5000, pull via tca-registry:5000
+registry: tca-registry:5000
+
+# Image name prefix — prevents collision with other constellations
+# in the shared registry. Images are pushed as seti-<service>:dev
+imagePrefix: seti-
+
+certForge:
+  tag: dev
+
+redis:
+  tag: "7-alpine"
+
+setiObservability:
+  tag: dev
+
+postgres:
+  tag: "16-alpine"
+  storage: 1Gi
+
+lore:
+  tag: dev
+
+augurCanis:
+  tag: dev
+
+signalClearance:
+  tag: dev
+
+policy:
+  tag: dev
+
+contractTest:
+  tag: dev
+
+results:
+  tag: dev
+
+signalAggregator:
+  tag: dev
+
+plotStore:
+  tag: dev
+
+plotTest:
+  tag: dev
+
+interactions:
+  tag: dev
+
+feedWrangler:
+  tag: dev
+
+integration:
+  tag: dev
+
+connieAgent:
+  tag: dev
+  syncIntervalMinutes: "10"
+
+aiLien:
+  tag: dev
+
+notifier:
+  tag: dev
+
+ui:
+  tag: dev
+
+gateway:
+  tag: dev
+
+authMode: "dev"
+gateway:
+  tag: dev
+  externalHostname: "seti.tca.local"
+
+remoteApps: {}

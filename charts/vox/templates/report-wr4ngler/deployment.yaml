@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: report-wr4ngler
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: report-wr4ngler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: report-wr4ngler
+  template:
+    metadata:
+      labels:
+        app: report-wr4ngler
+        {{- include "vox.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "vox.waitForCertForge" . | nindent 8 }}
+        {{- include "vox.waitForRedis" . | nindent 8 }}
+        {{- include "vox.waitForObservability" . | nindent 8 }}
+        {{- include "vox.waitForAugurCanis" . | nindent 8 }}
+      containers:
+        - name: report-wr4ngler
+          image: {{ .Values.registry }}/report-wr4ngler:{{ .Values.reportWr4ngler.tag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ .Values.reportWr4ngler.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.reportWr4ngler.port | quote }}
+            - name: SERVICE_NAME
+              value: "report-wr4ngler"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: REDIS_URL
+              value: "redis:6379"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POLL_BUILDER_URL
+              value: "https://poll-builder:{{ .Values.pollBuilder.port }}"
+            - name: RESULTS_HANDLER_URL
+              value: "https://results-handler:{{ .Values.resultsHandler.port }}"
+            - name: REPORT_TEMPLATER_URL
+              value: "https://report-templater:{{ .Values.reportTemplater.port }}"
+            - name: REPORT_BUILDER_URL
+              value: "https://report-builder:{{ .Values.reportBuilder.port }}"
+            - name: OBSERVABILITY_URL
+              value: "https://observability-service:{{ .Values.observabilityService.port }}"
+          volumeMounts:
+            - name: vox-certs
+              mountPath: /certs
+              readOnly: true
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: vox-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: report-wr4ngler
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: report-wr4ngler
+spec:
+  selector:
+    app: report-wr4ngler
+  ports:
+    - port: {{ .Values.reportWr4ngler.port }}
+      targetPort: {{ .Values.reportWr4ngler.port }}

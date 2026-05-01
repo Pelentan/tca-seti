@@ -1030,3 +1030,59 @@ components:
       responses:
         '202': { description: Accepted }
         '401': { description: Unauthorized }
+
+  /constellations/{tag}/run-contract-tests:
+    post:
+      summary: Trigger contract tests on a remote constellation via connie-agent
+      operationId: runRemoteConstellationContractTests
+      tags: [Constellations]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Accepted
+
+  /constellations/{tag}/contract-suites:
+    get:
+      summary: List contract suites for a remote constellation via connie-agent
+      operationId: listRemoteConstellationContractSuites
+      tags: [Constellations]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Contract suites list
+
+  /constellations/{tag}/contract-suites/{runId}:
+    get:
+      summary: Get a specific contract suite for a remote constellation via connie-agent
+      operationId: getRemoteConstellationContractSuite
+      tags: [Constellations]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: runId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Contract suite detail

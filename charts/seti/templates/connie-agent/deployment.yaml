@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: connie-agent
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: connie-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: connie-agent
+  template:
+    metadata:
+      labels:
+        app: connie-agent
+        {{- include "seti.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: connie-agent
+      initContainers:
+        {{- include "seti.waitForCertForge" . | nindent 8 }}
+        {{- include "seti.waitForAugurCanis" . | nindent 8 }}
+        {{- include "seti.waitForSignalAggregator" . | nindent 8 }}
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: connie-agent
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}connie-agent:{{ .Values.connieAgent.tag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ .Values.connieAgent.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.connieAgent.port | quote }}
+            - name: SERVICE_NAME
+              value: "connie-agent"
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: OBSERVABILITY_URL
+              value: "https://seti-observability:{{ .Values.setiObservability.port }}"
+            - name: PLOT_STORE_URL
+              value: "https://plot-store:{{ .Values.plotStore.port }}"
+            - name: SIGNAL_AGGREGATOR_URL
+              value: "https://signal-aggregator:{{ .Values.signalAggregator.port }}"
+            - name: POLICY_URL
+              value: "https://policy:{{ .Values.policy.port }}"
+            - name: REDIS_URL
+              value: "redis:6379"
+            - name: SILENCE_THRESHOLD_SECONDS
+              value: "30"
+            - name: REMOTE_APPS_PATH
+              value: "/etc/seti/remote-apps.json"
+            - name: STAR_GAZER_CERT
+              value: "/certs/star-gazer.crt"
+            - name: STAR_GAZER_KEY
+              value: "/certs/star-gazer.key"
+            - name: SYNC_INTERVAL_MINUTES
+              value: {{ .Values.connieAgent.syncIntervalMinutes | default "60" | quote }}
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: seti-certs
+              mountPath: /certs
+              readOnly: true
+            - name: remote-apps
+              mountPath: /etc/seti/remote-apps.json
+              subPath: remote-apps.json
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.connieAgent.port }}
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: seti-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+        - name: remote-apps
+          configMap:
+            name: seti-remote-apps
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: connie-agent
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: connie-agent
+spec:
+  selector:
+    app: connie-agent
+  ports:
+    - port: {{ .Values.connieAgent.port }}
+      targetPort: {{ .Values.connieAgent.port }}

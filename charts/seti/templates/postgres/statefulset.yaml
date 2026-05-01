@@ -70,17 +70,6 @@ spec:
               mountPath: /docker-entrypoint-initdb.d/init.sql
               subPath: init.sql
               readOnly: true
-          readinessProbe:
-            exec:
-              command:
-                - pg_isready
-                - -U
-                - {{ .Values.postgres.user | default "postgres" }}
-                - -d
-                - {{ .Values.postgres.db | default "lore" }}
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            failureThreshold: 10
           livenessProbe:
             exec:
               command:

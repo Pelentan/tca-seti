@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: results-handler
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: results-handler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: results-handler
+  template:
+    metadata:
+      labels:
+        app: results-handler
+        {{- include "vox.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "vox.waitForCertForge" . | nindent 8 }}
+        {{- include "vox.waitForRedis" . | nindent 8 }}
+        {{- include "vox.waitForObservability" . | nindent 8 }}
+        {{- include "vox.waitForAugurCanis" . | nindent 8 }}
+      containers:
+        - name: results-handler
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}results-handler:{{ .Values.resultsHandler.tag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ .Values.resultsHandler.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.resultsHandler.port | quote }}
+            - name: SERVICE_NAME
+              value: "results-handler"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: REDIS_URL
+              value: "redis:6379"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: REDIS_ADDR
+              value: "{{ .Values.redis.url }}"
+            - name: RESULTS_STORE
+              value: "/results-store"
+            - name: OBSERVABILITY_URL
+              value: "https://observability-service:{{ .Values.observabilityService.port }}"
+          volumeMounts:
+            - name: vox-certs
+              mountPath: /certs
+              readOnly: true
+            - name: results-store
+              mountPath: /results-store
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: vox-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+        - name: results-store
+          persistentVolumeClaim:
+            claimName: results-store
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: results-handler
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: results-handler
+spec:
+  selector:
+    app: results-handler
+  ports:
+    - port: {{ .Values.resultsHandler.port }}
+      targetPort: {{ .Values.resultsHandler.port }}

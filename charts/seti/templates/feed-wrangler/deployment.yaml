@@ -56,13 +56,6 @@ spec:
             - name: seti-certs
               mountPath: /certs
               readOnly: true
-          readinessProbe:
-            exec:
-              command: ["node", "/healthcheck.js"]
-            initialDelaySeconds: 15
-            periodSeconds: 30
-            timeoutSeconds: 10
-            failureThreshold: 5
           livenessProbe:
             exec:
               command: ["node", "/healthcheck.js"]

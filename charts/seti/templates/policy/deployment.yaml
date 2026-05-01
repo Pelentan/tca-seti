@@ -77,13 +77,6 @@ spec:
               mountPath: /etc/seti/remote-apps.json
               subPath: remote-apps.json
               readOnly: true
-          readinessProbe:
-            exec:
-              command: ["/healthcheck"]
-            initialDelaySeconds: 15
-            periodSeconds: 30
-            timeoutSeconds: 10
-            failureThreshold: 5
           livenessProbe:
             exec:
               command: ["/healthcheck"]
@@ -99,8 +92,8 @@ spec:
           configMap:
             name: seti-contracts
         - name: remote-apps
-          secret:
-            secretName: seti-remote-apps
+          configMap:
+            name: seti-remote-apps
 ---
 apiVersion: v1
 kind: Service

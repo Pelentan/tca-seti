@@ -1156,3 +1156,59 @@ components:
         message:
           type: string
           example: "Application 'app-tca-vox-prod' has no active subscription"
+
+  /federation/proxy/{tag}/run-contract-tests:
+    post:
+      summary: Trigger contract tests on a remote constellation's AC via monitor cert mTLS
+      operationId: proxyRunContractTests
+      tags: [Federation]
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Contract tests triggered
+        '503':
+          description: Constellation not active
+
+  /federation/proxy/{tag}/contract-suites:
+    get:
+      summary: List contract suites from a remote constellation's AC
+      operationId: proxyListContractSuites
+      tags: [Federation]
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Contract suites list
+        '503':
+          description: Constellation not active
+
+  /federation/proxy/{tag}/contract-suites/{runId}:
+    get:
+      summary: Get a specific contract suite from a remote constellation's AC
+      operationId: proxyGetContractSuite
+      tags: [Federation]
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: runId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Contract suite detail
+        '503':
+          description: Constellation not active

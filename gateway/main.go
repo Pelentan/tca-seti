@@ -35,6 +35,7 @@ var (
 	feedWranglerURL   = envOr("FEED_WRANGLER_URL", "https://feed-wrangler:4007")
 	policyURL         = envOr("POLICY_URL",       "https://policy:4002")
 	augurCanisURL     = envOr("AUGUR_CANIS_URL",  "https://augur-canis:4010")
+	connieAgentURL    = envOr("CONNIE_AGENT_URL", "https://connie-agent:4014")
 	loreURL           = envOr("LORE_URL",         "https://lore:4110")
 	interactionsURL   = envOr("INTERACTIONS_URL", "https://interactions:4009")
 )
@@ -216,6 +217,7 @@ func proxyTo(upstream, path string) http.HandlerFunc {
 
 		if err != nil {
 			reportEvent(callee, r.Method, path, 0, latencyMs)
+			log.Printf("[gateway] upstream error → %s %s: %v", r.Method, target, err)
 			http.Error(w, `{"code":"UPSTREAM_ERROR","message":"upstream unavailable"}`,
 				http.StatusBadGateway)
 			return
@@ -256,13 +258,17 @@ var (
 func addSSEClient(c *sseClient) {
 	sseMu.Lock()
 	sseClients[c] = struct{}{}
+	count := len(sseClients)
 	sseMu.Unlock()
+	log.Printf("[gateway] SSE client connected — total clients: %d", count)
 }
 
 func removeSSEClient(c *sseClient) {
 	sseMu.Lock()
 	delete(sseClients, c)
+	count := len(sseClients)
 	sseMu.Unlock()
+	log.Printf("[gateway] SSE client disconnected — total clients: %d", count)
 }
 
 func broadcastSSE(msg string) {
@@ -282,31 +288,131 @@ var redisShutdown context.CancelFunc
 func startRedisSubscriber() {
 	outerCtx, outerCancel := context.WithCancel(context.Background())
 	redisShutdown = outerCancel
-	go func() {
-		rdb := NewRedisClient(redisURL)
-		for {
-			select {
-			case <-outerCtx.Done():
-				return
-			default:
+
+	// Subscribe to SETI's own event channel
+	go startChannelSubscriber(outerCtx, "seti:events")
+
+	// Subscribe to federation announcement channel — dynamically add per-constellation channels
+	go startFederationAnnounceSubscriber(outerCtx)
+
+	// Subscribe to any already-active constellations on startup
+	go subscribeActiveConstellations(outerCtx)
+}
+
+var (
+	activeChannelsMu sync.Mutex
+	activeChannels   = map[string]bool{}
+)
+
+func startChannelSubscriber(ctx context.Context, channel string) {
+	activeChannelsMu.Lock()
+	if activeChannels[channel] {
+		activeChannelsMu.Unlock()
+		log.Printf("[gateway] Already subscribed to %s — skipping", channel)
+		return
+	}
+	activeChannels[channel] = true
+	activeChannelsMu.Unlock()
+
+	rdb := NewRedisClient(redisURL)
+	defer func() {
+		activeChannelsMu.Lock()
+		delete(activeChannels, channel)
+		activeChannelsMu.Unlock()
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		subCtx, cancel := context.WithCancel(ctx)
+		ch, err := rdb.Subscribe(subCtx, channel)
+		if err != nil {
+			cancel()
+			log.Printf("[gateway] Redis subscribe failed for %s — retrying in 2s: %v", channel, err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		log.Printf("[gateway] Subscribed to %s", channel)
+		for msg := range ch {
+			broadcastSSE(msg)
+		}
+		cancel()
+		log.Printf("[gateway] %s subscription dropped — reconnecting in 2s", channel)
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func startFederationAnnounceSubscriber(ctx context.Context) {
+	rdb := NewRedisClient(redisURL)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		subCtx, cancel := context.WithCancel(ctx)
+		ch, err := rdb.Subscribe(subCtx, "seti:federation:announce")
+		if err != nil {
+			cancel()
+			log.Printf("[gateway] federation announce subscribe failed — retrying in 2s: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		log.Printf("[gateway] Subscribed to seti:federation:announce")
+		for msg := range ch {
+			var announcement struct {
+				ApplicationID string `json:"application_id"`
+				Channel       string `json:"channel"`
 			}
-			ctx, cancel := context.WithCancel(outerCtx)
-			ch, err := rdb.Subscribe(ctx, "seti:events")
-			if err != nil {
-				cancel()
-				log.Printf("[gateway] Redis subscribe failed — retrying in 2s: %v", err)
-				time.Sleep(2 * time.Second)
+			if err := json.Unmarshal([]byte(msg), &announcement); err != nil {
+				log.Printf("[gateway] Could not parse federation announcement: %v", err)
 				continue
 			}
-			log.Printf("[gateway] Subscribed to seti:events")
-			for msg := range ch {
-				broadcastSSE(msg)
+			if announcement.Channel == "" {
+				continue
 			}
-			cancel()
-			log.Printf("[gateway] seti:events subscription dropped — reconnecting in 2s")
-			time.Sleep(2 * time.Second)
+			log.Printf("[gateway] New constellation announced: %s — subscribing to %s",
+				announcement.ApplicationID, announcement.Channel)
+			go startChannelSubscriber(ctx, announcement.Channel)
 		}
-	}()
+		cancel()
+		log.Printf("[gateway] federation announce subscription dropped — reconnecting in 2s")
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func subscribeActiveConstellations(ctx context.Context) {
+	// Wait for upstream client to be ready
+	time.Sleep(3 * time.Second)
+
+	resp, err := upstreamClient.Get(policyURL + "/available-applications")
+	if err != nil {
+		log.Printf("[gateway] Could not fetch active constellations from Policy: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Applications []struct {
+			Tag             string `json:"tag"`
+			MonitoringStatus string `json:"monitoring_status"`
+		} `json:"applications"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Printf("[gateway] Could not parse available-applications response: %v", err)
+		return
+	}
+
+	for _, app := range result.Applications {
+		if app.MonitoringStatus == "active" && app.Tag != "" {
+			channel := "federation:" + app.Tag + ":events"
+			log.Printf("[gateway] Startup: subscribing to %s for active constellation %s", channel, app.Tag)
+			go startChannelSubscriber(ctx, channel)
+		}
+	}
 }
 
 func handleSSE(w http.ResponseWriter, r *http.Request) {
@@ -575,6 +681,11 @@ func main() {
 	mux.HandleFunc("/augur-canis/contract-suites/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		upstream := strings.TrimPrefix(r.URL.Path, "/augur-canis")
 		proxyTo(augurCanisURL, upstream)(w, r)
+	}))
+	// Constellation proxy — routes contract test operations to remote AC via connie-agent
+	mux.HandleFunc("/constellations/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[gateway] constellation proxy: %s %s", r.Method, r.URL.Path)
+		proxyTo(connieAgentURL, r.URL.Path)(w, r)
 	}))
 	mux.HandleFunc("/augur-canis/baselines", requireAuth(proxyTo(augurCanisURL, "/baselines")))
 	mux.HandleFunc("/augur-canis/baselines/", requireAuth(func(w http.ResponseWriter, r *http.Request) {

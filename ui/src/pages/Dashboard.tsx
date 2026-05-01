@@ -25,7 +25,10 @@ export default function Dashboard() {
         setLastTestStatus('error');
         return;
       }
-      const res = await fetch(`${import.meta.env.VITE_GATEWAY_URL || ''}/augur-canis/run-contract-tests`, {
+      const endpoint = active.isSelf
+        ? `${import.meta.env.VITE_GATEWAY_URL || ''}/augur-canis/run-contract-tests`
+        : `${import.meta.env.VITE_GATEWAY_URL || ''}/constellations/${active.id}/run-contract-tests`;
+      const res = await fetch(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -44,6 +47,12 @@ export default function Dashboard() {
   const isHealthCheck = (e: SETIEvent) => e.path === '/check';
 
   let displayEvents = events.filter(e => e.caller && e.timestamp && new Date(e.timestamp).getTime() > 0);
+  // Filter by active constellation — application_id must match or (for seti) be absent/seti
+  if (active.isSelf) {
+    displayEvents = displayEvents.filter(e => !e.applicationId || e.applicationId === 'seti');
+  } else {
+    displayEvents = displayEvents.filter(e => e.applicationId === active.id);
+  }
   if (hideChecks) displayEvents = displayEvents.filter(e => !isHealthCheck(e));
   if (filter) {
     displayEvents = displayEvents.filter(e =>

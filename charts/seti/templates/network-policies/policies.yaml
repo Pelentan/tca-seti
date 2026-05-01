@@ -265,6 +265,9 @@ spec:
         - podSelector:
             matchLabels:
               app: augur-canis
+        - podSelector:
+            matchLabels:
+              app: connie-agent
       ports:
         - port: {{ .Values.policy.port }}
 ---
@@ -362,6 +365,9 @@ spec:
         - podSelector:
             matchLabels:
               app: augur-canis
+        - podSelector:
+            matchLabels:
+              app: connie-agent
       ports:
         - port: {{ .Values.signalAggregator.port }}
 ---
@@ -583,3 +589,99 @@ spec:
               app: augur-canis
       ports:
         - port: {{ .Values.notifier.port }}
+---
+# ---------------------------------------------------------------------------
+# Egress: signal-aggregator → cert-forge, Redis, augur-canis, Vox AC
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: signal-aggregator-egress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: signal-aggregator
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: {{ .Values.certForge.port }}
+          protocol: TCP
+        - port: {{ .Values.certForge.enrollmentPort }}
+          protocol: TCP
+        - port: {{ .Values.certForge.publicPort }}
+          protocol: TCP
+        - port: {{ .Values.augurCanis.port }}
+          protocol: TCP
+        - port: 6379
+          protocol: TCP
+        - port: 3025
+          protocol: TCP
+        - port: 53
+          protocol: UDP
+---
+# ---------------------------------------------------------------------------
+# Ingress: connie-agent — accepts from gateway
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: connie-agent-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: connie-agent
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - port: 4014
+---
+# ---------------------------------------------------------------------------
+# Egress: connie-agent → cert-forge, augur-canis, Redis, plot-store, K8s API, external registries
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: connie-agent-egress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: connie-agent
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: {{ .Values.certForge.port }}
+          protocol: TCP
+        - port: {{ .Values.certForge.enrollmentPort }}
+          protocol: TCP
+        - port: {{ .Values.certForge.publicPort }}
+          protocol: TCP
+        - port: {{ .Values.augurCanis.port }}
+          protocol: TCP
+        - port: {{ .Values.plotStore.port }}
+          protocol: TCP
+        - port: {{ .Values.signalAggregator.port }}
+          protocol: TCP
+        - port: {{ .Values.policy.port }}
+          protocol: TCP
+        - port: 6379
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+        - port: 3022
+          protocol: TCP
+        - port: 3052
+          protocol: TCP
+        - port: 53
+          protocol: UDP

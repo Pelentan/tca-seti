@@ -49,14 +49,6 @@ spec:
                   fieldPath: metadata.name
           # Readiness gates on /ca — plain HTTP, available once CA is generated
           # and the Secret has been written. All other pods wait on this.
-          readinessProbe:
-            httpGet:
-              path: /ca
-              port: {{ .Values.certForge.publicPort }}
-              scheme: HTTP
-            initialDelaySeconds: 5
-            periodSeconds: 3
-            failureThreshold: 20
           livenessProbe:
             httpGet:
               path: /ca

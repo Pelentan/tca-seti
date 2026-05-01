@@ -246,16 +246,6 @@ func processEvent(sub *Subscription, payload string) {
 
 	appendEvent(sub.ApplicationID, ev)
 
-	// Re-publish to seti:events for dashboard and other subscribers
-	enriched, _ := json.Marshal(ev)
-	localRDB.Publish(context.Background(), "seti:aggregated", string(enriched))
-
-	// Write to bad-whiff buffer — tier 2 of the three-tier storage model.
-	// Every event writes regardless of pass/fail. AI-lien needs baseline data,
-	// not just anomaly data. The buffer is a 24-hour sliding window of everything
-	// that crossed the constellation boundary for this application.
-	// Key: seti:whiff:{application_id}  Stream: MAXLEN ~10000 approximate trim.
-	// A full buffer (10k entries) is itself a signal worth investigating.
 	writeWhiffBuffer(sub.ApplicationID, ev)
 }
 
@@ -292,7 +282,7 @@ func selfSubscribe() {
 	sub := &Subscription{
 		ApplicationID: "seti",
 		RedisURL:      redisURL,
-		Channels:      []string{"seti:events", "tca:augur-canis"},
+		Channels:      []string{"tca:augur-canis"},
 		Status:        "active",
 		SubscribedAt:  time.Now().UTC().Format(time.RFC3339),
 	}
@@ -303,7 +293,7 @@ func selfSubscribe() {
 	windows["seti"] = []ConstellationEvent{}
 	windowMu.Unlock()
 	startSubscription(sub)
-	log.Printf("[signal-aggregator] Self-subscribed to seti (tca:events, tca:augur-canis)")
+	log.Printf("[signal-aggregator] Self-subscribed to seti (tca:augur-canis)")
 }
 
 // ---------------------------------------------------------------------------
@@ -598,7 +588,6 @@ func main() {
 	certMat = obtainCerts("signal-aggregator")
 	buildUpstreamClient()
 	connectRedis()
-	loadStarGazer()
 	go selfRegisterWithAC(certMat, "https://signal-aggregator:4006")
 	selfSubscribe()
 	go initFederationOnStartup()
@@ -611,6 +600,7 @@ func main() {
 	mux.HandleFunc("/verify/call-chain", handleVerify)
 	mux.HandleFunc("/federation/subscriptions", handleFederationSubscriptions)
 	mux.HandleFunc("/federation/subscriptions/", handleFederationReconnect)
+	mux.HandleFunc("/federation/proxy/", handleFederationProxy)
 
 	server := &http.Server{
 		Addr: ":" + port, Handler: mux, TLSConfig: loadServerTLS(),

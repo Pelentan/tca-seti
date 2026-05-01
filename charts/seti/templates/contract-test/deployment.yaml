@@ -67,13 +67,6 @@ spec:
             - name: contracts
               mountPath: /contracts
               readOnly: true
-          readinessProbe:
-            exec:
-              command: ["/healthcheck"]
-            initialDelaySeconds: 15
-            periodSeconds: 30
-            timeoutSeconds: 10
-            failureThreshold: 5
           livenessProbe:
             exec:
               command: ["/healthcheck"]

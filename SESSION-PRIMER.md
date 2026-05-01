@@ -1,106 +1,90 @@
-# SETI Session Primer
-*Last updated: 2026-04-22 — Phase S4 complete, ready for feed-wrangler redix replacement*
-
-## Who We Are
-
-**Michael** — Connie Wr4ngler, architect, all decisions.
-**Claude** — source of truth for all code, implements, tracks state, flags issues once.
-
-## Project
-
-**SETI** (Search for Erroneous Tessellated Interactions) — TCA constellation-level monitoring application. K8s deployment on k3d cluster (`tca`), namespace `seti`.
+# SESSION PRIMER — 2026-04-28
 
 ## Current State
 
-**All phases S1–S4 complete. Constellation is healthy — 53/53 contract tests, 11/11 plots passing.**
+SETI and Vox federation are working.  Both tabs show correctly on the dashboard.
+Health checks, inter-service traffic, and contract test events all flow correctly
+to the TCA Vox tab.
 
-### What Was Completed This Session
+## What's Working
 
-**Phase S1** — go-redis eliminated across all Go Jobs. TCA stdlib Redis client (`redis.go`) deployed to 8 Jobs. healthcheck embedded build stage cleaned across 14 Dockerfiles.
+- SETI tab: health checks every 30 seconds, clean feed, no repeating
+- TCA Vox tab: health checks, inter-service traffic, contract test events
+- Federation handshake: 3-message protocol with signature verification
+- Per-constellation Redis channels: `federation:tca-vox:events`
+- Gateway dynamic subscription via `seti:federation:announce`
+- IngressRouteTCP in Helm chart (no more manual apply)
+- Readiness probes removed from both SETI and Vox
+- Vox liveness probe corrected to 30 seconds (was 15)
+- `augur-canis` added to Vox observability known callers
+- Vox observability callee validation removed
+- Policy dynamic registration from connie-agent body
 
-**Phase S2** — golang-jwt eliminated. gateway and policy use stdlib HS256 JWT (`jwt.go`).
+## What's Broken / In Progress
 
-**Phase S3** — Secrets, PostgreSQL X.509, Graceful Shutdown:
-- helm install/upgrade requires zero `--set` flags
-- cert-forge generates `postgres-password` and `jwt-secret` on first startup, persists in `seti-certs` Secret
-- PostgreSQL authenticates lore via X.509 client certificate — no application password anywhere
-- All 20 Jobs handle SIGTERM gracefully via `shutdown.go`/`shutdown.py`/`shutdown.ts` (separate file, infrastructure not domain)
-- `terminationGracePeriodSeconds: 20` on all Deployments, 30 on postgres StatefulSet
-- CA rotation fix — forge.json lists all 18 deployments, fresh CA triggers immediate roll
-- `results` dead redis dependency removed, Dockerfile simplified
-- `ai-lien` requests replaced with stdlib urllib
+### Constellation Proxy (Run Contract Tests / Ring Reports)
 
-**Phase S4** — signal-clearance zero runtime npm dependencies:
-- `jose` → `jwks.ts` (TCA JWKS client, crypto.subtle + https)
-- `uuid` → `crypto.randomUUID()` (Node 20 builtin)
-- `redis` npm → `redis.ts` (TCA RESP2 client, net.Socket)
-- `express` + `cookie-parser` → `router.ts` (TCA HTTP router)
-- Three new TCA lib contracts: `jwks-client.yaml`, `redis.yaml` (TS), `router.yaml`
+The flow is:
+  UI → gateway → connie-agent → signal-aggregator → Vox AC (mTLS monitor cert)
 
-## Next Session Goal
+signal-aggregator has `handleFederationProxy` at `/federation/proxy/{tag}/...`
+connie-agent has `handleConstellationProxy` which forwards to SA.
+Gateway has `/constellations/` route that proxies to connie-agent.
+UI uses `active.isSelf` to pick SETI vs constellation endpoint.
 
-**Eliminate `redix` in feed-wrangler** — same RESP2 pattern, Elixir implementation. Then assess `jason` (needs OTP 27+) and `plug_cowboy` (no stdlib alternative).
+**The Problem:** When SA restarts, `fedApps` is empty.  Connie-agent's
+`isFederationActive` check hits the OLD SA pod (still alive during rolling update)
+and returns true — skipping the handshake.  New SA has no state.
+Result: `handleFederationProxy` returns "constellation not active" (503).
 
-## Remaining Third-Party Dependencies
+**Proposed Fix Being Considered:**
+Remove `isFederationActive` check entirely.  Always run `initiateFederation`
+on every sync cycle.  Signal-aggregator's `connectFederatedApp` already handles
+idempotency — cancels old goroutines via `done` channel before starting new ones.
+The cost is a re-handshake every 10 minutes, but the SSE stream stays live
+during the old goroutine's teardown.
 
-| Job | Dependency | Action |
-|-----|-----------|--------|
-| lore | lib/pq | Stays — no Go stdlib PostgreSQL driver |
-| feed-wrangler | redix | Replace with stdlib RESP2 client in Elixir |
-| feed-wrangler | jason | Stays unless OTP 27+ is available |
-| feed-wrangler | plug_cowboy | Stays — no Elixir stdlib HTTP server |
-| ui | react, vite, etc. | Build-time only, never runs in production |
+Michael wants to sleep on this — may have a cleaner approach.
 
-## Architecture Quick Reference
+## Key Files Changed This Session
 
-**Stack:** Go, TypeScript/Node.js, React 19/Vite, Python, Elixir, GnuCOBOL, Haskell
-**Infrastructure:** k3d (`tca` cluster), namespace `seti`, Helm chart at `charts/seti/`
-**Registry:** `localhost:5000` (push) / `tca-registry:5000` (pull)
-**Dev values:** `charts/seti/values/dev.yaml`
-**Ingress:** `seti.tca.local` via Traefik
+### SETI repo (`~/OneDrive/Coding/AI-Projects/tca-seti`)
+- `connie-agent/main.go` — constellation proxy, activateInPolicy with body, cleanupStaleFederations
+- `signal-aggregator/main.go` — `/federation/proxy/` route
+- `signal-aggregator/federation.go` — handleFederationProxy, ca_cert in GET response, verifyFeedEvent fix
+- `gateway/main.go` — `/constellations/` route, connieAgentURL, upstream error logging
+- `ui/src/pages/Dashboard.tsx` — Run Contract Tests button uses active constellation
+- `ui/src/pages/Ring.tsx` — Reports tab fetches from active constellation, isSelf type fix
+- `charts/seti/templates/gateway/ingress.yaml` — NEW: IngressRouteTCP in Helm chart
+- `charts/seti/templates/network-policies/policies.yaml` — connie-agent ingress from gateway
+- `charts/seti/templates/connie-agent/deployment.yaml` — waitForSignalAggregator init container (may revert)
+- `charts/seti/templates/configmaps/remote-apps-configmap.yaml` — hardcoded JSON (not from values)
+- All deployment templates — readiness probes removed
+- `contracts/openapi/connie-agent.yaml` — constellation proxy endpoints
+- `contracts/openapi/gateway.yaml` — constellation proxy routes
+- `contracts/openapi/signal-aggregator.yaml` — federation proxy endpoints
 
-**Key ports:**
-- gateway: 4000 (external TLS), proxies to all Jobs over mTLS
-- cert-forge: 4016 (public /ca), 4015 (enrollment mTLS), 4014 (sign mTLS)
-- augur-canis: 4010 (mTLS admin)
-- signal-clearance: 4001
-- lore: 4110
+### Vox repo (`~/OneDrive/Coding/AI-Projects/tca-vox`)
+- `observability-service/handler.go` — augur-canis added to callers, callee validation removed
+- All deployment templates — readiness probes removed, liveness probe 15→30s
 
-## TCA Lib Index (current)
+## Next Steps
 
-All in `contracts/lib/`:
-- `redis-client.yaml` → `redis.go` — Go Redis RESP2 client
-- `jwks-client.yaml` → `jwks.ts` — TypeScript JWKS/RS256 verification
-- `redis.yaml` (TS) → `redis.ts` — TypeScript Redis RESP2 client
-- `router.yaml` → `router.ts` — TypeScript HTTP router
-- `jwt.go` / `jwt.ts` — HS256 JWT sign/verify (Go and TypeScript)
+1. Resolve the `isFederationActive` / SA restart race condition
+2. Test Run Contract Tests button on TCA Vox tab
+3. Test Ring → Reports tab for TCA Vox
+4. Plot tests for remote constellations
 
-**Rule:** Check the lib index before any import. If no lib covers it, surface the gap — do not pull a package.
+## Build Commands
 
-## Critical Operational Notes
+```bash
+# SETI
+docker build --no-cache -t localhost:5000/seti-{service}:dev -f {service}/Dockerfile .
+docker push localhost:5000/seti-{service}:dev
+helm upgrade seti charts/seti -f charts/seti/values/dev.yaml -n seti
 
-- **Tarball delivery:** All changes delivered as `.tar.gz`. One file via `present_files`. Always includes `CHANGED_FILES.md`. Extract at project root: `tar -xzf <file>`
-- **Build command:** `./scripts/build-push.sh` then `kubectl delete pods --all -n seti` for full roll
-- **Selective rebuild:** `docker build -f <job>/Dockerfile -t localhost:5000/seti-<job>:dev . && docker push localhost:5000/seti-<job>:dev && kubectl rollout restart deployment/<job> -n seti`
-- **Test:** Run contract tests and plot tests from SETI Ring → Reports tab
-- **PVC deletion sequence:** `kubectl scale statefulset postgres -n seti --replicas=0` → `kubectl delete pvc postgres-data-postgres-0 -n seti` → helm upgrade
-- **node_modules on Windows/OneDrive:** `rmdir /s /q node_modules` then `npm install` (not PowerShell)
-
-## Key Bugs Fixed This Session (for continuity)
-
-- `selfRegisterWithAC` 10-attempt cap removed across all 14 certforge implementations — was masking startup race condition
-- Subscribe context race in healthcheck — independent `context.WithCancel` prevents premature channel close
-- `net.Error` timeout detection — `isTimeoutError()` helper with string fallback for Go 1.22 Linux wrapping
-- `listen_addresses = '*'` required in custom postgresql.conf — postgres defaults to localhost-only otherwise
-- `pg_ident.conf` maps CN=lore-db to lore pg role — clientcert verify-full uses CN as username
-- `defaultMode: 0640` on postgres Secret volume (fsGroup: 70) + `defaultMode: 0600` on lore Secret volume — postgres rejects world-readable key files
-- `waitForPostgresPassword` init container polls the actual file, not the HTTP endpoint — kubelet sync latency
-- router.ts `use()` empty-prefix mount — copy routes directly, don't combine empty pattern with route pattern
-- CA rotation: forge.json must list all deployments; fresh CA triggers immediate roll after Secret write
-
-## Reference Files in Project
-
-- `tca-guidelines.md` — living operational reference (updated this session: section 8 graceful shutdown, section 11 lib index discipline)
-- `contracts/lib/tca-lib-index.yaml` — supply chain gate
-- `PHASE-PLAN.md` — full phase history with lessons learned
-- `SETI-GUIDELINES.md`, `AC-GUIDELINES.md`, `K8S-MIGRATION-PRIMER.md` — always apply
+# Vox
+docker build --no-cache -t localhost:5000/vox-{service}:dev -f {service}/Dockerfile .
+docker push localhost:5000/vox-{service}:dev
+helm upgrade vox charts/vox -f charts/vox/values/dev.yaml -n tca-vox
+```

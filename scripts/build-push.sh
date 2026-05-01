@@ -35,6 +35,7 @@ SERVICES=(
   "integration:integration/Dockerfile:."
   "ai-lien:ai-lien/Dockerfile:."
   "notifier:notifier/Dockerfile:."
+  "connie-agent:connie-agent/Dockerfile:."
   "ui:ui/Dockerfile:."
   "gateway:gateway/Dockerfile:."
 )

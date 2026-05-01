@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: augur-canis
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: augur-canis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: augur-canis
+  template:
+    metadata:
+      labels:
+        app: augur-canis
+        {{- include "vox.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "vox.waitForCertForge" . | nindent 8 }}
+        {{- include "vox.waitForRedis" . | nindent 8 }}
+      containers:
+        - name: augur-canis
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}augur-canis:{{ .Values.augurCanis.tag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ .Values.augurCanis.port }}
+            - containerPort: {{ .Values.augurCanis.uiPort }}
+            - containerPort: {{ .Values.augurCanis.federationPort }}
+          env:
+            - name: PORT
+              value: {{ .Values.augurCanis.port | quote }}
+            - name: FEDERATION_PORT
+              value: {{ .Values.augurCanis.federationPort | quote }}
+            - name: REDIS_URL
+              value: "redis:6379"
+            - name: CONSTELLATION
+              value: "tca-vox"
+            - name: CONSTELLATION_ID
+              value: "tca-vox"
+            - name: CLUSTER_DNS_NAME
+              value: "augur-canis.tca-vox.svc.cluster.local"
+            - name: STAR_GAZER_CERT
+              value: "/stargazer/tls.crt"
+            - name: OBSERVABILITY_URL
+              value: "https://observability-service:{{ .Values.observabilityService.port }}"
+            - name: AUTH_SERVICE_URL
+              value: "https://auth-service:{{ .Values.authService.port }}"
+            - name: AC_UI_PORT
+              value: {{ .Values.augurCanis.uiPort | quote }}
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: SERVICE_NAME
+              value: "augur-canis"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: vox-certs
+              mountPath: /certs
+              readOnly: true
+            - name: seti-stargazer
+              mountPath: /stargazer
+              readOnly: true
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: vox-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+        - name: seti-stargazer
+          secret:
+            secretName: seti-stargazer-cert
+            optional: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: augur-canis
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: augur-canis
+spec:
+  selector:
+    app: augur-canis
+  ports:
+    - name: mtls
+      port: {{ .Values.augurCanis.port }}
+      targetPort: {{ .Values.augurCanis.port }}
+    - name: ui
+      port: {{ .Values.augurCanis.uiPort }}
+      targetPort: {{ .Values.augurCanis.uiPort }}
+    - name: federation
+      port: {{ .Values.augurCanis.federationPort }}
+      targetPort: {{ .Values.augurCanis.federationPort }}

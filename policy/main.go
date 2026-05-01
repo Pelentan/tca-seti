@@ -945,12 +945,52 @@ func handleAvailableApplication(w http.ResponseWriter, r *http.Request) {
 
 	case r.Method == http.MethodPost && action == "register":
 		remoteAppsMu.RLock()
-		alreadyActive := state.MonitoringStatus == "active"
+		alreadyActive := exists && state.MonitoringStatus == "active"
 		remoteAppsMu.RUnlock()
 
 		if alreadyActive {
 			json.NewEncoder(w).Encode(state)
 			return
+		}
+
+		// Accept app definition from connie-agent body if not in remoteApps
+		if !exists {
+			var incoming struct {
+				Name               string `json:"name"`
+				Description        string `json:"description"`
+				Namespace          string `json:"namespace"`
+				ACEndpoint         string `json:"ac_endpoint"`
+				FederationEndpoint string `json:"federation_endpoint"`
+				CaURL              string `json:"ca_url"`
+				RegistryURL        string `json:"registry_url"`
+				RegistryType       string `json:"registry_type"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil || incoming.Name == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{
+					"code":    "INVALID_REQUEST",
+					"message": "tag not in remote-apps.json and no valid app definition in request body",
+				})
+				return
+			}
+			remoteAppsMu.Lock()
+			app = &RemoteApp{
+				Name:         incoming.Name,
+				Description:  incoming.Description,
+				ACEndpoint:   incoming.ACEndpoint,
+				RegistryURL:  incoming.RegistryURL,
+				RegistryType: incoming.RegistryType,
+			}
+			remoteApps[tag] = app
+			if availableStates[tag] == nil {
+				availableStates[tag] = &AvailableAppState{
+					Tag:              tag,
+					MonitoringStatus: "inactive",
+				}
+			}
+			state = availableStates[tag]
+			remoteAppsMu.Unlock()
+			log.Printf("[policy] Remote app %q registered dynamically by connie-agent", tag)
 		}
 
 		// 1. Register in Policy application store

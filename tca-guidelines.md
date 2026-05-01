@@ -1,7 +1,7 @@
 # Tessellated Constellation Architecture — Project Guidelines
 
 **Status:** Living Document  
-**Last Updated:** 2026-04-19  
+**Last Updated:** 2026-04-13  
 **Audience:** AI partners and engineers working on TCA projects  
 **Scope:** Architectural rules, sequencing, and operational standards for any TCA implementation  
 **Related:** [Augur Canis Guidelines](AC-GUIDELINES.md) · [SETI Guidelines](SETI-GUIDELINES.md)
@@ -71,7 +71,6 @@ All TCA contracts are OpenAPI 3.1 YAML. Every contract must define:
 - The `servers` block referencing the service name (not a hardcoded IP or port)
 - The `x-tca-observability` block (see Section 6)
 - The `x-tca-security` block (see Section 7)
-- The `x-tca-lifecycle` block (see Section 8)
 
 No other paths or response codes are implemented. If the contract doesn't define it, the Job doesn't return it.
 
@@ -157,97 +156,7 @@ Zero-trust structure is built in from commit zero even when the policy engine is
 
 ---
 
-## 8. Graceful Shutdown — `x-tca-lifecycle`
-
-Every Job contract must include the `x-tca-lifecycle` extension block. Every Job implementation must handle SIGTERM gracefully. This is a structural requirement, not optional cleanup.
-
-### Why This Matters
-
-Kubernetes sends SIGTERM to a pod before termination. If the Job does not catch SIGTERM and drain, the pod exits immediately — mid-request, mid-subscription, mid-write. Callers receive connection errors. Observability events are dropped. Database transactions may be left open. This is not a Kubernetes problem; it is an implementation gap.
-
-The correct shutdown sequence:
-1. Receive SIGTERM
-2. Stop accepting new connections
-3. Drain in-flight requests (with a deadline)
-4. Close downstream connections (Redis, database, subscriptions)
-5. Exit 0
-
-Kubernetes waits `terminationGracePeriodSeconds` (explicit in every Deployment — never rely on the default) before sending SIGKILL. The drain timeout must be less than this period.
-
-### The `x-tca-lifecycle` Contract Block
-
-```yaml
-x-tca-lifecycle:
-  shutdown:
-    signal: SIGTERM
-    drain-timeout-seconds: 15
-    steps:
-      - stop-accepting-connections
-      - drain-in-flight-requests
-      - close-redis
-      - close-database        # only if the Job has a database connection
-      - unsubscribe-channels  # only if the Job holds Redis subscriptions
-      - exit-0
-```
-
-The steps are **Job-specific** — they reflect exactly what that Job has open. Do not copy steps from another Job's contract. A Job with no database connection does not declare `close-database`. A Job with no Redis subscriptions does not declare `unsubscribe-channels`. The contract is a truthful description of what actually happens on shutdown.
-
-An AI encountering the `x-tca-lifecycle` block implements the specified shutdown sequence without being asked. The steps in the block are not documentation — they are requirements.
-
-### Language Patterns
-
-**Go:**
-```go
-quit := make(chan os.Signal, 1)
-signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
-<-quit
-ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-defer cancel()
-server.Shutdown(ctx)  // drains in-flight HTTP requests
-rdb.Close()           // close Redis connection
-db.Close()            // close database connection if applicable
-```
-
-**TypeScript (Node.js):**
-```typescript
-process.on('SIGTERM', async () => {
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  redisClient.disconnect();
-  process.exit(0);
-});
-```
-
-**Python:**
-```python
-import signal, sys
-
-def shutdown(signum, frame):
-    server.server_close()
-    redis_client.close()
-    sys.exit(0)
-
-signal.signal(signal.SIGTERM, shutdown)
-```
-
-**Elixir:**
-OTP supervision handles SIGTERM correctly by default — the supervisor calls `terminate/2` on each process in reverse dependency order. Jobs using OTP supervision (feed-wrangler) do not need additional signal handling. Verify that `terminate/2` is implemented on any GenServer that holds external connections (Redis, HTTP).
-
-### Kubernetes `terminationGracePeriodSeconds`
-
-Every Deployment must declare `terminationGracePeriodSeconds` explicitly. The value must be greater than the drain timeout declared in the contract. Standard values:
-
-| Job type | drain-timeout-seconds | terminationGracePeriodSeconds |
-|----------|-----------------------|-------------------------------|
-| Standard (HTTP only) | 15 | 20 |
-| With Redis subscription | 15 | 20 |
-| With active DB connections | 15 | 20 |
-| Long-running job executor | 30 | 35 |
-
-Never use the K8s default (30s) — declare it explicitly so the relationship between the drain timeout and the kill deadline is visible and intentional.
-
----
-
-## 9. The Three-Year Lifecycle
+## 8. The Three-Year Lifecycle
 
 Every Job is designed to be completely rewritten within three years. Design decisions should reflect this.
 
@@ -267,7 +176,7 @@ The practical test for whether a Job is well-bounded: can it be completely rewri
 
 ---
 
-## 10. Kubernetes Deployment Patterns
+## 9. Kubernetes Deployment Patterns
 
 ### The Core Rule
 Pods are the atomic unit in K8s — you cannot scale containers within a Pod independently. Never co-locate services in a single Pod to solve a latency problem. Use Pod Affinity to keep latency-sensitive services on the same node while keeping them in separate Pods.
@@ -291,7 +200,7 @@ Affinity rules keep services close. Spread constraints keep them distributed acr
 
 ---
 
-## 11. Dependency and Build Discipline
+## 10. Dependency and Build Discipline
 
 ### Lockfiles Are Non-Negotiable
 Every package manager produces a lockfile. Every lockfile is committed. Every Dockerfile uses the lockfile-respecting install command.
@@ -305,6 +214,29 @@ Every package manager produces a lockfile. Every lockfile is committed. Every Do
 | Rust | `Cargo.lock` | standard Cargo |
 
 `npm install` in a Dockerfile without a committed lockfile produces version drift between local and container builds. The failure mode is builds that work locally and break in Docker, or worse, silently behave differently. Use `npm ci`.
+
+### Build Context — Project Root Required
+
+Every Docker image in a TCA constellation is built from the **project root**, not from the service subdirectory.  This is non-negotiable and must be enforced in `scripts/build-push.sh`.
+
+```bash
+# Correct — build context is project root
+docker build -t registry/service:tag -f service/Dockerfile .
+
+# Wrong — build context is the service directory
+docker build -t registry/service:tag service/
+```
+
+**Why:** TCA Dockerfiles use service-prefixed COPY paths (`COPY service/go.mod ./`) so all files in the constellation are accessible during the build.  A service-directory context will silently appear to succeed on cached layers while failing on fresh builds.  The diagnostic indicator is `transferring context: 2B` in the Docker build output — an empty context.
+
+**build-push.sh format:** The third field is always `.`:
+
+```bash
+services=(
+  "augur-canis:augur-canis/Dockerfile:."
+  "gateway:gateway/Dockerfile:."
+)
+```
 
 ### Dockerfile Layer Order
 Dependencies before source. Cache invalidation on source changes should not re-run dependency installation.
@@ -381,7 +313,7 @@ Check the current npm version before writing any Node.js Dockerfile. Zero warnin
 
 ---
 
-## 12. Logging Standards
+## 11. Logging Standards
 
 ### Stdout Only
 Services write to stdout and stderr. No file output inside containers. Where that output goes is an infrastructure concern, not an application concern — the application is fully decoupled from the logging destination.
@@ -408,7 +340,7 @@ Container logs are the first diagnostic tool when something is wrong. If a Job i
 
 ---
 
-## 13. Service Exposure
+## 12. Service Exposure
 
 Nothing is externally exposed that does not need to be.
 
@@ -420,7 +352,7 @@ The gateway is the single external entry point. TLS terminates there. JWT valida
 
 ---
 
-## 14. Data Pipeline Design
+## 13. Data Pipeline Design
 
 ### Async Pipelines Require Complete Field Contracts
 When data moves through an async pipeline — stream, queue, worker, storage — every field must be defined and populated at the point of entry. A missing field is not a runtime error at the point of omission; it is a silent contract violation that fails at the far end of the pipeline with no obvious connection to the origin. TCA Vox: `ForwardedVote` was missing `submittedAt` when sent to redis-handler. Redis-handler's validation rejected every vote silently in a background goroutine. The votes appeared to succeed at the API layer. Nothing ever persisted. Define all pipeline fields contractually and validate them at entry.
@@ -433,7 +365,7 @@ Consumer groups created with position `"0"` replay all existing messages from st
 
 ---
 
-## 15. UI Routing in Single-Page Applications
+## 14. UI Routing in Single-Page Applications
 
 ### Route Guards Must Be Symmetric
 When multiple effects or hooks both trigger page-loading logic, they must reference the same skip list. TCA Vox had two `useEffect` hooks that both called `loadPage` with separate skip lists that diverged over time — routes added to one were missed in the other, causing 400 errors on navigation. One canonical skip list, referenced by all effects that need it.
@@ -446,7 +378,7 @@ If an application uses short-lived JWTs plus refresh tokens, the UI must attempt
 
 ---
 
-## 16. SQL and Database Discipline
+## 15. SQL and Database Discipline
 
 ### PostgreSQL Column Alias Rules
 PostgreSQL does not allow referencing a column alias in `GROUP BY` or `WHERE` in the same query. `SELECT x AS value ... GROUP BY value` fails with "column 'value' does not exist." Use the full expression: `GROUP BY answers::json->>0`. This is a known divergence from MySQL and SQLite. All AI-generated PostgreSQL queries must use full expressions in GROUP BY, never aliases.
@@ -459,7 +391,7 @@ Never use `type: number` in an OpenAPI contract for a financial value. Floating 
 
 ---
 
-## 17. Third-Party Rendering Libraries (Vega-Lite)
+## 16. Third-Party Rendering Libraries (Vega-Lite)
 
 ### vconcat Spec Rules
 When composing multiple Vega-Lite charts into a single `vconcat` spec:
@@ -476,7 +408,7 @@ A `layer` spec with one mark on an ordinal x-axis and another on a quantitative 
 
 ---
 
-## 18. Configuration Object Design
+## 17. Configuration Object Design
 
 ### Nest Before Callers Exist
 When a config object accumulates more than 4-5 fields, restructure from flat to nested before callers exist. Flat configs become unmaintainable as they grow. TCA Vox report config started flat and had to be restructured into `style.page`, `style.title`, and `layout` sections mid-development. The restructure required updating every caller. Nested structure is cheaper to add before callers than to retrofit after.
@@ -489,142 +421,9 @@ When a request payload shape changes in a breaking way, keep the old shape worki
 
 ---
 
-## 19. What We've Learned (Running Log)
-
-Most recent first. Add entries as lessons are established — not on every commit, but when a principle is proven or a painful mistake earns its place here.
-
-**2026-04-19 — cert-forge Automatic Rotation: List Only Stateful Workloads**
-cert-forge's rotation-triggered Deployment restarts should list only stateful workloads that do not roll naturally within the rotation interval (Mongo instances, PostgreSQL, Redis). Listing every Deployment creates unnecessary churn — in a healthy production environment, most pods roll before the 30-day instance interval fires due to deployments, scaling events, and node maintenance. The rotation list is a safety net for the workloads that won't roll on their own, not a replacement for natural rolling behavior.
-
-**2026-04-19 — imagePullPolicy: Always Is Required for Mutable Tags in K8s**
-Mutable image tags (e.g., `dev`, `latest`) do not trigger a re-pull on pod restart unless `imagePullPolicy: Always` is set. Without it, the cluster runs stale images after a push — silently, with no error. This is particularly insidious because `kubectl rollout restart` appears to succeed but the pod continues running the old binary. Set `imagePullPolicy: Always` on all deployment templates that use mutable tags.
-
-**2026-04-19 — Gateway External Listener Must Be HTTPS Regardless of Ingress Position**
-A gateway that speaks plain HTTP on its external port is unacceptable in a zero-trust environment even when positioned behind a TLS-terminating ingress like Traefik. The segment between Traefik and the gateway is inside the cluster but it is not encrypted without TLS on the gateway side. The gateway must speak HTTPS. The cert comes from cert-forge — the same instance cert used for internal mTLS, with the external hostname added to the SANs via the `GATEWAY_EXTERNAL_HOSTNAME` env var.
-
-**2026-04-19 — Traefik v2 Backend CA Verification Requires kube-system Access**
-Traefik v2's `ServersTransport` `rootCAsSecrets` field requires the CA Secret to be in the `kube-system` namespace — not in the constellation namespace where cert-forge operates. Granting cert-forge write access to `kube-system` is a production security decision that belongs to the security team, not the development framework. In dev, `insecureSkipVerify: true` in the `ServersTransport` is the correct compromise — traffic is still encrypted, backend cert verification is skipped. The constellation CA Secret (`{constellation}-traefik-ca`) is generated and available for production when the access model is defined by the appropriate team.
-
-**2026-04-19 — Traefik TLS Termination: Constellation CA Is Per-Constellation, Not Cluster-Level**
-When Traefik terminates TLS for a constellation's external hostname, it needs to trust the backend gateway's certificate. The temptation is to centralize this — one cluster-level CA, one cluster-level cert-forge. This collapses per-constellation security policy into a shared policy, which is exactly the coupling TCA is designed to prevent. Different constellations may have different CA backends, cert lifetimes, or organizational CA requirements. Per-constellation cert-forge keeps those decisions independent. Additionally, a cluster-level cert-forge restart would break every constellation simultaneously. Per-constellation cert-forge is the correct model.
-
-**2026-04-13 — Contract Tests Are Not Generated Tests**
-A contract test suite generated from OpenAPI contracts cannot independently verify those contracts — it re-states them.  Independent verification requires a human to read the contract, understand the intent, and write assertions separately.  If a contract changes, the tests must be updated manually.  That friction is the point.  Hardcode the test suite; update it by hand.
-
-**2026-04-13 — Negative Tests Are the Tests Most Likely to Find Real Bugs**
-Positive tests verify that correct input produces correct output.  Negative tests verify that incorrect input produces a 4xx response, not a 5xx.  A 5xx on bad input means the Job is swallowing errors.  This is a real bug that positive tests cannot surface.  Every Job with POST endpoints needs at least one negative test sending malformed or missing required fields.
-
-**2026-04-13 — Detection Thresholds Belong in Code, Not Configuration**
-Monitoring and alerting thresholds are architectural decisions with operational consequences.  An environment variable threshold can be set to zero by anyone with access to the compose file, then reset.  A hardcoded constant requires a code review, a rebuild, and a deployment.  The friction is the safeguard.  Interactions' critical failure threshold (50%) and silence window (7 days) are Go constants, not env vars.
-
-**2026-04-13 — Python BaseHTTPServer + Go mTLS Client: Use ResilientHTTPServer**
-Python's `BaseHTTPServer.handle_error` propagates `BrokenPipeError` and `ssl.SSLError` to stderr and terminates the handler thread.  This causes the Go mTLS client to see a broken pipe on the write side.  Subclass `HTTPServer` with a `handle_error` override that silently absorbs `BrokenPipeError`, `ConnectionResetError`, and `ssl.SSLError`.  These are expected when an mTLS client closes the connection before reading the full response.
-
-**2026-04-13 — Go HTTP Client + Python BaseHTTPServer: Use bytes.NewReader with ContentLength**
-A custom `io.Reader` type that only implements `Read()` causes Go's HTTP client to use chunked transfer encoding — it cannot determine content length upfront.  Python's `BaseHTTPServer` does not handle chunked POST bodies reliably under TLS and closes the connection mid-write.  Use `bytes.NewReader(payload)` with explicit `req.ContentLength = int64(len(payload))` for all POST requests from Go to Python services.
-
-**2026-04-13 — Redis Streams over Lists for Time-Series Data**
-Redis Lists (LPUSH/LTRIM) store raw values with no timestamps.  Time-bounded queries require iterating the full list and filtering client-side.  Redis Streams (XADD/XRANGE) store entries with millisecond-precision timestamps as built-in IDs, enabling `XRANGE minMs maxMs` queries with no client-side filtering.  Any metric or event data that will be queried by time window belongs in a Stream.
-
-**2026-04-13 — AI-lien With Lore Is a Different Instrument Than AI-lien Without It**
-An AI analysis without institutional memory is a first-responder with no case history.  Feeding Lore baselines, recent incidents, and known patterns into the analysis context before every query produces qualitatively different assessments.  The loop — Lore feeds AI-lien, AI-lien feeds Lore — means every analysis makes the next one better.  Build the memory layer before depending on the intelligence layer.
-
-**2026-04-13 — The Notifier Must Be a Permanent Stub in the Open Source Distribution**
-Notification mechanisms are environment-specific.  A default implementation that "mostly works" (e.g., a generic SMTP sender) gives operators the wrong signal — they ship with a default they did not choose, and humans do not get paged correctly.  An explicit permanent stub with `stub_active: true` in the health response forces operators to make a deliberate decision about how humans get woken up.  The stub is the safeguard.
-
-**2026-04-13 — getFreshJWT in React useEffect Dependencies Causes Infinite Loops**
-Functions from hooks (e.g., `useAuth`) typically get a new reference on every render.  Including them in `useEffect` or `useCallback` dependency arrays causes the effect to fire on every render, triggering state updates, causing re-renders.  Fix: store the function in a `useRef` and sync it with a separate effect.  Call `ref.current()` inside effects instead of the function directly.  The dependency array contains only the values that should meaningfully trigger re-runs.
-
-**2026-04-12 — Chunked Transfer Encoding Breaks Node.js TLS POST Endpoints from Go mTLS Clients**
-Node.js TLS POST endpoint connections from Go mTLS clients time out consistently when the Go client uses chunked transfer encoding.  AC's suite removes negative POST tests for Node.js services (signal-clearance) rather than fighting the transport mismatch.  Verify via Ring Trial instead.
-
-**2026-04-12 — Plot Test Retry Logic Belongs in Plot-test, Not Callers**
-Retry logic for transient failures (pod recycle, connection refused, 5xx) belongs in the executor — plot-test in this case — not in callers or escalation paths.  Only retry on network-level failures and 5xx.  Never retry on 4xx, assertion failures, or chain failures.  Record the attempt count in every step result so the pattern is visible in Lore even when the plot passes.
-
-**2026-04-09 — cert-forge: PKI Abstraction Is a Standard TCA Component**
-Distributing certificates via a shared Docker volume exposes all private keys to all services — any compromised service can read every other service's key material. cert-forge solves this by acting as a PKI abstraction layer: it generates the CA in memory, issues instance certificates on demand over an enrollment mTLS connection, and holds all private key material in memory only. Services receive their own cert/key over an encrypted channel and never see any other service's material. cert-forge is a candidate standard TCA component applicable to any constellation, not a SETI-specific pattern.
-
-**2026-04-09 — cert-forge: Three-Port Architecture Is Load-Bearing**
-TLS client authentication cannot be enforced per-path on a single port — it is a connection-level property. cert-forge requires three distinct servers: port for plain HTTP (CA cert distribution — public), port for enrollment mTLS (instance cert issuance — requires enrollment cert), port for constellation mTLS (signing operations — requires instance cert). Attempting to collapse these onto fewer ports will break the security model.
-
-**2026-04-09 — cert-forge: Enrollment CA Pattern**
-cert-forge generates a separate enrollment CA whose only issued credential is a single enrollment cert written to the shared volume. This cert's only capability is calling the instance-cert endpoint. The constellation CA private key never touches the shared volume. In K8s production, the cert issuance backend points to cert-manager or the organizational CA — the signing responsibility stays with cert-forge, the constellation is decoupled from infrastructure PKI choices.
-
-**2026-04-09 — Gateway Must Forward Upstream Response Headers**
-A reverse proxy that reads the upstream response body and status code but does not copy upstream response headers silently discards Set-Cookie, Cache-Control, and other headers the client depends on. In SETI, the gateway was discarding Set-Cookie from signal-clearance, so the httpOnly refresh token cookie was never stored in the browser — the client sent every refresh request with no cookie and received 400. Always copy all upstream response headers to the client response before writing the body.
-
-**2026-04-09 — httpOnly Cookie Scope Is the Issuing Domain and Port**
-A cookie set by a service on port N is scoped to port N. If a reverse proxy on port M forwards the response but does not preserve the Set-Cookie header, the browser never receives the cookie. If the proxy does forward it, the cookie is scoped to the proxy's port (M), and the browser will send it back to port M — which is correct when all client traffic routes through the proxy. The cookie must be issued through the gateway, not directly from the upstream service, for cookie-based auth to work in a proxied architecture.
-
-**2026-04-09 — Session Timeout Is Inactivity Timeout, Not Wall Clock**
-A JWT with a 15-minute TTL is not a 15-minute session limit — it is a 15-minute inactivity timeout, implemented by refreshing the token on every authenticated API call. getFreshJWT() must call the refresh endpoint unconditionally on every invocation, not only when the token is near expiry. Any expiry-check before refresh defeats the inactivity timeout model: a user active at minute 10 who returns at minute 17 is still locked out because the token was never refreshed during the active period.
-
-**2026-04-09 — Contract Title Must Produce the Same String as Service Self-Registration Name**
-Contract-test derives the service name from the contract title using serviceNameFromTitle(). Augur Canis looks up registered jobs by the name the service used when it called self-register. If these two strings don't match exactly, every test for that service is silently skipped with job_not_deployed — not failed, skipped. The contract title is authoritative. Display name choices (capitalisation, numeronym substitution like Wr4ngler vs Wrangler) must not diverge from the technical identifier. Verify: serviceNameFromTitle(contract.title) == service.service_name in self-registration payload.
-
-**2026-03-31 — Augur Canis: The Correct Health Check Architecture**
-The Redis pub/sub coordination pattern for health checks — where the healthcheck binary inside a container triggers a check via Redis rather than exposing an HTTP port — eliminates every class of health check vulnerability simultaneously: no open ports, no unauthenticated surfaces, health check traffic itself observable through the monitoring layer. This pattern is not TCA-specific; it is the correct architecture for any containerized environment. TCA's polyglot constraint forced the general solution by making language-specific workarounds unacceptable across six languages simultaneously.
-
-**2026-03-31 — Augur Canis: Point-to-Point Networks Are Non-Negotiable**
-A shared health check network introduces the attack vector the agent is designed to detect. If a Job is compromised and the Augur Canis agent shares a network with all Jobs, the compromised Job can reach every other Job through that network. N Jobs require N dedicated two-member networks. The naming convention is `ac-{service}-net`.
-
-**2026-03-31 — K8s Container Replacement Inferred from Container ID Change**
-Kubernetes container replacement does not require Kubernetes API access or RBAC permissions to detect. The healthcheck binary already sends the container ID (`$HOSTNAME`) on every check request. Augur Canis tracks the previous container ID per Job and infers replacement when it changes. PreStop lifecycle hooks are an optional enhancement for advance notice but are not required.
-
-**2026-03-27 — Config Objects: Nest Before Callers Exist**
-TCA Vox report config required a mid-development restructure from flat to nested sections because fields outgrew the flat shape before structure was established. Restructuring after callers exist requires updating every caller. Nest early.
-
-**2026-03-27 — Vega SVG Has a Hardcoded White Background**
-`vega.toSVG()` outputs `style="background-color: white"` regardless of config. Strip it. In `vconcat`, strip `$schema` from sub-specs, add explicit `width`, and use `resolve: { scale/legend: { color: 'independent' } }`.
-
-**2026-03-27 — PostgreSQL Rejects Column Aliases in GROUP BY**
-`GROUP BY value` where `value` is an alias fails. Use the full expression. This diverges from MySQL/SQLite behavior. AI-generated PostgreSQL must use full expressions.
-
-**2026-03-27 — Define Status Models Completely Before Implementation**
-Collapsing status values mid-project requires updating every Job that checks that field. TCA Vox: `open` → `public/private` missed the vote handler, silently rejecting all votes. Define the complete status enum in the contract first.
-
-**2026-03-27 — Async Pipeline Fields Must Be Complete at Entry**
-Missing fields fail silently at the far end of the pipeline, not at the point of omission. TCA Vox: missing `submittedAt` in `ForwardedVote` caused silent vote rejection in a background goroutine. Define all pipeline fields contractually and validate at entry.
-
-**2026-03-27 — GnuCOBOL OPEN EXTEND Requires Existing File**
-`OPEN EXTEND` fails with status 35 on a non-existent file. Probe with `OPEN INPUT` first, then branch to `OPEN OUTPUT` for new files.
-
-**2026-03-27 — UI Route Guards Must Be Symmetric**
-Multiple effects with separate skip lists will diverge. One canonical skip list, referenced by all effects.
-
-**2026-03-27 — Schema Changes Require Volume Resets**
-`CREATE TABLE IF NOT EXISTS` does not add new columns. Volume reset (`docker compose down -v`) required when adding columns to existing tables.
-
-**2026-03-07 — No Alpine in Runtime Stages**
-Alpine is not permitted in runtime container stages. Go Jobs run in scratch. TypeScript/Node use distroless. The only exception is `cert-init`. Zero warnings on a build is the standard.
-
-**2026-03-04 — x-tca-security Belongs in the Contract, Not the Implementation**
-Security posture defined only in implementation code is invisible to subsequent Jobs and contract reviewers. The `x-tca-security` block makes security requirements a first-class part of the interface definition.
-
-**2026-02-26 — npm ci + Lockfiles Are Non-Negotiable in Docker**
-`npm install` without a committed lockfile produces version drift. Use `npm ci`.
-
-**2026-02-26 — Check Library API Versions Before Writing Code**
-SimpleWebAuthn v10 had breaking changes from v9 not reflected in training data. Verify current API before implementation for any library with major version history.
-
-**2026-02-26 — Stdout Is the Only Correct Logging Target in Containers**
-Writing logs to files inside containers creates operational complexity with zero benefit. Stdout decouples the application from logging infrastructure entirely.
-
-**2026-02-25 — Decomposition Is a Principle, Granularity Is a Variable**
-The right question is not "microservices or monolith?" It is: what is the latency budget, and where does it come from?
-
-**2026-02-25 — .gitignore and Security Actions Are Commit Zero**
-Security scanning added mid-project means every prior commit was unscanned.
-
-**2026-02-25 — Contracts Before Implementation**
-Writing OpenAPI specs first forces clarity. Ambiguities that would cause mid-implementation pivots get resolved at design time instead.
-
-**2026-02-25 — Stub Contracts Are Real Contracts**
-When the real implementation replaces a stub, no caller changes. That is the test.
-
 ---
 
-## 20. Phase Planning — When in Doubt, Phase It Out
+## 19. Phase Planning — When in Doubt, Phase It Out
 
 For projects larger than a handful of Jobs, build order is an architectural decision that deserves the same deliberate treatment as Job decomposition. The wrong build sequence produces a constellation that cannot be meaningfully tested until it is mostly complete. The right sequence produces a working system at every phase boundary — each phase delivers something observable, verifiable, and useful on its own.
 
@@ -706,7 +505,9 @@ The AI partner maintains PHASE-PLAN.md as source of truth alongside the code. Wh
 
 ---
 
-## 21. Augur Canis — Standard TCA Component
+---
+
+## 20. Augur Canis — Standard TCA Component
 
 Augur Canis (AC) is a health and behavioral monitoring service for TCA constellations.  It is also a standalone product with its own repository.  Every TCA constellation includes an Augur Canis instance.
 
@@ -776,7 +577,129 @@ Full setup reference: [AC-GUIDELINES.md](AC-GUIDELINES.md).
 
 ---
 
-## 22. cert-forge — PKI Abstraction Layer
+## 18. What We've Learned (Running Log)
+
+Most recent first. Add entries as lessons are established — not on every commit, but when a principle is proven or a painful mistake earns its place here.
+
+**2026-03-31 — Augur Canis: The Correct Health Check Architecture**
+The Redis pub/sub coordination pattern for health checks — where the healthcheck binary inside a container triggers a check via Redis rather than exposing an HTTP port — eliminates every class of health check vulnerability simultaneously: no open ports, no unauthenticated surfaces, health check traffic itself observable through the monitoring layer. This pattern is not TCA-specific; it is the correct architecture for any containerized environment. TCA's polyglot constraint forced the general solution by making language-specific workarounds unacceptable across six languages simultaneously.
+
+**2026-03-31 — Augur Canis: Point-to-Point Networks Are Non-Negotiable**
+A shared health check network introduces the attack vector the agent is designed to detect. If a Job is compromised and the Augur Canis agent shares a network with all Jobs, the compromised Job can reach every other Job through that network. N Jobs require N dedicated two-member networks. The naming convention is `ac-{service}-net`.
+
+**2026-03-31 — K8s Container Replacement Inferred from Container ID Change**
+Kubernetes container replacement does not require Kubernetes API access or RBAC permissions to detect. The healthcheck binary already sends the container ID (`$HOSTNAME`) on every check request. Augur Canis tracks the previous container ID per Job and infers replacement when it changes. PreStop lifecycle hooks are an optional enhancement for advance notice but are not required.
+
+**2026-03-27 — Config Objects: Nest Before Callers Exist**
+TCA Vox report config required a mid-development restructure from flat to nested sections because fields outgrew the flat shape before structure was established. Restructuring after callers exist requires updating every caller. Nest early.
+
+**2026-03-27 — Vega SVG Has a Hardcoded White Background**
+`vega.toSVG()` outputs `style="background-color: white"` regardless of config. Strip it. In `vconcat`, strip `$schema` from sub-specs, add explicit `width`, and use `resolve: { scale/legend: { color: 'independent' } }`.
+
+**2026-03-27 — PostgreSQL Rejects Column Aliases in GROUP BY**
+`GROUP BY value` where `value` is an alias fails. Use the full expression. This diverges from MySQL/SQLite behavior. AI-generated PostgreSQL must use full expressions.
+
+**2026-03-27 — Define Status Models Completely Before Implementation**
+Collapsing status values mid-project requires updating every Job that checks that field. TCA Vox: `open` → `public/private` missed the vote handler, silently rejecting all votes. Define the complete status enum in the contract first.
+
+**2026-03-27 — Async Pipeline Fields Must Be Complete at Entry**
+Missing fields fail silently at the far end of the pipeline, not at the point of omission. TCA Vox: missing `submittedAt` in `ForwardedVote` caused silent vote rejection in a background goroutine. Define all pipeline fields contractually and validate at entry.
+
+**2026-03-27 — GnuCOBOL OPEN EXTEND Requires Existing File**
+`OPEN EXTEND` fails with status 35 on a non-existent file. Probe with `OPEN INPUT` first, then branch to `OPEN OUTPUT` for new files.
+
+**2026-03-27 — UI Route Guards Must Be Symmetric**
+Multiple effects with separate skip lists will diverge. One canonical skip list, referenced by all effects.
+
+**2026-03-27 — Schema Changes Require Volume Resets**
+`CREATE TABLE IF NOT EXISTS` does not add new columns. Volume reset (`docker compose down -v`) required when adding columns to existing tables.
+
+**2026-03-07 — No Alpine in Runtime Stages**
+Alpine is not permitted in runtime container stages. Go Jobs run in scratch. TypeScript/Node use distroless. The only exception is `cert-init`. Zero warnings on a build is the standard.
+
+**2026-03-04 — x-tca-security Belongs in the Contract, Not the Implementation**
+Security posture defined only in implementation code is invisible to subsequent Jobs and contract reviewers. The `x-tca-security` block makes security requirements a first-class part of the interface definition.
+
+**2026-02-26 — npm ci + Lockfiles Are Non-Negotiable in Docker**
+`npm install` without a committed lockfile produces version drift. Use `npm ci`.
+
+**2026-02-26 — Check Library API Versions Before Writing Code**
+SimpleWebAuthn v10 had breaking changes from v9 not reflected in training data. Verify current API before implementation for any library with major version history.
+
+**2026-02-26 — Stdout Is the Only Correct Logging Target in Containers**
+Writing logs to files inside containers creates operational complexity with zero benefit. Stdout decouples the application from logging infrastructure entirely.
+
+**2026-02-25 — Decomposition Is a Principle, Granularity Is a Variable**
+The right question is not "microservices or monolith?" It is: what is the latency budget, and where does it come from?
+
+**2026-02-25 — .gitignore and Security Actions Are Commit Zero**
+Security scanning added mid-project means every prior commit was unscanned.
+
+**2026-02-25 — Contracts Before Implementation**
+Writing OpenAPI specs first forces clarity. Ambiguities that would cause mid-implementation pivots get resolved at design time instead.
+
+**2026-02-25 — Stub Contracts Are Real Contracts**
+When the real implementation replaces a stub, no caller changes. That is the test.
+
+**2026-04-09 — cert-forge: PKI Abstraction Is a Standard TCA Component**
+Distributing certificates via a shared Docker volume exposes all private keys to all services — any compromised service can read every other service's key material. cert-forge solves this by acting as a PKI abstraction layer: it generates the CA in memory, issues instance certificates on demand over an enrollment mTLS connection, and holds all private key material in memory only. Services receive their own cert/key over an encrypted channel and never see any other service's material. cert-forge is a candidate standard TCA component applicable to any constellation, not a SETI-specific pattern.
+
+**2026-04-09 — cert-forge: Three-Port Architecture Is Load-Bearing**
+TLS client authentication cannot be enforced per-path on a single port — it is a connection-level property. cert-forge requires three distinct servers: port for plain HTTP (CA cert distribution — public), port for enrollment mTLS (instance cert issuance — requires enrollment cert), port for constellation mTLS (signing operations — requires instance cert). Attempting to collapse these onto fewer ports will break the security model.
+
+**2026-04-09 — cert-forge: Enrollment CA Pattern**
+cert-forge generates a separate enrollment CA whose only issued credential is a single enrollment cert written to the shared volume. This cert's only capability is calling the instance-cert endpoint. The constellation CA private key never touches the shared volume. In K8s production, the cert issuance backend points to cert-manager or the organizational CA — the signing responsibility stays with cert-forge, the constellation is decoupled from infrastructure PKI choices.
+
+**2026-04-09 — Gateway Must Forward Upstream Response Headers**
+A reverse proxy that reads the upstream response body and status code but does not copy upstream response headers silently discards Set-Cookie, Cache-Control, and other headers the client depends on. In SETI, the gateway was discarding Set-Cookie from signal-clearance, so the httpOnly refresh token cookie was never stored in the browser — the client sent every refresh request with no cookie and received 400. Always copy all upstream response headers to the client response before writing the body.
+
+**2026-04-09 — httpOnly Cookie Scope Is the Issuing Domain and Port**
+A cookie set by a service on port N is scoped to port N. If a reverse proxy on port M forwards the response but does not preserve the Set-Cookie header, the browser never receives the cookie. If the proxy does forward it, the cookie is scoped to the proxy's port (M), and the browser will send it back to port M — which is correct when all client traffic routes through the proxy. The cookie must be issued through the gateway, not directly from the upstream service, for cookie-based auth to work in a proxied architecture.
+
+**2026-04-09 — Session Timeout Is Inactivity Timeout, Not Wall Clock**
+A JWT with a 15-minute TTL is not a 15-minute session limit — it is a 15-minute inactivity timeout, implemented by refreshing the token on every authenticated API call. getFreshJWT() must call the refresh endpoint unconditionally on every invocation, not only when the token is near expiry. Any expiry-check before refresh defeats the inactivity timeout model: a user active at minute 10 who returns at minute 17 is still locked out because the token was never refreshed during the active period.
+
+**2026-04-09 — Contract Title Must Produce the Same String as Service Self-Registration Name**
+Contract-test derives the service name from the contract title using serviceNameFromTitle(). Augur Canis looks up registered jobs by the name the service used when it called self-register. If these two strings don't match exactly, every test for that service is silently skipped with job_not_deployed — not failed, skipped. The contract title is authoritative. Display name choices (capitalisation, numeronym substitution like Wr4ngler vs Wrangler) must not diverge from the technical identifier. Verify: serviceNameFromTitle(contract.title) == service.service_name in self-registration payload.
+
+**2026-04-13 — Contract Tests Are Not Generated Tests**
+A contract test suite generated from OpenAPI contracts cannot independently verify those contracts — it re-states them.  Independent verification requires a human to read the contract, understand the intent, and write assertions separately.  If a contract changes, the tests must be updated manually.  That friction is the point.  Hardcode the test suite; update it by hand.
+
+**2026-04-13 — Negative Tests Are the Tests Most Likely to Find Real Bugs**
+Positive tests verify that correct input produces correct output.  Negative tests verify that incorrect input produces a 4xx response, not a 5xx.  A 5xx on bad input means the Job is swallowing errors.  This is a real bug that positive tests cannot surface.  Every Job with POST endpoints needs at least one negative test sending malformed or missing required fields.
+
+**2026-04-13 — Detection Thresholds Belong in Code, Not Configuration**
+Monitoring and alerting thresholds are architectural decisions with operational consequences.  An environment variable threshold can be set to zero by anyone with access to the compose file, then reset.  A hardcoded constant requires a code review, a rebuild, and a deployment.  The friction is the safeguard.  Interactions' critical failure threshold (50%) and silence window (7 days) are Go constants, not env vars.
+
+**2026-04-13 — Python BaseHTTPServer + Go mTLS Client: Use ResilientHTTPServer**
+Python's `BaseHTTPServer.handle_error` propagates `BrokenPipeError` and `ssl.SSLError` to stderr and terminates the handler thread.  This causes the Go mTLS client to see a broken pipe on the write side.  Subclass `HTTPServer` with a `handle_error` override that silently absorbs `BrokenPipeError`, `ConnectionResetError`, and `ssl.SSLError`.  These are expected when an mTLS client closes the connection before reading the full response.
+
+**2026-04-13 — Go HTTP Client + Python BaseHTTPServer: Use bytes.NewReader with ContentLength**
+A custom `io.Reader` type that only implements `Read()` causes Go's HTTP client to use chunked transfer encoding — it cannot determine content length upfront.  Python's `BaseHTTPServer` does not handle chunked POST bodies reliably under TLS and closes the connection mid-write.  Use `bytes.NewReader(payload)` with explicit `req.ContentLength = int64(len(payload))` for all POST requests from Go to Python services.
+
+**2026-04-13 — Redis Streams over Lists for Time-Series Data**
+Redis Lists (LPUSH/LTRIM) store raw values with no timestamps.  Time-bounded queries require iterating the full list and filtering client-side.  Redis Streams (XADD/XRANGE) store entries with millisecond-precision timestamps as built-in IDs, enabling `XRANGE minMs maxMs` queries with no client-side filtering.  Any metric or event data that will be queried by time window belongs in a Stream.
+
+**2026-04-13 — AI-lien With Lore Is a Different Instrument Than AI-lien Without It**
+An AI analysis without institutional memory is a first-responder with no case history.  Feeding Lore baselines, recent incidents, and known patterns into the analysis context before every query produces qualitatively different assessments.  The loop — Lore feeds AI-lien, AI-lien feeds Lore — means every analysis makes the next one better.  Build the memory layer before depending on the intelligence layer.
+
+**2026-04-13 — The Notifier Must Be a Permanent Stub in the Open Source Distribution**
+Notification mechanisms are environment-specific.  A default implementation that "mostly works" (e.g., a generic SMTP sender) gives operators the wrong signal — they ship with a default they did not choose, and humans do not get paged correctly.  An explicit permanent stub with `stub_active: true` in the health response forces operators to make a deliberate decision about how humans get woken up.  The stub is the safeguard.
+
+**2026-04-13 — getFreshJWT in React useEffect Dependencies Causes Infinite Loops**
+Functions from hooks (e.g., `useAuth`) typically get a new reference on every render.  Including them in `useEffect` or `useCallback` dependency arrays causes the effect to fire on every render, triggering state updates, causing re-renders.  Fix: store the function in a `useRef` and sync it with a separate effect.  Call `ref.current()` inside effects instead of the function directly.  The dependency array contains only the values that should meaningfully trigger re-runs.
+
+**2026-04-12 — Chunked Transfer Encoding Breaks Node.js TLS POST Endpoints from Go mTLS Clients**
+Node.js TLS POST endpoint connections from Go mTLS clients time out consistently when the Go client uses chunked transfer encoding.  AC's suite removes negative POST tests for Node.js services (signal-clearance) rather than fighting the transport mismatch.  Verify via Ring Trial instead.
+
+**2026-04-12 — Plot Test Retry Logic Belongs in Plot-test, Not Callers**
+Retry logic for transient failures (pod recycle, connection refused, 5xx) belongs in the executor — plot-test in this case — not in callers or escalation paths.  Only retry on network-level failures and 5xx.  Never retry on 4xx, assertion failures, or chain failures.  Record the attempt count in every step result so the pattern is visible in Lore even when the plot passes.
+
+
+
+---
+
+## 21. cert-forge — PKI Abstraction Layer
 
 Every TCA constellation needs certificates. The naive approach — generating all certificates in an init container and distributing them via a shared Docker volume — has a fundamental flaw: every service can read every other service's private key material. A single compromised container exposes the entire constellation's PKI.
 
@@ -848,60 +771,12 @@ This means cert-forge can be restarted in K8s without requiring a constellation-
 
 ### Adding cert-forge to a New TCA Project (Kubernetes)
 
-1. Copy the cert-forge service directory from the SETI repository. cert-forge has no constellation-specific code in the Go files — only `forge.json` is constellation-specific.
-2. Add the cert-forge Helm templates from the SETI chart: `ServiceAccount`, `Role`, `RoleBinding`, `Deployment`, `Service`. The Role requires two rules:
-   - `get`, `create`, `update` on `secrets` — for writing cert material to the K8s Secret
-   - `get`, `patch` on `deployments` — for rotation-triggered rolling restarts of stateful workloads
-3. Configure `forge.json` for the constellation. Required fields beyond the CA block:
-   - `traefik_ca_secret` — name of the Opaque Secret cert-forge will write containing the CA cert as `tls.ca` for Traefik `ServersTransport` backend verification
-   - In `services`, add a static cert entry for the external hostname with `tls_secret` set — cert-forge will write a `kubernetes.io/tls` Secret with this name for Traefik TLS termination
-   - `rotation` block — configure `instance_interval_days`, `ca_interval_days`, `ca_overlap_hours`, `strategy`, and `deployments` (stateful workloads only — see Automatic Rotation below)
-4. cert-forge writes all cert material to a K8s Secret on startup. Every other service mounts the Secret at `/certs` read-only.
-5. cert-forge's readiness probe uses `httpGet` on the public port (`/ca`, plain HTTP). Every other service uses `exec: ["/healthcheck"]`.
-6. An init container on each service (`wait-for-cert-forge`) polls the public port until it responds before the main container starts.
-7. The certs volume from Docker Compose is replaced entirely by the K8s Secret. No PVC required for cert material.
-8. Set `imagePullPolicy: Always` on all deployment templates. Mutable tags (e.g., `dev`) will not be re-pulled without this, causing the cluster to silently run stale images after a push.
-
-### Traefik TLS Integration (Kubernetes)
-
-In a K8s deployment with Traefik ingress, cert-forge generates two additional Secrets for each constellation:
-
-**`{constellation}-traefik-tls`** (`kubernetes.io/tls`) — contains `tls.crt` and `tls.key` for the external hostname cert. Traefik mounts this for browser-facing TLS termination. Configured by adding `"tls_secret": "{constellation}-traefik-tls"` to the static cert entry in `forge.json`.
-
-**`{constellation}-traefik-ca`** (Opaque) — contains `tls.ca` with the constellation CA cert for Traefik `ServersTransport` backend verification. Configured by adding `"traefik_ca_secret": "{constellation}-traefik-ca"` to `forge.json`.
-
-The gateway's instance cert must include the external hostname in its SANs. Set `GATEWAY_EXTERNAL_HOSTNAME` via Helm values (`gateway.externalHostname`) — the certforge client reads this at startup and includes it in the `/instance-cert` request alongside the standard entries. The `sans` field overrides defaults, so the standard entries (`gateway`, `gateway-{instanceID}`, `localhost`) must be explicitly included.
-
-The ingress pattern uses `IngressRoute` (not the basic `Ingress` resource) with `scheme: https` and a `ServersTransport` reference. The gateway must speak HTTPS on its external port — plain HTTP is not acceptable in a zero-trust environment regardless of position in the stack.
-
-**Traefik v2 limitation:** `ServersTransport` `rootCAsSecrets` requires the CA Secret to be in `kube-system`. Granting cert-forge write access to `kube-system` is a production security decision. In dev, use `insecureSkipVerify: true` in the `ServersTransport`. The `{constellation}-traefik-ca` Secret is generated and available for production when the access model is defined.
-
-### Automatic Cert Rotation (Kubernetes)
-
-cert-forge manages automatic rotation of both instance certs and the constellation CA. Rotation is K8s-only — the rotation loop is a no-op in Docker Compose.
-
-**Instance cert rotation:** cert-forge patches the `kubectl.kubernetes.io/restartedAt` annotation on each Deployment listed in `forge.json rotation.deployments`, triggering a rolling restart. Pods re-enroll against the current CA and receive new instance certs. In healthy production environments most pods roll before the instance interval fires — the rotation list should contain only stateful workloads that do not roll on their own.
-
-**CA rotation:** cert-forge generates a new CA and activates it immediately for `/instance-cert` issuance and the `/ca` endpoint. An overlap window (default 24h) follows during which services that restart pick up the new CA. After the overlap window, all Deployments in the rotation list are rolled. The old CA is retired.
-
-**`forge.json` rotation block:**
-
-```json
-"rotation": {
-  "instance_interval_days": 30,
-  "ca_interval_days": 30,
-  "ca_overlap_hours": 24,
-  "strategy": "simultaneous",
-  "deployments": [
-    { "name": "postgres", "namespace": "seti" },
-    { "name": "redis",    "namespace": "seti" }
-  ]
-}
-```
-
-`strategy` accepts `"simultaneous"` (all listed Deployments patched at once) or `"staged"` (stubbed — falls back to simultaneous with a log warning, clean swap point for production batch rolling).
-
-Only list Deployments that will not roll naturally within the rotation interval. For most constellations this means: Mongo instances, PostgreSQL, Redis.
+1. Copy the cert-forge service directory from the SETI repository.
+2. Add the cert-forge Helm templates from the SETI chart: `ServiceAccount`, `Role`, `RoleBinding`, `Deployment`, `Service`. The Role grants `get`, `create`, `update` on secrets in the namespace only.
+3. cert-forge writes all cert material to a K8s Secret on startup. Every other service mounts the Secret at `/certs` read-only.
+4. cert-forge's readiness probe uses `httpGet` on the public port (`/ca`, plain HTTP). Every other service uses `exec: ["/healthcheck"]`.
+5. An init container on each service (`wait-for-cert-forge`) polls the public port until it responds before the main container starts.
+6. The certs volume from Docker Compose is replaced entirely by the K8s Secret. No PVC required for cert material.
 
 ### certforge Client — Language Reference
 
@@ -929,7 +804,7 @@ All four implementations follow the same flow: fetch CA cert → request instanc
 
 ---
 
-## 23. SETI — Standard TCA Monitoring Constellation
+## 22. SETI — Standard TCA Monitoring Constellation
 
 S.E.T.I. (Search for Erroneous Tessellated Interactions) is the monitoring constellation for TCA applications.  It sits outside the constellations it monitors and watches them through the Augur Canis contract test layer, the Plot test behavioral layer, and the Observability event stream.
 
@@ -962,7 +837,7 @@ The adoption path:  AC first (standalone, one dependency, self-registration snip
 
 ---
 
-## 24. Testing Philosophy — Three Layers
+## 23. Testing Philosophy — Three Layers
 
 TCA testing has three distinct layers.  Each serves a different purpose and requires a different author.
 
@@ -1014,7 +889,7 @@ TCA testing has three distinct layers.  Each serves a different purpose and requ
 
 ---
 
-## 25. Rodeo Clown (Future — Security Boundary Verification)
+## 24. Rodeo Clown (Future — Security Boundary Verification)
 
 Rodeo Clown is a planned SETI sidecar for security boundary verification.  Named deliberately — a Rodeo Clown operates outside the normal structure and absorbs hits.
 
