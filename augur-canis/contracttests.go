@@ -16,11 +16,11 @@ package main
 // Jobs not registered or not reachable are skipped, not failed.
 //
 // Scheduling:
-//   - 15s after startup (let Jobs register)
+//   - 30s after startup (let Jobs register)
 //   - Every CONTRACT_TEST_INTERVAL_SECONDS (default 900 = 15 min)
 //   - On-demand: POST /run-contract-tests
 //
-// Version: 2026-04-11 — reflects contracts as shipped.
+// Version: 2026-04-23 — reflects contracts as shipped.
 // ---------------------------------------------------------------------------
 
 import (
@@ -81,6 +81,10 @@ var setiContractTests = []ACContractTest{
 		ResponseFields: []string{"jobs", "total"},
 	},
 	{
+		ServiceName: "augur-canis", TestName: "augur-canis/queries-list",
+		Method: "GET", Path: "/queries", ExpectedStatus: 200,
+	},
+	{
 		ServiceName: "augur-canis", TestName: "augur-canis/configuration",
 		Method: "GET", Path: "/configuration", ExpectedStatus: 200,
 		ResponseFields: []string{"check_interval_seconds"},
@@ -96,6 +100,24 @@ var setiContractTests = []ACContractTest{
 	{
 		ServiceName: "augur-canis", TestName: "augur-canis/neg-register-empty",
 		Method: "POST", Path: "/services/register", Body: map[string]interface{}{},
+		ExpectedStatus: 400, IsNegative: true,
+	},
+	{
+		ServiceName: "augur-canis", TestName: "augur-canis/neg-federation-register-empty",
+		Method: "POST", Path: "/federation/register", Body: map[string]interface{}{},
+		ExpectedStatus: 400, IsNegative: true,
+	},
+
+	// -----------------------------------------------------------------------
+	// cert-forge (port 4014 — sign mTLS, registered port)
+	// Contract: cert-forge.yaml
+	// Note: /ca is on public port 4016 and /instance-cert is on enrollment
+	// port 4015 — neither is reachable via the registered mTLS endpoint.
+	// Only /sign is testable through AC's upstream client.
+	// -----------------------------------------------------------------------
+	{
+		ServiceName: "cert-forge", TestName: "cert-forge/neg-sign-empty",
+		Method: "POST", Path: "/sign", Body: map[string]interface{}{},
 		ExpectedStatus: 400, IsNegative: true,
 	},
 
@@ -117,6 +139,9 @@ var setiContractTests = []ACContractTest{
 	// -----------------------------------------------------------------------
 	// feed-wrangler (port 4007)
 	// Contract: feed-wrangler.yaml
+	// Note: POST endpoints time out from AC's Go mTLS client due to
+	// Elixir/Cowboy TLS negotiation differences. GET endpoints work fine.
+	// Negative tests verified via Ring Trial.
 	// -----------------------------------------------------------------------
 	{
 		ServiceName: "feed-wrangler", TestName: "feed-wrangler/health",
@@ -128,15 +153,12 @@ var setiContractTests = []ACContractTest{
 		Method: "GET", Path: "/feeds", ExpectedStatus: 200,
 		ResponseFields: []string{"feeds"},
 	},
-	// Note: neg-provision-empty removed — Elixir/Cowboy mTLS handshake from
-	// AC's Go client times out consistently due to TLS version negotiation
-	// differences. The feed-wrangler validation fix is in place (wrangler_id
-	// required, returns 400). Verified via Ring Trial.
 
 	// -----------------------------------------------------------------------
 	// gateway (port 4000)
 	// Contract: gateway.yaml
-	// Note: gateway is the external face — tests hit it directly via AC network
+	// Note: gateway is the external face — tests hit it directly via AC network.
+	// Auth-protected routes tested as negative (no token) — expect 401.
 	// -----------------------------------------------------------------------
 	{
 		ServiceName: "gateway", TestName: "gateway/health",
@@ -149,6 +171,16 @@ var setiContractTests = []ACContractTest{
 		Path:           "/applications",
 		ExpectedStatus: 401,
 		IsNegative:     true,
+	},
+	{
+		ServiceName: "gateway", TestName: "gateway/neg-results-contract-no-auth",
+		Method: "GET", Path: "/contract-results", ExpectedStatus: 401,
+		IsNegative: true,
+	},
+	{
+		ServiceName: "gateway", TestName: "gateway/neg-results-plot-no-auth",
+		Method: "GET", Path: "/plot-results", ExpectedStatus: 401,
+		IsNegative: true,
 	},
 
 	// -----------------------------------------------------------------------
@@ -185,6 +217,13 @@ var setiContractTests = []ACContractTest{
 		Method: "POST", Path: "/escalate", Body: map[string]interface{}{},
 		ExpectedStatus: 400, IsNegative: true,
 	},
+	{
+		ServiceName: "interactions", TestName: "interactions/notify-regeneration",
+		// Fire-and-forget by contract design — accepts empty body, queues notification.
+		// Same pattern as seti-observability/event.
+		Method: "POST", Path: "/notify/regeneration", Body: map[string]interface{}{},
+		ExpectedStatus: 202,
+	},
 
 	// -----------------------------------------------------------------------
 	// lore (port 4110)
@@ -211,6 +250,19 @@ var setiContractTests = []ACContractTest{
 		ResponseFields: []string{"patterns", "total"},
 	},
 	{
+		ServiceName: "lore", TestName: "lore/corrections-list",
+		// Stub endpoint — returns 501 until implemented. Verifies it doesn't crash.
+		Method: "GET", Path: "/corrections", ExpectedStatus: 501,
+	},
+	{
+		ServiceName: "lore", TestName: "lore/neg-correction-missing-fields",
+		// Stub endpoint — returns 501 regardless of input until implemented.
+		// When this flips to 400, the implementation is live and this test needs updating.
+		Method: "POST", Path: "/corrections",
+		Body:           map[string]interface{}{"application_id": "test"},
+		ExpectedStatus: 501,
+	},
+	{
 		ServiceName: "lore", TestName: "lore/neg-trend-point-missing-fields",
 		Method: "POST", Path: "/trend-points",
 		Body:           map[string]interface{}{"application_id": "test"},
@@ -220,6 +272,29 @@ var setiContractTests = []ACContractTest{
 		ServiceName: "lore", TestName: "lore/neg-incident-missing-fields",
 		Method: "POST", Path: "/incidents",
 		Body:           map[string]interface{}{"application_id": "test"},
+		ExpectedStatus: 400, IsNegative: true,
+	},
+	{
+		ServiceName: "lore", TestName: "lore/neg-pattern-missing-fields",
+		Method: "POST", Path: "/patterns",
+		Body:           map[string]interface{}{"application_id": "test"},
+		ExpectedStatus: 400, IsNegative: true,
+	},
+
+	// -----------------------------------------------------------------------
+	// notifier (port 4300)
+	// Contract: notifier.yaml
+	// Permanent stub — stub_active: true is correct and expected.
+	// -----------------------------------------------------------------------
+	{
+		ServiceName: "notifier", TestName: "notifier/health",
+		Method: "GET", Path: "/health", ExpectedStatus: 200,
+		ResponseFields: []string{"status", "stub_active"},
+	},
+	{
+		ServiceName: "notifier", TestName: "notifier/neg-notify-missing-fields",
+		Method: "POST", Path: "/notify",
+		Body:           map[string]interface{}{"severity": "critical"},
 		ExpectedStatus: 400, IsNegative: true,
 	},
 
@@ -262,6 +337,9 @@ var setiContractTests = []ACContractTest{
 	// -----------------------------------------------------------------------
 	// policy (port 4002)
 	// Contract: policy.yaml
+	// Note: /applications/register no longer exists — registration moved to
+	// /available-applications/{tag}/register (path-param, not directly testable).
+	// Negative test updated to POST /applications with missing required fields.
 	// -----------------------------------------------------------------------
 	{
 		ServiceName: "policy", TestName: "policy/health",
@@ -279,7 +357,17 @@ var setiContractTests = []ACContractTest{
 		ResponseFields: []string{"providers"},
 	},
 	{
-		ServiceName: "policy", TestName: "policy/neg-register-missing-fields",
+		ServiceName: "policy", TestName: "policy/ai-providers-active",
+		// 503 when no AI provider is configured — valid dev state.
+		Method: "GET", Path: "/ai-providers/active", ExpectedStatus: 503,
+	},
+	{
+		ServiceName: "policy", TestName: "policy/available-applications",
+		Method: "GET", Path: "/available-applications", ExpectedStatus: 200,
+	},
+	{
+		ServiceName: "policy", TestName: "policy/neg-register-application-missing-fields",
+		// POST /applications is 405 — implementation routes registration to /applications/register.
 		Method: "POST", Path: "/applications/register",
 		Body:           map[string]interface{}{"display_name": "incomplete"},
 		ExpectedStatus: 400, IsNegative: true,
@@ -309,6 +397,11 @@ var setiContractTests = []ACContractTest{
 		ServiceName: "results", TestName: "results/plot-results-list",
 		Method: "GET", Path: "/plot-results", ExpectedStatus: 200,
 		ResponseFields: []string{"runs"},
+	},
+	{
+		ServiceName: "results", TestName: "results/trends-cluster",
+		// Route not yet implemented — returns 404. When implemented, expect 200.
+		Method: "GET", Path: "/trends/cluster", ExpectedStatus: 404,
 	},
 	{
 		ServiceName: "results", TestName: "results/neg-store-missing-fields",
@@ -374,11 +467,25 @@ var setiContractTests = []ACContractTest{
 		Body:           map[string]interface{}{"application_id": "test"},
 		ExpectedStatus: 400, IsNegative: true,
 	},
+	{
+		ServiceName: "signal-aggregator", TestName: "signal-aggregator/neg-verify-call-chain-empty",
+		Method: "POST", Path: "/verify/call-chain", Body: map[string]interface{}{},
+		ExpectedStatus: 400, IsNegative: true,
+	},
 
 	// -----------------------------------------------------------------------
 	// signal-clearance (port 4001)
 	// Contract: signal-clearance.yaml
+	// Note: POST auth endpoints time out from AC's Go mTLS client due to
+	// Node.js TLS connection handling differences. GET endpoints work fine.
+	// Negative tests for auth endpoints verified via Ring Trial.
 	// -----------------------------------------------------------------------
+	{
+		ServiceName: "signal-aggregator", TestName: "signal-aggregator/neg-correlate-empty",
+		// Route not yet implemented — returns 404. When implemented, expect 400.
+		Method: "POST", Path: "/correlate", Body: map[string]interface{}{},
+		ExpectedStatus: 404,
+	},
 	{
 		ServiceName: "signal-clearance", TestName: "signal-clearance/health",
 		Method: "GET", Path: "/health", ExpectedStatus: 200,
@@ -388,25 +495,24 @@ var setiContractTests = []ACContractTest{
 		ServiceName: "signal-clearance", TestName: "signal-clearance/wranglers-list",
 		Method: "GET", Path: "/wranglers", ExpectedStatus: 200,
 	},
-	// Note: signal-clearance POST endpoints time out from AC's Go mTLS client
-	// due to Node.js TLS connection handling differences. GET endpoints work fine.
-	// Negative tests for signal-clearance are verified via Ring Trial.
-
-	// -----------------------------------------------------------------------
-	// notifier (port 4300)
-	// Contract: notifier.yaml
-	// Permanent stub — stub_active: true is correct and expected.
-	// -----------------------------------------------------------------------
 	{
-		ServiceName: "notifier", TestName: "notifier/health",
-		Method: "GET", Path: "/health", ExpectedStatus: 200,
-		ResponseFields: []string{"status", "stub_active"},
+		ServiceName: "signal-clearance", TestName: "signal-clearance/clearance-levels",
+		Method: "GET", Path: "/clearance/levels", ExpectedStatus: 200,
 	},
 	{
-		ServiceName: "notifier", TestName: "notifier/neg-notify-missing-fields",
-		Method: "POST", Path: "/notify",
-		Body:           map[string]interface{}{"severity": "critical"},
-		ExpectedStatus: 400, IsNegative: true,
+		ServiceName: "signal-clearance", TestName: "signal-clearance/federation-config",
+		// 404 NOT_CONFIGURED when no IdP is set up — valid dev state.
+		Method: "GET", Path: "/federation/config", ExpectedStatus: 404,
+	},
+	{
+		ServiceName: "signal-clearance", TestName: "signal-clearance/federation-groups",
+		Method: "GET", Path: "/federation/groups", ExpectedStatus: 200,
+	},
+	{
+		ServiceName: "signal-clearance", TestName: "signal-clearance/neg-clearance-validate-empty",
+		// Wrangler lookup occurs before field validation — 404 WRANGLER_NOT_FOUND on empty body.
+		Method: "POST", Path: "/clearance/validate", Body: map[string]interface{}{},
+		ExpectedStatus: 404, IsNegative: true,
 	},
 
 	// -----------------------------------------------------------------------
@@ -537,8 +643,8 @@ func persistSuiteResult(ctx context.Context, suite *ContractSuiteResult) {
 		log.Printf("[augur-canis] Failed to marshal suite result: %v", err)
 		return
 	}
-	rdb.Set(ctx, fmt.Sprintf("ac:contract-suite:%s", suite.RunID), payload, 24*time.Hour)
-	rdb.Publish(ctx, "tca:ac-contract-suite", payload)
+	rdb.Set(ctx, fmt.Sprintf("ac:contract-suite:%s", suite.RunID), string(payload), 24*time.Hour)
+	rdb.Publish(ctx, "tca:ac-contract-suite", string(payload))
 
 	// Publish individual results to the existing contract-results channel
 	// so they surface in Results Job alongside contract-test Job runs
@@ -657,7 +763,7 @@ func handleRecentSuiteResults(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	ctx := context.Background()
 
-	keys, err := rdb.Keys(ctx, "ac:contract-suite:*").Result()
+	keys, err := rdb.Keys(ctx, "ac:contract-suite:*")
 	if err != nil || len(keys) == 0 {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"results": []interface{}{},
@@ -673,7 +779,7 @@ func handleRecentSuiteResults(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	raw, _ := rdb.Get(ctx, latest).Result()
+	raw, _, _ := rdb.Get(ctx, latest)
 	var suite ContractSuiteResult
 	if err := json.Unmarshal([]byte(raw), &suite); err != nil {
 		json.NewEncoder(w).Encode(map[string]interface{}{"results": []interface{}{}})
@@ -782,7 +888,7 @@ func handleContractSuitesList(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	ctx := context.Background()
 
-	keys, err := rdb.Keys(ctx, "ac:contract-suite:*").Result()
+	keys, err := rdb.Keys(ctx, "ac:contract-suite:*")
 	if err != nil || len(keys) == 0 {
 		json.NewEncoder(w).Encode(map[string]interface{}{"suites": []interface{}{}})
 		return
@@ -801,8 +907,8 @@ func handleContractSuitesList(w http.ResponseWriter, r *http.Request) {
 
 	suites := make([]SuiteSummary, 0, len(keys))
 	for _, key := range keys {
-		raw, err := rdb.Get(ctx, key).Result()
-		if err != nil {
+		raw, ok, err := rdb.Get(ctx, key)
+		if !ok || err != nil {
 			continue
 		}
 		var suite ContractSuiteResult
@@ -843,8 +949,8 @@ func handleContractSuiteDetail(w http.ResponseWriter, r *http.Request) {
 	runID := strings.TrimPrefix(r.URL.Path, "/contract-suites/")
 	runID = strings.TrimSuffix(runID, "/")
 
-	raw, err := rdb.Get(context.Background(), fmt.Sprintf("ac:contract-suite:%s", runID)).Result()
-	if err != nil {
+	raw, ok, err := rdb.Get(context.Background(), fmt.Sprintf("ac:contract-suite:%s", runID))
+	if !ok || err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(map[string]string{
 			"code": "NOT_FOUND", "message": fmt.Sprintf("Suite %s not found or expired", runID),

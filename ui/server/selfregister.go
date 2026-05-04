@@ -68,6 +68,7 @@ func selfRegister(serviceName, networkEndpoint string) {
 		"service_name":     serviceName,
 		"network_endpoint": networkEndpoint,
 		"cert_fingerprint": fingerprint,
+		"cert_pem":         string(certPEM),
 		"timestamp":        timestamp,
 		"signature":        base64.StdEncoding.EncodeToString(sig),
 	})

@@ -6,6 +6,8 @@ const MAX_EVENTS = 200;
 export interface SETIEvent {
   id: string;
   timestamp: string;
+  receivedAt?: string;
+  applicationId?: string;
   caller: string;
   callee: string;
   method: string;
@@ -39,7 +41,6 @@ export function useEventStream(jwt: string | null) {
       esRef.current.close();
     }
 
-    // Gateway SSE endpoint — JWT in query param since EventSource can't set headers
     const url = `${GATEWAY}/events?token=${encodeURIComponent(jwt)}`;
     const es = new EventSource(url);
     esRef.current = es;
@@ -50,7 +51,12 @@ export function useEventStream(jwt: string | null) {
 
     es.onmessage = (e) => {
       try {
-        const event: SETIEvent = JSON.parse(e.data);
+        const raw = JSON.parse(e.data);
+        const event: SETIEvent = {
+          ...raw,
+          applicationId: raw.applicationId || raw.application_id,
+          timestamp: raw.timestamp || raw.received_at || raw.receivedAt,
+        };
         setState(prev => ({
           ...prev,
           eventCount: prev.eventCount + 1,
@@ -64,7 +70,6 @@ export function useEventStream(jwt: string | null) {
     es.onerror = () => {
       setState(prev => ({ ...prev, connected: false, error: 'Stream disconnected' }));
       es.close();
-      // Reconnect after 3 seconds
       reconnectTimer.current = setTimeout(connect, 3000);
     };
   }, [jwt]);

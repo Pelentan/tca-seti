@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: seti-remote-apps
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+data:
+  remote-apps.json: |
+    {
+      "tca-vox": {
+        "name": "TCA Vox",
+        "description": "Polyglot polling application — TCA proof of concept.",
+        "namespace": "tca-vox",
+        "ac_endpoint": "https://augur-canis.tca-vox.svc.cluster.local:3025",
+        "federation_endpoint": "https://augur-canis.tca-vox.svc.cluster.local:3052",
+        "ca_url": "http://cert-forge.tca-vox.svc.cluster.local:3022/ca",
+        "registry_url": "https://api.github.com/repos/Pelentan/tca-vox/contents",
+        "registry_plots_path": "contracts/plots",
+        "registry_type": "github",
+        "registry_token_secret": "tca-vox-registry-token"
+      }
+    }

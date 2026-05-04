@@ -37,7 +37,7 @@ import (
 
 var (
 	port             = envOr("PORT", "4110")
-	databaseURL      = mustEnv("DATABASE_URL")
+	databaseURL      = buildDatabaseURL()
 	observabilityURL = envOr("OBSERVABILITY_URL", "https://seti-observability:4011")
 )
 
@@ -54,6 +54,34 @@ func mustEnv(key string) string {
 		log.Fatalf("[lore] Required env var %s not set", key)
 	}
 	return v
+}
+
+// buildDatabaseURL constructs the postgres connection URL using X.509
+// client certificate authentication. No password — lore authenticates
+// via its cert-forge instance cert (CN=lore-db maps to the lore pg role).
+// Falls back to DATABASE_URL env var for Docker Compose compatibility.
+func buildDatabaseURL() string {
+	// Direct URL takes precedence (Docker Compose dev mode)
+	if url := os.Getenv("DATABASE_URL"); url != "" {
+		return url
+	}
+
+	// K8s: cert-based auth — no password in the URL
+	cert := envOr("DATABASE_CERT", "/certs/lore-db.crt")
+	key := envOr("DATABASE_KEY", "/certs/lore-db.key")
+	ca := envOr("DATABASE_CA", "/certs/ca.crt")
+
+	// Verify the cert files exist before building the URL
+	for _, f := range []string{cert, key, ca} {
+		if _, err := os.Stat(f); err != nil {
+			log.Fatalf("[lore] Database cert file not found %s: %v", f, err)
+		}
+	}
+
+	return fmt.Sprintf(
+		"postgres://lore@postgres:5432/lore?sslmode=verify-full&sslcert=%s&sslkey=%s&sslrootcert=%s",
+		cert, key, ca,
+	)
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,7 +1106,10 @@ func main() {
 	log.Printf("[lore] Storage: PostgreSQL (persistent)")
 	log.Printf("[lore] Institutional memory: trend points, baselines, incidents, patterns")
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[lore] Server error: %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[lore] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }

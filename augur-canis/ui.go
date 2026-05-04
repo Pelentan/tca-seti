@@ -30,14 +30,10 @@ import (
 	"time"
 )
 
-// uiPort reads AC_UI_PORT from the environment.
-// Empty string = UI disabled (default).
 func uiPort() string {
 	return os.Getenv("AC_UI_PORT")
 }
 
-// startDevUI launches the plain HTTP UI server if AC_UI_PORT is set.
-// Called from main() — no-op if the env var is unset.
 func startDevUI() {
 	p := uiPort()
 	if p == "" {
@@ -67,16 +63,11 @@ func startDevUI() {
 	}()
 }
 
-// ---------------------------------------------------------------------------
-// API endpoint — aggregates all state the UI needs in one call
-// ---------------------------------------------------------------------------
-
 func serveUIStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	// Jobs
 	type jobSummary struct {
 		ServiceName     string  `json:"service_name"`
 		NetworkEndpoint string  `json:"network_endpoint"`
@@ -89,21 +80,15 @@ func serveUIStatus(w http.ResponseWriter, r *http.Request) {
 
 	jobs := []jobSummary{}
 	for name, j := range registeredJobs {
-		lastSeen, _ := rdb.Get(ctx, fmt.Sprintf(keyLastSeen, name)).Result()
-		isAlert, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertActive, name)).Result()
-		alertType, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertType, name)).Result()
+		lastSeen, _, _ := rdb.Get(ctx, fmt.Sprintf(keyLastSeen, name))
+		isAlert, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertActive, name))
+		alertType, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertType, name))
 
-		// Get latest latency from stream
 		latency := 0.0
-		msgs, err := rdb.XRevRangeN(ctx, fmt.Sprintf(keyLatencyStream, name), "+", "-", 1).Result()
+		msgs, err := rdb.XRevRangeN(ctx, fmt.Sprintf(keyLatencyStream, name), "+", "-", 1)
 		if err == nil && len(msgs) > 0 {
-			if v, ok := msgs[0].Values["latency_ms"]; ok {
-				switch val := v.(type) {
-				case string:
-					latency, _ = strconv.ParseFloat(val, 64)
-				case float64:
-					latency = val
-				}
+			if v, ok := msgs[0].Fields["latency_ms"]; ok {
+				latency, _ = strconv.ParseFloat(v, 64)
 			}
 		}
 
@@ -118,7 +103,6 @@ func serveUIStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Active alerts
 	type alertSummary struct {
 		ServiceName string `json:"service_name"`
 		AlertID     string `json:"alert_id"`
@@ -129,20 +113,19 @@ func serveUIStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	alerts := []alertSummary{}
-	alertKeys, _ := rdb.Keys(ctx, "ac:state:*:alert_active").Result()
+	alertKeys, _ := rdb.Keys(ctx, "ac:state:*:alert_active")
 	for _, key := range alertKeys {
-		v, _ := rdb.Get(ctx, key).Result()
+		v, _, _ := rdb.Get(ctx, key)
 		if v != "1" {
 			continue
 		}
-		// Extract service name: ac:state:{service}:alert_active
 		svc := strings.TrimPrefix(key, "ac:state:")
 		svc = strings.TrimSuffix(svc, ":alert_active")
 
-		alertID, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertID, svc)).Result()
-		alertType, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertType, svc)).Result()
-		firstAt, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertFirstAt, svc)).Result()
-		barkCount, _ := rdb.Get(ctx, fmt.Sprintf(keyBarkCount, svc)).Result()
+		alertID, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertID, svc))
+		alertType, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertType, svc))
+		firstAt, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertFirstAt, svc))
+		barkCount, _, _ := rdb.Get(ctx, fmt.Sprintf(keyBarkCount, svc))
 
 		severity := "warn"
 		if alertType == string(AlertSilence) {
@@ -159,7 +142,6 @@ func serveUIStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Recent contract suite
 	type suiteSummary struct {
 		RunID      string `json:"run_id"`
 		Trigger    string `json:"trigger"`
@@ -171,7 +153,7 @@ func serveUIStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var recentSuite *suiteSummary
-	suiteKeys, _ := rdb.Keys(ctx, "ac:contract-suite:*").Result()
+	suiteKeys, _ := rdb.Keys(ctx, "ac:contract-suite:*")
 	if len(suiteKeys) > 0 {
 		latest := ""
 		for _, k := range suiteKeys {
@@ -179,8 +161,8 @@ func serveUIStatus(w http.ResponseWriter, r *http.Request) {
 				latest = k
 			}
 		}
-		raw, err := rdb.Get(ctx, latest).Result()
-		if err == nil {
+		raw, ok, _ := rdb.Get(ctx, latest)
+		if ok {
 			var suite ContractSuiteResult
 			if jsonErr := json.Unmarshal([]byte(raw), &suite); jsonErr == nil {
 				recentSuite = &suiteSummary{
@@ -196,8 +178,7 @@ func serveUIStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Redis health
-	redisOK := rdb.Ping(ctx).Err() == nil
+	redisOK := rdb.Ping(ctx) == nil
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"constellation":    constellation,
@@ -219,15 +200,10 @@ func serveUIStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ---------------------------------------------------------------------------
-// UI HTML — embedded, no build step, no dependencies
-// ---------------------------------------------------------------------------
-
 func serveUI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(acUIHTML))
 }
-
 const acUIHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>

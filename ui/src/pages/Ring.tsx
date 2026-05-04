@@ -300,7 +300,7 @@ function TrialTab({ isSecWrangler, getFreshJWT }: {
 function ReportsTab({ jwt, getFreshJWT, active }: {
   jwt: string | null;
   getFreshJWT: () => Promise<string | null>;
-  active: { id: string; label: string };
+  active: { id: string; label: string; isSelf: boolean };
 }) {
   const [contractSuites, setContractSuites] = useState<ContractSuite[]>([]);
   const [plotRuns, setPlotRuns] = useState<PlotRun[]>([]);
@@ -322,8 +322,11 @@ function ReportsTab({ jwt, getFreshJWT, active }: {
   useEffect(() => {
     if (!jwt) return;
     setLoading(true);
+    const contractSuitesEndpoint = active.isSelf
+      ? '/augur-canis/contract-suites'
+      : `/constellations/${active.id}/contract-suites`;
     Promise.all([
-      authFetch('/augur-canis/contract-suites'),
+      authFetch(contractSuitesEndpoint),
       authFetch(`/plot-results?application_id=${active.id}&limit=50`),
     ]).then(async ([csRes, prRes]) => {
       if (csRes.ok) { const d = await csRes.json(); setContractSuites(d.suites || []); }
@@ -337,9 +340,12 @@ function ReportsTab({ jwt, getFreshJWT, active }: {
     setExpandedTest(null);
     if (!runId) return;
     setLoadingDetail(true);
+    const detailEndpoint = active.isSelf
+      ? `/augur-canis/contract-suites/${runId}`
+      : `/constellations/${active.id}/contract-suites/${runId}`;
     try {
       // Try dedicated endpoint first; fall back to checks/recent for the latest run
-      const res = await authFetch(`/augur-canis/contract-suites/${runId}`);
+      const res = await authFetch(detailEndpoint);
       if (res.ok) {
         setContractDetail(await res.json());
       } else {

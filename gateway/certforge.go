@@ -4,8 +4,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/pem"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -53,8 +53,9 @@ func obtainCerts(serviceName string) *CertMaterial {
 	enrollURL := deriveEnrollmentURL(forgeURL, enrollPort)
 
 	caCertPEM := fetchCACert(forgeURL)
+	sans      := buildSANs(serviceName, instanceID)
 	certPEM, keyPEM, fingerprint, instanceCN, validUntil :=
-		requestInstanceCert(enrollURL, enrollCert, enrollKey, serviceName, instanceID)
+		requestInstanceCert(enrollURL, enrollCert, enrollKey, serviceName, instanceID, sans)
 
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
@@ -73,6 +74,22 @@ func obtainCerts(serviceName string) *CertMaterial {
 		ServiceName:  serviceName,
 		ValidUntil:   validUntil,
 	}
+}
+
+// buildSANs constructs the SAN list for the gateway's instance cert.
+// Because cert-forge's sans field overrides (not merges) the defaults,
+// we must explicitly include the standard entries alongside any
+// environment-supplied external hostname.
+func buildSANs(serviceName, instanceID string) []string {
+	sans := []string{
+		serviceName,
+		fmt.Sprintf("%s-%s", serviceName, instanceID),
+		"localhost",
+	}
+	if h := os.Getenv("GATEWAY_EXTERNAL_HOSTNAME"); h != "" {
+		sans = append(sans, h)
+	}
+	return sans
 }
 
 func deriveEnrollmentURL(forgeURL, enrollPort string) string {
@@ -114,7 +131,7 @@ func fetchCACert(forgeURL string) []byte {
 	return nil
 }
 
-func requestInstanceCert(enrollURL, enrollCertPath, enrollKeyPath, serviceName, instanceID string) ([]byte, []byte, string, string, time.Time) {
+func requestInstanceCert(enrollURL, enrollCertPath, enrollKeyPath, serviceName, instanceID string, sans []string) ([]byte, []byte, string, string, time.Time) {
 	enrollTLSCert, err := tls.LoadX509KeyPair(enrollCertPath, enrollKeyPath)
 	if err != nil {
 		log.Fatalf("[certforge] Cannot load enrollment cert %s: %v", enrollCertPath, err)
@@ -131,11 +148,19 @@ func requestInstanceCert(enrollURL, enrollCertPath, enrollKeyPath, serviceName, 
 		Timeout: 10 * time.Second,
 	}
 
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"service_name": serviceName,
+		"instance_id":  instanceID,
+		"sans":         sans,
+	})
+	if err != nil {
+		log.Fatalf("[certforge] Failed to marshal instance-cert request: %v", err)
+	}
+
 	url := strings.TrimRight(enrollURL, "/") + "/instance-cert"
-	body := fmt.Sprintf(`{"service_name":%q,"instance_id":%q}`, serviceName, instanceID)
 
 	for attempt := 1; attempt <= 30; attempt++ {
-		req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+		req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(string(reqBody)))
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := client.Do(req)
@@ -246,34 +271,33 @@ func signPayload(mat *CertMaterial, payload []byte) (string, error) {
 func selfRegisterWithAC(mat *CertMaterial, networkEndpoint string) {
 	acURL := cfEnvOr("AUGUR_CANIS_URL", "https://augur-canis:4010")
 
-	for attempt := 1; attempt <= 10; attempt++ {
+	for attempt := 1; ; attempt++ {
 		timestamp := time.Now().UTC().Format(time.RFC3339)
 		payload   := mat.ServiceName + networkEndpoint + mat.Fingerprint + timestamp
 
 		sig, err := signPayload(mat, []byte(payload))
 		if err != nil {
-			log.Printf("[%s] selfRegister: signing failed (attempt %d/10): %v", mat.ServiceName, attempt, err)
+			log.Printf("[%s] selfRegister: signing failed (attempt %d): %v", mat.ServiceName, attempt, err)
 			time.Sleep(3 * time.Second)
 			continue
 		}
 
-	// Extract cert PEM from the tls.Certificate
-	var certPEM string
-	if len(mat.InstanceCert.Certificate) > 0 {
-		certPEM = string(pem.EncodeToMemory(&pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: mat.InstanceCert.Certificate[0],
-		}))
-	}
+		var certPEM string
+		if len(mat.InstanceCert.Certificate) > 0 {
+			certPEM = string(pem.EncodeToMemory(&pem.Block{
+				Type:  "CERTIFICATE",
+				Bytes: mat.InstanceCert.Certificate[0],
+			}))
+		}
 
-	body, _ := json.Marshal(map[string]interface{}{
-		"service_name":     mat.ServiceName,
-		"network_endpoint": networkEndpoint,
-		"cert_fingerprint": mat.Fingerprint,
-		"cert_pem":         certPEM,
-		"timestamp":        timestamp,
-		"signature":        sig,
-	})
+		body, _ := json.Marshal(map[string]interface{}{
+			"service_name":     mat.ServiceName,
+			"network_endpoint": networkEndpoint,
+			"cert_fingerprint": mat.Fingerprint,
+			"cert_pem":         certPEM,
+			"timestamp":        timestamp,
+			"signature":        sig,
+		})
 
 		client := &http.Client{
 			Transport: &http.Transport{
@@ -289,7 +313,7 @@ func selfRegisterWithAC(mat *CertMaterial, networkEndpoint string) {
 
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("[%s] selfRegister: AC unreachable (attempt %d/10): %v", mat.ServiceName, attempt, err)
+			log.Printf("[%s] selfRegister: AC unreachable (attempt %d): %v", mat.ServiceName, attempt, err)
 			time.Sleep(3 * time.Second)
 			continue
 		}
@@ -301,10 +325,9 @@ func selfRegisterWithAC(mat *CertMaterial, networkEndpoint string) {
 			log.Printf("[%s] selfRegister: registered with AC (status=%s)", mat.ServiceName, ack["status"])
 			return
 		}
-		log.Printf("[%s] selfRegister: AC returned %d (attempt %d/10)", mat.ServiceName, resp.StatusCode, attempt)
+		log.Printf("[%s] selfRegister: AC returned %d (attempt %d)", mat.ServiceName, resp.StatusCode, attempt)
 		time.Sleep(3 * time.Second)
 	}
-	log.Printf("[%s] selfRegister: giving up after 10 attempts", mat.ServiceName)
 }
 
 func cfEnvOr(key, def string) string {

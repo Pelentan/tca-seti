@@ -561,7 +561,10 @@ func main() {
 	log.Printf("[interactions] AI-lien: %s | Notifier: %s | Lore: %s",
 		ailienURL, notifierURL, loreURL)
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[interactions] %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[interactions] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }

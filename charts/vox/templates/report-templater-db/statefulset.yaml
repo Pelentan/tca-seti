@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: report-templater-db
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: report-templater-db
+spec:
+  serviceName: report-templater-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: report-templater-db
+  template:
+    metadata:
+      labels:
+        app: report-templater-db
+        {{- include "vox.labels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: report-templater-db
+          image: postgres:{{ .Values.reportTemplaterDb.tag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vox-credentials
+                  key: reportTemplaterDbPassword
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: report-templater-db-data
+              mountPath: /var/lib/postgresql/data
+            - name: init-script
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: init-script
+          configMap:
+            name: report-templater-db-init
+  volumeClaimTemplates:
+    - metadata:
+        name: report-templater-db-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.reportTemplaterDb.storageClass }}
+        storageClassName: {{ .Values.reportTemplaterDb.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.reportTemplaterDb.storage }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: report-templater-db
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: report-templater-db
+spec:
+  selector:
+    app: report-templater-db
+  ports:
+    - port: 5432
+      targetPort: 5432
+  type: ClusterIP

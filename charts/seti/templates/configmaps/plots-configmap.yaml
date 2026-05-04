@@ -1,0 +1,761 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: seti-plots
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+data:
+  contract-test-pipeline.json: |
+    {
+      "name": "Contract Test Pipeline",
+      "description": "Triggers a contract test run and verifies results are stored. Tests the complete contract testing pipeline from trigger through policy token issuance through results storage.",
+      "application_id": "seti",
+      "author": "seti",
+      "version": "1.0.0",
+      "tags": ["pipeline", "contract-test", "core"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "Trigger a contract test run via the gateway",
+          "method": "POST",
+          "path": "/run-contract-test",
+          "body": { "application_id": "seti" },
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "contract-test", "method": "POST", "path": "/run" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 2,
+          "description": "Verify contract results are accessible",
+          "method": "GET",
+          "path": "/contract-results",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "results", "method": "GET", "path": "/contract-results" }
+          ],
+          "verify_within_seconds": 10
+        }
+      ]
+    }
+  plot-lifecycle.json: |
+    {
+      "name": "Plot Lifecycle",
+      "description": "Creates a plot and retrieves it. Verifies Plot Store accepts and returns structured plot data correctly. The plot created is intentionally minimal — it validates the storage mechanism, not the execution pipeline.",
+      "application_id": "seti",
+      "author": "seti",
+      "version": "1.0.0",
+      "tags": ["plot-store", "lifecycle", "core"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "Create a minimal plot in Plot Store",
+          "method": "POST",
+          "path": "/plots",
+          "body": {
+            "application_id": "seti",
+            "name": "Lifecycle Verification Plot",
+            "description": "Created by the Plot Lifecycle plot test to verify storage",
+            "author": "plot-test",
+            "steps": [
+              {
+                "step_number": 1,
+                "description": "Health check",
+                "method": "GET",
+                "path": "/health",
+                "expected_status": 200,
+                "expected_chain": []
+              }
+            ]
+          },
+          "expected_status": 201,
+          "capture": [
+            { "name": "created_plot_id", "path": "plot_id" }
+          ],
+          "expected_chain": [
+            { "caller": "gateway", "callee": "plot-store", "method": "POST", "path": "/plots" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 2,
+          "description": "Retrieve the plots list and verify it is non-empty",
+          "method": "GET",
+          "path": "/plots",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "plot-store", "method": "GET", "path": "/plots" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 3,
+          "description": "Delete the lifecycle verification plot — no orphans",
+          "method": "DELETE",
+          "path": "/plots/{created_plot_id}",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "plot-store", "method": "DELETE", "path": "/plots/{created_plot_id}" }
+          ],
+          "verify_within_seconds": 10
+        }
+      ]
+    }
+  ai-provider-configuration.json: |
+    {
+      "name": "AI Provider Configuration",
+      "description": "Registers an AI provider with Policy and verifies it is retrievable. Does not attempt to refresh models (Ollama may not be running in all environments) — that step is exercised manually via the Admin panel. Tests the configuration storage pathway. Cleans up after itself so repeated runs always produce consistent results.",
+      "application_id": "seti",
+      "author": "seti",
+      "version": "1.0.1",
+      "tags": ["policy", "ai-lien", "configuration"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "Register a test AI provider with Policy",
+          "method": "POST",
+          "path": "/ai-providers",
+          "body": {
+            "name": "Plot Test Provider",
+            "ollama_url": "http://host.docker.internal:11434",
+            "description": "Created by the AI Provider Configuration plot test"
+          },
+          "expected_status": 201,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "policy", "method": "POST", "path": "/ai-providers" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 2,
+          "description": "Verify the provider list includes the registered provider",
+          "method": "GET",
+          "path": "/ai-providers",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "policy", "method": "GET", "path": "/ai-providers" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 3,
+          "description": "Remove the test provider — cleanup so repeated runs start clean",
+          "method": "DELETE",
+          "path": "/ai-providers/plot-test-provider",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "policy", "method": "DELETE", "path": "/ai-providers/plot-test-provider" }
+          ],
+          "verify_within_seconds": 10
+        }
+      ]
+    }
+  integration-api.json: |
+    {
+      "name": "Integration API",
+      "description": "Verifies the versioned read-only API surface is reachable and returning data. This is the customer tooling integration point — if this plot fails, external tools cannot query SETI results.",
+      "application_id": "seti",
+      "author": "seti",
+      "version": "1.0.0",
+      "tags": ["integration", "external-api", "core"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "Query cluster health via the v1 API",
+          "method": "GET",
+          "path": "/v1/cluster/health",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "integration", "method": "GET", "path": "/v1/cluster/health" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 2,
+          "description": "Query registered applications via the v1 API",
+          "method": "GET",
+          "path": "/v1/applications",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "integration", "method": "GET", "path": "/v1/applications" },
+            { "caller": "integration", "callee": "policy", "method": "GET", "path": "/applications" }
+          ],
+          "verify_within_seconds": 15
+        }
+      ]
+    }
+  feed-provisioning.json: |
+    {
+      "name": "Feed Provisioning",
+      "description": "Creates a signal feed via Feed Wr4ngler, verifies it exists, then deletes it. Tests the scoped signal delivery provisioning path end-to-end. Feed Wr4ngler is the Elixir OTP service — this plot also verifies the Elixir runtime is stable.",
+      "application_id": "seti",
+      "author": "seti",
+      "version": "1.1.0",
+      "tags": ["feed-wrangler", "elixir", "feeds"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "Create a signal feed for a test wrangler",
+          "method": "POST",
+          "path": "/feeds",
+          "body": {
+            "wrangler_id": "plot-test-wr4ngler",
+            "clearance_level": "connie-wr4ngler",
+            "filters": []
+          },
+          "expected_status": 201,
+          "capture": [
+            { "name": "feed_id", "path": "feed_id" }
+          ],
+          "expected_chain": [
+            { "caller": "gateway", "callee": "feed-wrangler", "method": "POST", "path": "/feeds" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 2,
+          "description": "List active feeds and verify creation succeeded",
+          "method": "GET",
+          "path": "/feeds",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "feed-wrangler", "method": "GET", "path": "/feeds" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 3,
+          "description": "Delete the test feed — no orphans",
+          "method": "DELETE",
+          "path": "/feeds/{feed_id}",
+          "expected_status": 200
+        }
+      ]
+    }
+  augur-canis-health-check-cycle-verification.json: |
+    {
+      "name": "Augur Canis Health Cycle",
+      "description": "Validates Augur Canis is running, all SETI Jobs are registered, and the configuration is accessible via the gateway admin routes. Check history and query endpoints are stubs pending full AC implementation — this plot tests what is currently operational.",
+      "application_id": "seti",
+      "author": "claude-sonnet-4-6-session-20260410",
+      "version": "0.4.0",
+      "tags": ["augur-canis", "health", "constellation"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "Augur Canis health check via gateway admin route — confirms AC is running and Redis is connected",
+          "call": { "method": "GET", "path": "/augur-canis/health" },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "status", "operator": "equals", "value": "healthy" },
+            { "field": "redis_connected", "operator": "equals", "value": true }
+          ],
+          "expect_call_chain": [
+            { "caller": "gateway", "callee": "augur-canis", "method": "GET", "path": "/health" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 2,
+          "description": "List registered Jobs via gateway admin route — all SETI Jobs should be registered with AC",
+          "call": { "method": "GET", "path": "/augur-canis/jobs" },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "total", "operator": "gte", "value": 15 }
+          ],
+          "expect_call_chain": [
+            { "caller": "gateway", "callee": "augur-canis", "method": "GET", "path": "/jobs" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 3,
+          "description": "AC configuration is readable via gateway — confirms constellation-level settings are accessible",
+          "call": { "method": "GET", "path": "/augur-canis/configuration" },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "check_interval_seconds", "operator": "present" }
+          ],
+          "expect_call_chain": [
+            { "caller": "gateway", "callee": "augur-canis", "method": "GET", "path": "/configuration" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 4,
+          "description": "Active alerts endpoint is accessible — confirms alert pipeline is operational",
+          "call": { "method": "GET", "path": "/augur-canis/alerts" },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "alerts", "operator": "present" }
+          ],
+          "expect_call_chain": [
+            { "caller": "gateway", "callee": "augur-canis", "method": "GET", "path": "/alerts/active" }
+          ],
+          "verify_within_seconds": 10
+        }
+      ]
+    }
+  contract-test-trigger-run-and-verify-results.json: |
+    {
+      "name": "Contract Test Trigger and Retrieve",
+      "description": "Validates the contract test pipeline: a run is triggered for the seti application (fire-and-forget, returns 'accepted' immediately), and historical results are retrievable from the Results Job. The trigger is asynchronous by design — the run executes in the background and results are polled.",
+      "application_id": "seti",
+      "author": "claude-sonnet-4-6-session-20260410",
+      "version": "0.4.0",
+      "tags": ["contract-test", "pipeline", "results"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "Health check — contract-test confirms Redis connectivity and scheduler status",
+          "call": { "method": "GET", "path": "/health" },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "status", "operator": "equals", "value": "healthy" }
+          ]
+        },
+        {
+          "step_number": 2,
+          "description": "Trigger a contract test run — returns 'accepted' immediately, run executes asynchronously",
+          "call": {
+            "method": "POST",
+            "path": "/run-contract-test",
+            "body": { "application_id": "seti" }
+          },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "status", "operator": "equals", "value": "accepted" },
+            { "field": "application_id", "operator": "equals", "value": "seti" }
+          ],
+          "expect_call_chain": [
+            { "caller": "gateway", "callee": "contract-test", "method": "POST", "path": "/run" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 3,
+          "description": "Verify historical contract results are stored and retrievable from the Results Job",
+          "call": { "method": "GET", "path": "/contract-results" },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "runs", "operator": "present" }
+          ],
+          "expect_call_chain": [
+            { "caller": "gateway", "callee": "results", "method": "GET", "path": "/contract-results" }
+          ],
+          "verify_within_seconds": 10
+        }
+      ]
+    }
+  gateway-dev-auth-flow.json: |
+    {
+      "name": "Gateway Auth Flow",
+      "description": "Validates the complete dev-mode authentication flow through the gateway: dev login produces a JWT and clearance level, and the JWT is accepted on a subsequent authenticated request. Session refresh requires the httpOnly seti_refresh cookie which plot-test cannot maintain — refresh is verified by the system's own inter-service traffic, not this plot.",
+      "application_id": "seti",
+      "author": "claude-sonnet-4-6-session-20260410",
+      "version": "0.4.0",
+      "tags": ["gateway", "auth", "session"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "Gateway health check confirms service is up before exercising auth",
+          "call": { "method": "GET", "path": "/health" },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "status", "operator": "equals", "value": "healthy" }
+          ]
+        },
+        {
+          "step_number": 2,
+          "description": "Dev login with ops-wr4ngler clearance — gateway proxies to signal-clearance, JWT and clearance returned",
+          "call": {
+            "method": "POST",
+            "path": "/auth/dev/login",
+            "body": { "display_name": "plot-test-ops", "clearance_level": "ops-wr4ngler" }
+          },
+          "expect_status": 200,
+          "capture": [
+            { "name": "jwt", "path": "jwt" }
+          ],
+          "assertions": [
+            { "field": "jwt", "operator": "present" }
+          ],
+          "expect_call_chain": [
+            { "caller": "gateway", "callee": "signal-clearance", "method": "POST", "path": "/auth/dev/login" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 3,
+          "description": "Authenticated request to Policy confirms JWT is valid and gateway proxies correctly",
+          "call": {
+            "method": "GET",
+            "path": "/applications",
+            "headers": { "Authorization": "Bearer {jwt}" }
+          },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "applications", "operator": "present" }
+          ],
+          "expect_call_chain": [
+            { "caller": "gateway", "callee": "policy", "method": "GET", "path": "/applications" }
+          ],
+          "verify_within_seconds": 10
+        }
+      ]
+    }
+  seti-observability-event-ingestion-and-rules-verification.json: |
+    {
+      "name": "Observability Pipeline Verification",
+      "description": "Validates the observability pipeline: allowlist rules are inspectable through the gateway, a contract test run is triggered (fire-and-forget), and historical results confirm the pipeline processed events end-to-end. The event submission endpoint is internal-only — this plot verifies the pipeline through its downstream effects.",
+      "application_id": "seti",
+      "author": "claude-sonnet-4-6-session-20260410",
+      "version": "0.5.0",
+      "tags": ["seti-observability", "events", "pipeline"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "Gateway health check confirms SETI is up",
+          "call": { "method": "GET", "path": "/health" },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "status", "operator": "equals", "value": "healthy" }
+          ]
+        },
+        {
+          "step_number": 2,
+          "description": "Observability rules are inspectable via gateway — confirms allowlist is configured",
+          "call": { "method": "GET", "path": "/observability/rules" },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "knownCallers", "operator": "present" }
+          ],
+          "expect_call_chain": [
+            { "caller": "gateway", "callee": "seti-observability", "method": "GET", "path": "/rules" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 3,
+          "description": "Trigger a contract test run — fire-and-forget, returns 'accepted', run executes asynchronously and generates observability events",
+          "call": {
+            "method": "POST",
+            "path": "/run-contract-test",
+            "body": { "application_id": "seti" }
+          },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "status", "operator": "equals", "value": "accepted" }
+          ],
+          "expect_call_chain": [
+            { "caller": "gateway", "callee": "contract-test", "method": "POST", "path": "/run" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 4,
+          "description": "Confirm results are stored — proves the observability pipeline processed events end-to-end",
+          "call": { "method": "GET", "path": "/contract-results" },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "runs", "operator": "present" }
+          ],
+          "expect_call_chain": [
+            { "caller": "gateway", "callee": "results", "method": "GET", "path": "/contract-results" }
+          ],
+          "verify_within_seconds": 10
+        }
+      ]
+    }
+  signal-clearance-clearance-validation-flow.json: |
+    {
+      "name": "Signal Clearance Validation",
+      "description": "Validates that signal-clearance correctly issues JWTs and that the issued JWT grants access to protected resources. Session refresh requires the httpOnly seti_refresh cookie which plot-test cannot maintain as a server-side mTLS client — refresh is exercised by the system's own session management.",
+      "application_id": "seti",
+      "author": "claude-sonnet-4-6-session-20260410",
+      "version": "0.5.0",
+      "tags": ["signal-clearance", "auth", "clearance"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "Gateway health check confirms SETI is up before exercising auth",
+          "call": { "method": "GET", "path": "/health" },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "status", "operator": "equals", "value": "healthy" }
+          ]
+        },
+        {
+          "step_number": 2,
+          "description": "Dev login issues a sec-wr4ngler JWT — gateway proxies to signal-clearance",
+          "call": {
+            "method": "POST",
+            "path": "/auth/dev/login",
+            "body": { "display_name": "plot-test-sec", "clearance_level": "sec-wr4ngler" }
+          },
+          "expect_status": 200,
+          "capture": [
+            { "name": "sec_jwt", "path": "jwt" }
+          ],
+          "assertions": [
+            { "field": "jwt", "operator": "present" }
+          ],
+          "expect_call_chain": [
+            { "caller": "gateway", "callee": "signal-clearance", "method": "POST", "path": "/auth/dev/login" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 3,
+          "description": "Use JWT on a protected endpoint — confirms clearance grants access to Policy application registry",
+          "call": {
+            "method": "GET",
+            "path": "/applications",
+            "headers": { "Authorization": "Bearer {sec_jwt}" }
+          },
+          "expect_status": 200,
+          "assertions": [
+            { "field": "applications", "operator": "present" }
+          ],
+          "expect_call_chain": [
+            { "caller": "gateway", "callee": "policy", "method": "GET", "path": "/applications" }
+          ],
+          "verify_within_seconds": 10
+        }
+      ]
+    }
+  policy-application-lifecycle.json: |
+    {
+      "name": "Policy Application Lifecycle",
+      "description": "Registers a test application with Policy, retrieves it, then deletes it. Exercises the full application management lifecycle through the gateway. Policy derives application_id deterministically from display_name ('Plot Test Application' -> 'plot-test-application'), so no capture is needed and the plot is fully idempotent — step 1 cleans up any orphan from a prior run before registering fresh.",
+      "application_id": "seti",
+      "author": "seti",
+      "version": "2.0.0",
+      "tags": ["policy", "applications", "lifecycle"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "Pre-cleanup — delete any orphaned test application from a prior run. 200 = cleaned up, 404 = nothing to clean, both pass.",
+          "method": "DELETE",
+          "path": "/applications/plot-test-application",
+          "expected_statuses": [200, 404]
+        },
+        {
+          "step_number": 2,
+          "description": "Register the test application — ID is derived as 'plot-test-application'",
+          "method": "POST",
+          "path": "/applications/register",
+          "body": {
+            "display_name": "Plot Test Application",
+            "gateway_url": "https://plot-test:4004",
+            "redis_url": "redis:6379",
+            "repository_url": "https://github.com/plot-test/app",
+            "contracts_path": "contracts/",
+            "environments": ["development"]
+          },
+          "expected_status": 201,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "policy", "method": "POST", "path": "/applications/register" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 3,
+          "description": "Retrieve the registered application by its deterministic ID",
+          "method": "GET",
+          "path": "/applications/plot-test-application",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "policy", "method": "GET", "path": "/applications/plot-test-application" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 4,
+          "description": "Delete the test application — no orphans",
+          "method": "DELETE",
+          "path": "/applications/plot-test-application",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "policy", "method": "DELETE", "path": "/applications/plot-test-application" }
+          ],
+          "verify_within_seconds": 10
+        }
+      ]
+    }
+
+  signal-aggregator-subscription-access.json: |
+    {
+      "name": "Signal Aggregator Subscription Access",
+      "description": "Verifies that the signal aggregator's subscription registry and event stream are accessible through the gateway. Subscriptions hold the per-feed delivery routing state — confirming they are readable validates that signal routing infrastructure is operational. Signal events confirm the event bus is live.",
+      "application_id": "seti",
+      "author": "seti",
+      "version": "1.0.0",
+      "tags": ["signal-aggregator", "subscriptions", "events"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "List active subscriptions from Signal Aggregator",
+          "method": "GET",
+          "path": "/subscriptions",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "signal-aggregator", "method": "GET", "path": "/subscriptions" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 2,
+          "description": "Query recent signal events — confirms the event bus is live and gateway routes correctly",
+          "method": "GET",
+          "path": "/signal-events",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "signal-aggregator", "method": "GET", "path": "/events" }
+          ],
+          "verify_within_seconds": 10
+        }
+      ]
+    }
+  augur-canis-on-demand-suite.json: |
+    {
+      "name": "Augur Canis On-Demand Suite",
+      "description": "Triggers an on-demand AC contract test suite via the gateway admin route and verifies the trigger is accepted. Confirms that the gateway correctly proxies admin commands to Augur Canis and that AC's on-demand suite mechanism is operational. The suite itself runs asynchronously — this plot tests the trigger path, not the suite results.",
+      "application_id": "seti",
+      "author": "seti",
+      "version": "1.0.0",
+      "tags": ["augur-canis", "contract-tests", "admin"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "Confirm AC is healthy and reporting registered jobs before triggering",
+          "method": "GET",
+          "path": "/augur-canis/health",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "augur-canis", "method": "GET", "path": "/health" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 2,
+          "description": "Trigger on-demand contract test suite via gateway admin route — returns accepted immediately",
+          "method": "POST",
+          "path": "/augur-canis/run-contract-tests",
+          "body": {},
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "augur-canis", "method": "POST", "path": "/run-contract-tests" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 3,
+          "description": "List recent contract suite results — confirms AC persists suite runs after trigger",
+          "method": "GET",
+          "path": "/augur-canis/contract-suites",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "augur-canis", "method": "GET", "path": "/contract-suites" }
+          ],
+          "verify_within_seconds": 15
+        }
+      ]
+    }
+  lore-data-access.json: |
+    {
+      "name": "Lore Data Access",
+      "description": "Reads trend-points, incidents, patterns, and corrections from Lore via the gateway. Tests the read paths that are live today. corrections returns 501 (stub) — when that flips to 200 this plot will fail, which is the signal that a write/read lifecycle plot needs to be written for corrections.",
+      "application_id": "seti",
+      "author": "seti",
+      "version": "1.0.0",
+      "tags": ["lore", "trends", "incidents", "patterns"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "List trend-points — confirms lore is receiving and storing constellation telemetry",
+          "method": "GET",
+          "path": "/lore/trend-points",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "lore", "method": "GET", "path": "/trend-points" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 2,
+          "description": "List incidents — confirms incident tracking is operational",
+          "method": "GET",
+          "path": "/lore/incidents",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "lore", "method": "GET", "path": "/incidents" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 3,
+          "description": "List patterns — confirms pattern recognition store is accessible",
+          "method": "GET",
+          "path": "/lore/patterns",
+          "expected_status": 200,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "lore", "method": "GET", "path": "/patterns" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 4,
+          "description": "List corrections — stub, returns 501. When this returns 200 the stub is implemented and this plot needs a full corrections lifecycle test.",
+          "method": "GET",
+          "path": "/lore/corrections",
+          "expected_status": 501
+        }
+      ]
+    }
+  interactions-notification-flow.json: |
+    {
+      "name": "Interactions Notification Flow",
+      "description": "Exercises the two interactions endpoints available through the gateway. Both are fire-and-forget (202 accepted). When escalate and notify/regeneration gain real processing logic, this plot will need to be replaced with one that verifies the downstream effects.",
+      "application_id": "seti",
+      "author": "seti",
+      "version": "1.0.0",
+      "tags": ["interactions", "escalation", "notifications"],
+      "steps": [
+        {
+          "step_number": 1,
+          "description": "Submit an escalation event — fire-and-forget, 202 accepted.",
+          "method": "POST",
+          "path": "/interactions/escalate",
+          "body": {
+            "application_id": "seti",
+            "run_id": "plot-test-run",
+            "severity": "warning",
+            "message": "Plot test escalation — ignore"
+          },
+          "expected_status": 202,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "interactions", "method": "POST", "path": "/escalate" }
+          ],
+          "verify_within_seconds": 10
+        },
+        {
+          "step_number": 2,
+          "description": "Submit a regeneration notification — fire-and-forget, 202 accepted.",
+          "method": "POST",
+          "path": "/interactions/notify/regeneration",
+          "body": {
+            "application_id": "seti",
+            "plot_id": "",
+            "reason": "Plot test notification — ignore"
+          },
+          "expected_status": 202,
+          "expected_chain": [
+            { "caller": "gateway", "callee": "interactions", "method": "POST", "path": "/notify/regeneration" }
+          ],
+          "verify_within_seconds": 10
+        }
+      ]
+    }

@@ -1,8 +1,8 @@
 # tca-seti — Phase Plan
 
 **Status:** In Progress
-**Last Updated:** 2026-04-12
-**Next Action:** Phase 9 — Interactions triage routing (three paths), AI-lien Lore integration, Results fast-path write. Notifier is deployed and healthy.
+**Last Updated:** 2026-04-21
+**Next Action:** Push gateway and policy images, roll deployment, verify contract tests and plots pass. Then resume Phase 9 — Interactions triage routing, AI-lien Lore integration, Results fast-path write.
 
 ---
 
@@ -264,6 +264,42 @@ React/TS    — UI (served by Go static file server)
 
 ---
 
+## Phase S1 — Supply Chain: All third-party library dependencies eliminated from Go Jobs
+
+**Status:** Complete
+**Deliverable:** Zero third-party Go library dependencies across the entire SETI constellation. All Go Jobs use stdlib only. go-redis replaced with a TCA stdlib Redis client in every Job. golang-jwt pending replacement in gateway and policy.
+**Rationale:** Every external library is a supply chain vector. go-redis introduced transitive dependencies (bsm, cespare/xxhash, dgryski) with no operational benefit at SETI's scale. The TCA Redis client is stdlib-only, contract-backed, and each Job owns its copy — the three-year lifecycle makes it fully replaceable at the Job boundary.
+
+### What Was Done
+
+- Designed and implemented `TCA redis-client` library (`redis.go`) — stdlib `net` only, RESP2 wire protocol, full pub/sub + streams + pipeline support. Contract at `contracts/lib/redis-client.yaml`.
+- Replaced go-redis in: `augur-canis`, `seti-observability`, `gateway`, `contract-test`, `policy`, `plot-test`, `signal-aggregator`, `healthcheck`.
+- `signal-aggregator/redis.go` extended with `SubscribeMulti` — multiple-channel subscribe on a single connection, needed for SETI's own event stream subscriptions.
+- `watchdog` removed entirely — superseded by augur-canis, which now owns the full health check lifecycle.
+- `healthcheck` Dockerfile stage updated across all 14 Job Dockerfiles — `go mod download` and `go.sum` COPY removed from the embedded healthcheck build stage.
+- Stale go-redis entries removed from `lore/go.sum`.
+- `golang-jwt/jwt/v5` identified as third-party (community fork, not official Go team) — replacement with stdlib HMAC/SHA256 JWT deferred to Phase S2.
+
+### Lessons Learned
+- The TCA lib copy-per-Job model is correct. Each Job owns its redis.go, can extend it for its needs (SubscribeMulti), and the contract guarantees behavioral compatibility. The apparent redundancy is intentional isolation.
+- go-redis brought three transitive dependencies whose sole function was hashing and test framework support — none of which SETI uses. Removing one library removed four.
+- Supply chain work surfaces dead code. watchdog was carried through multiple phases because it built cleanly. The redis replacement exposed it as an orphan.
+
+---
+
+## Phase S2 — Supply Chain: golang-jwt replaced with stdlib JWT
+
+**Status:** Complete
+**Deliverable:** gateway and policy use stdlib `crypto/hmac`, `crypto/sha256`, and `encoding/base64` for HS256 JWT signing and verification. Zero third-party Go dependencies across the full constellation.
+**Rationale:** golang-jwt/jwt is a community-maintained fork, not an official Go package. The name is misleading. HS256 over stdlib is 30 lines of code.
+
+### Lessons Learned
+- stdlib HS256 is straightforward — hmac.New(sha256.New, secret), base64url encode header.claims.sig. No surprises.
+- golang-jwt's `RegisteredClaims` embedded struct was the only structural coupling. Replacing it with a plain `map[string]interface{}` for signing and direct field extraction after verify is cleaner.
+- gateway only needs `wrangler_id` and `clearance_level` from tokens — it doesn't need to model the full claims shape of every issuer. The flat map approach makes this explicit.
+
+---
+
 ## Phase 9 — Closure Loop: Interactions routing, AI-lien memory, Notifier
 
 **Status:** In Progress
@@ -291,3 +327,196 @@ React/TS    — UI (served by Go static file server)
 
 ### Lessons Learned
 *Populated when phase completes.*
+
+---
+
+## Phase 10 — Kubernetes Migration: TCA 2.0 deployment architecture
+
+**Status:** Complete
+**Deliverable:** The full SETI constellation runs on k3d (local K8s) with the same operational behavior as Docker Compose. A Helm chart is the authoritative constellation definition. cert-forge writes cert material to K8s Secrets. NetworkPolicy defines the communication topology. The dev/prod gap is eliminated.
+**Rationale:** Docker Compose is an approximation of the target architecture. It has a 32-network ceiling that forced the ac-net compromise. K8s removes that ceiling and provides the correct primitives — Secrets, NetworkPolicy, init containers, readiness probes — for everything that was being approximated.
+
+**Completed:** 2026-04-14 (approximately 4 hours, engineer-AI partnership)
+
+### What Was Built
+
+**cert-forge K8s Secret integration** (`cert-forge/k8s.go`)
+cert-forge detects its environment via the projected ServiceAccount token. In K8s it writes all cert material — CA cert, enrollment CA cert, enrollment cert+key, star-gazer cert+key — to a K8s Secret via the K8s REST API using stdlib `net/http` only. No client-go, no external dependencies, scratch container stays. In Docker Compose it writes to the volume as before. Detection is automatic — same image, same binary, different behavior based on environment.
+
+**Helm chart** (`charts/seti/`)
+Single chart covering the full 20-container constellation. Environment-specific behavior via values files — `values/dev.yaml` for k3d local development. One chart deploys to dev, staging, and production.
+
+| Resource type | Count |
+|--------------|-------|
+| Deployments | 17 |
+| StatefulSet | 1 (postgres) |
+| Services | 18 |
+| ConfigMaps | 2 (contracts, plots) |
+| Secrets | 3 (seti-certs, postgres credentials, remote-apps) |
+| ServiceAccount + Role + RoleBinding | 1 set (cert-forge) |
+| NetworkPolicy | 22 |
+| Namespace | 1 |
+
+**Startup ordering** (`charts/seti/templates/_init.tpl`)
+Init containers replace `depends_on: condition: service_healthy`. Reusable wait helpers per dependency. K8s holds pods in `Init:` state until all dependencies are ready. Startup is clean, ordered, and observable.
+
+**AC health verification**
+Every service uses `exec: ["/healthcheck"]` for readiness and liveness probes — the same healthcheck binary, the same Redis pub/sub mechanism, the same AC Watchdog verification. cert-forge uses `httpGet` on `/ca` as the sole exception.
+
+**NetworkPolicy** (`charts/seti/templates/network-policies/policies.yaml`)
+22 policies. Default-deny ingress for all pods. Explicit allow rules per service derived from the actual call matrix. Policies are in the chart regardless of environment; enforced automatically by the CNI in staging and production.
+
+**Scripts** (`scripts/`)
+- `k3d-setup.sh` — creates the `seti` cluster, local registry, port mapping
+- `build-push.sh` — builds and pushes all 18 service images
+
+### Deployment Tiers (TCA 2.0)
+
+| Tier | Tool | When | Notes |
+|------|------|------|-------|
+| 0 — Solo Job | Docker Compose (partial stack) | Active Job development | Fast inner loop, no K8s overhead |
+| 1 — Dev Constellation | k3d + Helm | Full constellation testing | `helm upgrade`, `k9s` for observability |
+| 2 — Staging | k3s or managed K8s + ArgoCD | Pre-production validation | NetworkPolicy enforced, ArgoCD drift detection |
+| 3 — Production | k3s (street) or managed K8s + ArgoCD | Live | Same chart, different values |
+
+### Architecture Decisions Recorded
+
+- Docker Compose is Tier 0, not deprecated. Helm chart is the source of truth for the full constellation.
+- cert-forge writes to K8s Secret, not PVC. Narrow-scoped ServiceAccount with `get`, `create`, `update` on secrets only.
+- All `.env` and volume-based secrets become K8s Secrets. Supplied via `--set` at install time. Never in values files.
+- `helm install` requires `-n <namespace>` explicitly. `--create-namespace` alone is insufficient.
+- k3d over Docker Desktop built-in K8s. Named, independent, multi-node clusters. Coexists with Docker Compose without interference. Developers don't toggle Docker Desktop modes between projects.
+- NodePort 30400 + k3d port mapping. `-p "4000:30400@loadbalancer"` at cluster creation. Same `localhost:4000` URL as Docker Compose.
+- ArgoCD for staging and production, not dev. `helm upgrade` is the dev workflow.
+- NetworkPolicy in chart, enforcement deferred to staging. Same chart, no changes required.
+- Startup contract test failures during fresh install are expected and correct. Degraded-healthy fallback is not a bug.
+- ac-net compromise is resolved. NetworkPolicy gives true point-to-point isolation between augur-canis and each service.
+
+### Lessons Learned
+- The shared volume cert approach and ac-net compromise were both Docker Compose artifacts, not architectural choices. K8s removes both cleanly.
+- `helm install` without `-n <namespace>` deploys to `default` regardless of template namespace declarations. Always specify `-n` explicitly.
+- ConfigMaps from contract files are cleaner than volume mounts for read-only config. 440KB fits well under the 1MB limit.
+- Init containers are the correct K8s equivalent of `depends_on: condition: service_healthy`. TCP check (`nc`) confirms port availability; AC handles health verification once the service is running.
+- `exec: ["/healthcheck"]` is the correct probe for all mTLS services. `httpGet` with `scheme: HTTPS` fails the handshake without a client cert. `tcpSocket` bypasses AC entirely.
+- k3d image pull uses `seti-registry:5000` (in-cluster DNS), not `localhost:5000` (host). Push and pull addresses differ. Must be in `values/dev.yaml`.
+- A 20-service polyglot constellation migrated from Docker Compose to K8s in approximately 4 hours via engineer-AI partnership. Traditional team estimate: 2-6 weeks.
+
+### Additional Lessons Learned (Post-Delivery — 2026-04-14)
+
+- k3d enforces NetworkPolicy via its bundled controller. The assumption that flannel does not enforce NetworkPolicy is wrong. Policies are active in dev immediately on application.
+- Redis and augur-canis ingress policies must use the `app.kubernetes.io/part-of: seti` label selector. Enumerating callers is incomplete — init containers create transient access patterns that runtime caller lists don't capture.
+- Services that are universal dependencies (cert-forge, redis, augur-canis, seti-observability) require the label selector approach. Enumerating callers for universal dependencies is always wrong.
+- Self-registration has 10 retry attempts. If NetworkPolicy is wrong at startup, services exhaust retries, give up, and run unregistered. AC marks them `skip: job_not_deployed`. Correct NetworkPolicy from the start is the fix, not more retries.
+- cert-forge restart without CA persistence invalidates the constellation. CA cert and key are now persisted in the K8s Secret. cert-forge loads the existing CA on restart rather than generating a new one.
+- `helm upgrade` does not restart pods on ConfigMap changes. Services that read config at startup require `kubectl rollout restart` to pick up updated ConfigMap content.
+- PlotStep `expected_status` is `int` in the Go struct. A JSON array breaks parsing and silently drops the plot.
+- Plot tests must clean up persistent state they create. Docker Compose's reset behavior masked this assumption. K8s does not reset in-memory state between runs.
+
+---
+
+## Phase S3 — Supply Chain: Secrets, PostgreSQL X.509, and Graceful Shutdown
+
+**Status:** Complete
+**Completed:** 2026-04-21
+**Deliverable:** helm install/upgrade requires no --set flags. PostgreSQL authenticates lore via X.509 client certificate — no application password. All 20 Jobs handle SIGTERM gracefully with a documented shutdown sequence. Third-party Go and Python dependencies eliminated from remaining Jobs.
+
+### What Was Built
+
+**Secret elimination:**
+- cert-forge generates `postgres-password` and `jwt-secret` on first startup, persists both in the `seti-certs` K8s Secret alongside cert material. Loads existing values on restart — stable across cert-forge restarts.
+- gateway, policy, signal-clearance read JWT secret from `/certs/jwt-secret` file path. No `--set jwtSecret=` required.
+- postgres superuser uses `POSTGRES_PASSWORD_FILE=/certs/postgres-password`. No `--set postgresCredentials.password=` required.
+
+**PostgreSQL X.509 client certificate authentication:**
+- cert-forge issues two new static certs: `postgres-server` (SANs: postgres, localhost) and `lore-db` (CN=lore-db).
+- `pg_hba.conf` (ConfigMap): hostssl cert clientcert=verify-full with pg_ident.conf mapping CN=lore-db → lore role.
+- `postgresql.conf` (ConfigMap): ssl=on, listen_addresses=*, config files mounted from ConfigMap.
+- `init.sql` (ConfigMap): creates `lore` role (LOGIN, no password) and `lore` database, grants schema ownership.
+- lore connects via `sslcert=/certs/lore-db.crt&sslkey=/certs/lore-db.key&sslrootcert=/certs/ca.crt`. No password anywhere in the connection string.
+- postgres superuser retains cert-forge-generated password for emergency DBA access only — never used by any application.
+- Security scanner finding on application password auth: eliminated.
+
+**CA rotation fix:**
+- forge.json now lists all 18 SETI deployments in the rotation list.
+- cert-forge detects fresh CA generation on startup and immediately rolls all deployments after writing the Secret — no more stale trust pools after manual `kubectl delete secret seti-certs`.
+
+**Graceful shutdown:**
+- `x-tca-lifecycle` block added to all 18 contracts — Job-specific shutdown steps.
+- Section 8 added to tca-guidelines.md — language patterns for Go, TypeScript, Python, Elixir.
+- `shutdown.go` added to all 13 Go Jobs — separate file per the infrastructure-not-domain principle.
+- `shutdown.ts` added to signal-clearance, `shutdown.py` to ai-lien and results.
+- feed-wrangler: `terminate/2` added to EventSubscriber, `stop/1` added to Application.
+- `TCA Redis client Close()` method added to all redis.go copies.
+- `terminationGracePeriodSeconds: 20` added to all Deployments, 30 to postgres StatefulSet.
+- Pods now terminate with `Completed` (exit 0) instead of `Error`.
+
+**Supply chain cleanup:**
+- `results`: dead `redis==5.0.3` dependency removed (was never imported). Dockerfile simplified to single stage.
+- `ai-lien`: `requests` replaced with stdlib `urllib`. Dockerfile simplified to single stage.
+- `signal-clearance`: `uuid` replaced with `crypto.randomUUID()` (Node 20 builtin). `redis` npm package replaced with TCA stdlib RESP2 client (`redis.ts`) — connection-per-command pattern over `net.Socket`.
+
+### Remaining Supply Chain Items
+- `signal-clearance`: `express`, `cookie-parser` (Node.js HTTP routing — significant rewrite)
+- `signal-clearance`: `jose` (OIDC JWKS RS256 verification — no stdlib alternative)
+- `feed-wrangler`: `redix`, `jason`, `plug_cowboy` (Elixir ecosystem equivalents of stdlib — low priority)
+- `lore`: `lib/pq` (PostgreSQL driver — no stdlib alternative exists for database connectivity)
+
+### Lessons Learned
+- Security scanners flag application-layer passwords regardless of how they are generated or stored. X.509 client certificate auth eliminates the finding entirely at the architectural level.
+- PostgreSQL unix socket trust auth is the clean bootstrap mechanism — init.sql runs via unix socket with no credentials, avoiding the MongoDB localhost exception complexity entirely.
+- `listen_addresses = '*'` must be explicit in custom postgresql.conf — PostgreSQL defaults to localhost-only when a custom config file is provided without this setting.
+- `pg_ident.conf` maps cert CN to database role — allows cert name (`lore-db`) to differ from the role name (`lore`) without changing either.
+- `fsGroup: 70` + `defaultMode: 0640` on the postgres pod is required for PostgreSQL to read the key file — postgres refuses world-readable private keys.
+- `defaultMode: 0600` on the lore deployment certs volume is required for the PostgreSQL client to accept the key file — same check, client side.
+- cert-forge's CA write to K8s Secret and the kubelet syncing that Secret to pod volumes are not synchronous. The `waitForPostgresPassword` init container polling the file directly is more reliable than polling the HTTP endpoint.
+- Graceful shutdown is infrastructure, not domain logic. `shutdown.go` alongside `redis.go` and `jwt.go` — same copy-per-Job pattern, same reasoning.
+- Dead dependencies (`redis==5.0.3` in results) survive undetected when requirements.txt is not audited against actual imports. Audit imports, not just declared dependencies.
+- Node.js `crypto.randomUUID()` is a global in Node 20 — no import required. ES2022 target with dom lib makes it available to TypeScript without explicit typing.
+- Connection-per-command in the TypeScript RESP2 client is correct for low-frequency session operations. The Go mutex-and-persistent-connection model is correct for high-frequency pub/sub. Pattern choice is driven by usage, not by what the library did.
+
+---
+
+## Phase S4 — Supply Chain: TypeScript stdlib complete, TCA lib contracts established
+
+**Status:** Complete
+**Completed:** 2026-04-22
+
+### What Was Built
+
+**signal-clearance — zero runtime npm dependencies achieved:**
+- `jose` replaced with `jwks.ts` — TCA JWKS client using `crypto.subtle` + stdlib `https`. RS256 JWT verification, JWKS caching with per-pod in-memory default and pluggable shared cache adapter for horizontal scale.
+- `uuid` replaced with `crypto.randomUUID()` — Node 20 builtin global, no import needed.
+- `redis` npm package replaced with `redis.ts` — TCA RESP2 client using `net.Socket`. Connection-per-command pattern for low-frequency session operations.
+- `express` + `cookie-parser` replaced with `router.ts` — TCA HTTP router. App and Router classes with identical (req, res) interface to express. Method routing, URL parameter extraction, JSON body parsing, cookie parsing/setting, sub-router mounting. All 18 route handler bodies unchanged.
+
+**signal-clearance runtime dependencies after Phase S4: zero.**
+Build-time only: `@types/node`, `typescript`.
+
+**TCA lib contracts created:**
+- `contracts/lib/jwks-client.yaml` — JWKS verification lib. Documents two-tier caching model (per-pod in-memory default, shared Redis adapter for scale), rate limiting, key rotation handling, algorithm constraint (RS256 only), production checklist.
+- `contracts/lib/router.yaml` — HTTP routing lib. Documents App/Router classes, TCARequest/TCAResponse interfaces, CookieOptions, all methods with signatures and error behavior.
+- `contracts/lib/tca-lib-index.yaml` — updated with both new entries.
+
+**Supply chain fix — router.use() bug:**
+- No-prefix sub-router mount (`app.use(router)`) was combining an empty prefix pattern with route patterns incorrectly, breaking all sub-router routes. Fixed to copy routes directly when no prefix is provided.
+
+### Remaining Supply Chain Items
+
+| Job | Dependency | Status |
+|-----|-----------|--------|
+| lore | lib/pq | No Go stdlib PostgreSQL driver — stays until Go ships one |
+| signal-clearance | — | Zero runtime dependencies ✓ |
+| feed-wrangler | redix | Replaceable with stdlib RESP2 client in Elixir |
+| feed-wrangler | jason | No Elixir stdlib JSON until OTP 27+ — stays |
+| feed-wrangler | plug_cowboy | No Elixir stdlib HTTP server — stays |
+| ui | react, vite, etc. | Build-time only — never executes in production ✓ |
+
+**Next target: `redix` in feed-wrangler** — same RESP2 pattern, third language implementation.
+
+### Lessons Learned
+- TypeScript `body: any` on TCARequest is correct — handlers were written against express's permissive any-typed body. Auditing every destructure for strict typing is a separate pass.
+- `new Router()` not `Router()` — class instantiation requires new. Express's factory function pattern masked this for years.
+- Empty-prefix sub-router mounting needs special handling — combining an empty pattern with a route pattern adds an extra path separator that breaks route matching.
+- Copy-per-Job applies to lib files in every language. `jwks.ts`, `redis.ts`, `router.ts` — each Job that uses them owns its copy.
+- `crypto.subtle.importKey()` with `extractable: true` is required for Tier 2 cache adapters that need to re-export keys for Redis storage. Set it even in the default Tier 1 path for symmetry.
+- The TCA lib index is the supply chain gate. An AI encountering an unknown import checks the index first. If nothing covers it, it surfaces the gap rather than pulling a package.

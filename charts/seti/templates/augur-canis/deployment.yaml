@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: augur-canis
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: augur-canis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: augur-canis
+  template:
+    metadata:
+      labels:
+        app: augur-canis
+        {{- include "seti.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "seti.waitForCertForge" . | nindent 8 }}
+        {{- include "seti.waitForRedis" . | nindent 8 }}
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: augur-canis
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}augur-canis:{{ .Values.augurCanis.tag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ .Values.augurCanis.port }}
+            - containerPort: {{ .Values.augurCanis.uiPort }}
+          env:
+            - name: PORT
+              value: {{ .Values.augurCanis.port | quote }}
+            - name: AC_UI_PORT
+              value: {{ .Values.augurCanis.uiPort | quote }}
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            - name: SERVICE_NAME
+              value: "augur-canis"
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OBSERVABILITY_URL
+              value: "https://seti-observability:{{ .Values.setiObservability.port }}"
+            - name: CONSTELLATION
+              value: "tca-seti"
+            - name: CONSTELLATION_ID
+              value: "tca-seti"
+            - name: CHECK_INTERVAL_SECONDS
+              value: "30"
+            - name: RESULT_TTL_SECONDS
+              value: "30"
+            - name: SILENCE_THRESHOLD_SECONDS
+              value: "90"
+            - name: REMINDER_INTERVAL_SECONDS
+              value: "30"
+            - name: MAX_INITIAL_BARKS
+              value: "3"
+            - name: STAR_GAZER_CERT
+              value: "/certs/star-gazer.crt"
+          volumeMounts:
+            - name: seti-certs
+              mountPath: /certs
+              readOnly: true
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: seti-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: augur-canis
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: augur-canis
+spec:
+  selector:
+    app: augur-canis
+  ports:
+    - name: mtls
+      port: {{ .Values.augurCanis.port }}
+      targetPort: {{ .Values.augurCanis.port }}
+    - name: ui
+      port: {{ .Values.augurCanis.uiPort }}
+      targetPort: {{ .Values.augurCanis.uiPort }}

@@ -11,9 +11,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/redis/go-redis/v9"
 )
 
 // ---------------------------------------------------------------------------
@@ -32,7 +29,7 @@ var (
 	port             = envOr("PORT", "4002")
 	redisURL         = envOr("REDIS_URL", "redis:6379")
 	observabilityURL = envOr("OBSERVABILITY_URL", "https://seti-observability:4011")
-	jwtSecret        = []byte(mustEnv("JWT_SECRET"))
+	jwtSecret        = mustReadSecretFile("JWT_SECRET_FILE")
 	signalAggURL     = envOr("SIGNAL_AGGREGATOR_URL", "https://signal-aggregator:4006")
 )
 
@@ -49,6 +46,25 @@ func mustEnv(key string) string {
 		log.Fatalf("[policy] Required env var %s not set", key)
 	}
 	return v
+}
+
+// mustReadSecretFile reads a secret value from the file path given by the
+// named environment variable. Used for secrets written by cert-forge to
+// the /certs volume rather than passed as plain env vars.
+func mustReadSecretFile(envKey string) []byte {
+	path := os.Getenv(envKey)
+	if path == "" {
+		log.Fatalf("[policy] Required env var %s is not set", envKey)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("[policy] Failed to read secret file %s: %v", path, err)
+	}
+	data = []byte(strings.TrimSpace(string(data)))
+	if len(data) == 0 {
+		log.Fatalf("[policy] Secret file %s is empty", path)
+	}
+	return data
 }
 
 // ---------------------------------------------------------------------------
@@ -96,43 +112,31 @@ var (
 // These tokens are how SETI internal Jobs authenticate to constellation services.
 // ---------------------------------------------------------------------------
 
-type SETIServiceClaims struct {
-	AccountID     string `json:"account_id"`
-	ApplicationID string `json:"application_id"`
-	Role          string `json:"role"`
-	ClearanceLevel string `json:"clearance_level"`
-	WranglerID    string `json:"wrangler_id"`
-	jwt.RegisteredClaims
-}
-
 func issueServiceAccountJWT(account *ServiceAccount) (string, error) {
 	now := time.Now()
-	claims := SETIServiceClaims{
-		AccountID:      account.AccountID,
-		ApplicationID:  account.ApplicationID,
-		Role:           account.Role,
-		ClearanceLevel: "sec-wr4ngler", // Service accounts get sec-wr4ngler clearance
-		WranglerID:     account.AccountID,
-		RegisteredClaims: jwt.RegisteredClaims{
-			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
-		},
+	claims := map[string]interface{}{
+		"account_id":      account.AccountID,
+		"application_id":  account.ApplicationID,
+		"role":            account.Role,
+		"clearance_level": "sec-wr4ngler",
+		"wrangler_id":     account.AccountID,
+		"iat":             now.Unix(),
+		"exp":             now.Add(15 * time.Minute).Unix(),
 	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(jwtSecret)
+	return SignJWT(claims, jwtSecret)
 }
 
 // ---------------------------------------------------------------------------
 // Redis client
 // ---------------------------------------------------------------------------
 
-var rdb *redis.Client
+var rdb *RedisClient
 
 func connectRedis() {
 	for i := 0; i < 10; i++ {
-		rdb = redis.NewClient(&redis.Options{Addr: redisURL})
+		rdb = NewRedisClient(redisURL)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, err := rdb.Ping(ctx).Result()
+		err := rdb.Ping(ctx)
 		cancel()
 		if err == nil {
 			log.Printf("[policy] Connected to Redis at %s", redisURL)
@@ -454,6 +458,22 @@ func handleGetApplication(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	if r.Method == http.MethodDelete {
+		mu.Lock()
+		delete(applications, appID)
+		// Remove associated service account
+		delete(accounts, fmt.Sprintf("svc-%s", appID))
+		mu.Unlock()
+		log.Printf("[policy] Application deleted: %s", appID)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":         "ok",
+			"message":        fmt.Sprintf("Application %s deleted", appID),
+			"application_id": appID,
+		})
+		return
+	}
+
 	json.NewEncoder(w).Encode(app)
 }
 
@@ -925,12 +945,52 @@ func handleAvailableApplication(w http.ResponseWriter, r *http.Request) {
 
 	case r.Method == http.MethodPost && action == "register":
 		remoteAppsMu.RLock()
-		alreadyActive := state.MonitoringStatus == "active"
+		alreadyActive := exists && state.MonitoringStatus == "active"
 		remoteAppsMu.RUnlock()
 
 		if alreadyActive {
 			json.NewEncoder(w).Encode(state)
 			return
+		}
+
+		// Accept app definition from connie-agent body if not in remoteApps
+		if !exists {
+			var incoming struct {
+				Name               string `json:"name"`
+				Description        string `json:"description"`
+				Namespace          string `json:"namespace"`
+				ACEndpoint         string `json:"ac_endpoint"`
+				FederationEndpoint string `json:"federation_endpoint"`
+				CaURL              string `json:"ca_url"`
+				RegistryURL        string `json:"registry_url"`
+				RegistryType       string `json:"registry_type"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil || incoming.Name == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{
+					"code":    "INVALID_REQUEST",
+					"message": "tag not in remote-apps.json and no valid app definition in request body",
+				})
+				return
+			}
+			remoteAppsMu.Lock()
+			app = &RemoteApp{
+				Name:         incoming.Name,
+				Description:  incoming.Description,
+				ACEndpoint:   incoming.ACEndpoint,
+				RegistryURL:  incoming.RegistryURL,
+				RegistryType: incoming.RegistryType,
+			}
+			remoteApps[tag] = app
+			if availableStates[tag] == nil {
+				availableStates[tag] = &AvailableAppState{
+					Tag:              tag,
+					MonitoringStatus: "inactive",
+				}
+			}
+			state = availableStates[tag]
+			remoteAppsMu.Unlock()
+			log.Printf("[policy] Remote app %q registered dynamically by connie-agent", tag)
 		}
 
 		// 1. Register in Policy application store
@@ -1105,7 +1165,10 @@ func main() {
 	log.Printf("[policy] Self-registration: seti active")
 	log.Printf("[policy] Storage: in-memory (Phase 2 — swap PostgreSQL in Phase 4)")
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[policy] Server error: %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[policy] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }

@@ -1,0 +1,270 @@
+tca-lib: 1.0.0
+
+info:
+  name: jwks-client
+  description: |
+    JWKS (JSON Web Key Set) client for verifying RS256 ID tokens issued by
+    OIDC-compliant identity providers. Replaces the jose npm library with a
+    zero-external-dependency implementation using Web Crypto API (crypto.subtle)
+    and Node.js stdlib net/https.
+
+    This library handles the full OIDC token verification surface:
+      - Fetching and caching public keys from a remote JWKS endpoint
+      - Verifying RS256 JWT signatures using the cached keys
+      - Key rotation: automatic re-fetch on unknown kid
+      - Rate limiting: minimum interval between JWKS re-fetches to prevent
+        DoS via unknown-kid flooding
+      - Claim validation: exp, aud
+
+    CACHING TIERS
+
+    The library provides two caching tiers. The tier is selected by whether
+    the caller provides a JWKSCache adapter at construction time.
+
+    Tier 1 — Per-pod in-memory cache (default):
+      Keys are cached in a Map<kid, CryptoKey> local to the process. No
+      external dependencies. Correct for single-pod deployments or
+      low-traffic scenarios. Cache is lost on pod restart — a single JWKS
+      fetch on first use after restart re-warms it. This is the default
+      when no cache adapter is provided.
+
+    Tier 2 — Shared external cache (optional):
+      The caller provides a JWKSCache adapter backed by any key-value store
+      (Redis, Memcached, etc.). All pods share the same key material. A single
+      pod fetches from the JWKS endpoint on unknown kid; all others read from
+      the shared cache. Required for horizontally scaled deployments where
+      per-pod cache misses on key rotation would produce N simultaneous JWKS
+      requests.
+
+      The library does not ship a Redis adapter — it ships the JWKSCache
+      interface. The caller implements the adapter using their own Redis client
+      (TCA redis-client.go or equivalent). This keeps the library decoupled
+      from any specific cache implementation.
+
+      Reference Redis adapter implementation:
+        class RedisJWKSCache implements JWKSCache {
+          async get(kid: string): Promise<CryptoKey | null> {
+            const raw = await rdb.get(`jwks:${kid}`);
+            if (!raw) return null;
+            const jwk = JSON.parse(raw);
+            return crypto.subtle.importKey('jwk', jwk,
+              { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+              false, ['verify']);
+          }
+          async set(kid: string, key: CryptoKey, ttlSeconds: number): Promise<void> {
+            const jwk = await crypto.subtle.exportKey('jwk', key);
+            await rdb.set(`jwks:${kid}`, JSON.stringify(jwk), ttlSeconds);
+          }
+        }
+
+    RATE LIMITING
+
+    To prevent a DoS attack where an adversary submits tokens with random
+    unknown kid values — causing a JWKS re-fetch on every request — the
+    library enforces a minimum interval between JWKS endpoint fetches.
+    Default: 300 seconds (5 minutes). The caller may increase this value;
+    decreasing below 60 seconds is not recommended.
+
+    Behavior on unknown kid within the rate limit window: reject immediately
+    with an "unknown key" error. Do not re-fetch. The token is either
+    malicious or the caller is receiving it too soon after key rotation.
+    The caller should retry after the rate limit window expires.
+
+    KEY ROTATION HANDLING
+
+    IdPs rotate signing keys by publishing the new kid in the JWKS alongside
+    the old kid for an overlap period (typically 24–48 hours). The library
+    handles rotation transparently:
+      1. Token arrives with kid not in cache
+      2. If rate limit allows: fetch JWKS, update cache with all returned keys
+      3. Retry verification with the newly cached key
+      4. If kid still not found: reject — the token is invalid
+
+    This means a pod that has been running for the full overlap period will
+    accept tokens signed by both the old and new key without any operator
+    intervention.
+
+    ALGORITHM CONSTRAINT
+
+    This library verifies RS256 (RSASSA-PKCS1-v1_5 with SHA-256) only.
+    Tokens with any other alg value are rejected immediately. This is a
+    deliberate restriction — SETI's threat model does not require EC or
+    EdDSA support, and algorithm agility is itself a security risk (alg
+    confusion attacks). If a future deployment requires a different algorithm,
+    a new library version must be created with a new contract.
+
+    PRODUCTION CHECKLIST
+
+    Deployments using this library at scale must address:
+      - Shared cache adapter provisioned and connected before first request
+      - Rate limit interval tuned to acceptable key rotation latency
+      - JWKS endpoint reachable from all pods (egress NetworkPolicy if applicable)
+      - Cache TTL set to less than the IdP's key rotation overlap period
+      - Monitoring on JWKS fetch frequency (spike = unknown kid flooding)
+
+  version: 1.0.0
+  language: typescript
+  source-file: jwks.ts
+
+x-tca-lib-constraints:
+  external-dependencies: none
+  stdlib-only: true
+  notes: >
+    This library uses only Node.js stdlib and Web Crypto API (crypto.subtle).
+    No external npm packages. The import list is: crypto (Node builtin),
+    https (Node builtin), net (Node builtin).
+
+    The JWKSCache interface is the extension point. Callers provide their
+    own adapter implementation using their own dependencies. The library
+    itself never imports a cache client.
+
+    Violations of the zero-external-dependencies constraint are contract
+    violations, not style choices. A PR that adds a package.json dependency
+    must be rejected regardless of the justification.
+
+interfaces:
+  - name: JWKSCache
+    description: >
+      Extension point for shared cache backends. Implement this interface
+      and pass the instance to JWKSClient constructor to enable Tier 2
+      shared caching. The library calls get() before fetching the JWKS
+      endpoint and set() after importing a new key. The library does not
+      call delete() — key expiry is managed entirely by the cache backend
+      via TTL.
+    methods:
+      - name: get
+        signature: "get(kid: string): Promise<CryptoKey | null>"
+        description: >
+          Returns the cached CryptoKey for the given kid, or null if not
+          cached. Must return null (not throw) on cache miss. May throw on
+          infrastructure failure — the library will fall back to fetching
+          from the JWKS endpoint if get() throws.
+
+      - name: set
+        signature: "set(kid: string, key: CryptoKey, ttlSeconds: number): Promise<void>"
+        description: >
+          Stores the CryptoKey for the given kid with the specified TTL.
+          The library passes keyTtl (default 86400 seconds) as the TTL.
+          May throw on infrastructure failure — the library logs the error
+          but does not fail the verification if set() throws.
+
+functions:
+  - name: JWKSClient (constructor)
+    signature: |
+      new JWKSClient(jwksUri: string, options?: {
+        cache?: JWKSCache;
+        minRefreshIntervalSeconds?: number;
+        keyTtlSeconds?: number;
+      })
+    description: >
+      Creates a new JWKS client. Does not fetch the JWKS endpoint at
+      construction time — the first verify() call triggers the initial fetch.
+
+      jwksUri: The full HTTPS URL of the JWKS endpoint. Must be HTTPS.
+        HTTP endpoints are rejected at construction time.
+
+      cache: Optional JWKSCache adapter for Tier 2 shared caching.
+        If not provided, an in-memory Map is used (Tier 1).
+
+      minRefreshIntervalSeconds: Minimum seconds between JWKS endpoint
+        fetches. Default 300. Minimum enforced value: 60.
+
+      keyTtlSeconds: TTL passed to cache.set() for imported keys.
+        Default 86400 (24 hours). Has no effect on Tier 1 (in-memory
+        cache has no TTL — keys live until pod restart).
+    errors:
+      - condition: jwksUri is not HTTPS
+        behavior: throws immediately at construction time
+
+  - name: verify
+    signature: |
+      verify(token: string, options?: {
+        audience?: string;
+      }): Promise<JWTPayload>
+    description: >
+      Verifies an RS256 JWT against the JWKS. Returns the decoded payload
+      on success. Throws on any verification failure.
+
+      Verification steps in order:
+        1. Decode JWT header — reject if malformed or alg !== 'RS256'
+        2. Look up kid in cache (Tier 1: in-memory Map; Tier 2: JWKSCache.get())
+        3. On cache miss: fetch JWKS if rate limit allows, import keys, retry
+        4. Verify RS256 signature using crypto.subtle.verify()
+        5. Validate exp claim (reject if expired)
+        6. Validate aud claim if options.audience provided
+        7. Return decoded payload
+
+    returns: >
+      JWTPayload — a plain object of the decoded JWT claims. Type is
+      Record<string, unknown>. Callers extract typed fields after verify().
+
+    errors:
+      - condition: token is malformed (not three dot-separated parts)
+        behavior: throws Error('malformed token')
+      - condition: alg is not RS256
+        behavior: throws Error('unsupported algorithm: {alg}')
+      - condition: kid not in cache and rate limit active
+        behavior: throws Error('unknown key: {kid} — retry after rate limit window')
+      - condition: kid not in cache after JWKS re-fetch
+        behavior: throws Error('unknown key: {kid}')
+      - condition: signature verification fails
+        behavior: throws Error('invalid signature')
+      - condition: token expired
+        behavior: throws Error('token expired')
+      - condition: audience mismatch
+        behavior: throws Error('audience mismatch: expected {aud}')
+      - condition: JWKS endpoint unreachable
+        behavior: throws Error('JWKS fetch failed: {detail}')
+      - condition: JWKS response is not valid JSON with a keys array
+        behavior: throws Error('invalid JWKS response')
+
+  - name: prefetch
+    signature: "prefetch(): Promise<void>"
+    description: >
+      Fetches the JWKS endpoint eagerly and populates the cache. Call during
+      pod startup (after server.listen()) to warm the cache before the first
+      real token arrives. Not required — verify() handles cold starts
+      transparently — but eliminates the first-request latency spike and
+      ensures the pod fails fast if the JWKS endpoint is unreachable at startup.
+    errors:
+      - condition: JWKS endpoint unreachable
+        behavior: throws — caller should treat this as a fatal startup error
+      - condition: JWKS response is not valid JSON with a keys array
+        behavior: throws — caller should treat this as a fatal startup error
+
+implementation-notes:
+  - note: >
+      crypto.subtle.importKey() returns a CryptoKey that cannot be serialized
+      directly. For Tier 2 cache adapters that need to serialize to Redis,
+      export the key as JWK format first using crypto.subtle.exportKey('jwk', key),
+      store the JWK JSON string, and re-import on retrieval. The reference Redis
+      adapter in the description above demonstrates this pattern.
+
+  - note: >
+      The JWKS endpoint fetch uses Node.js https.get() with the mTLS agent
+      from mtls.ts if the JWKS URI is an internal endpoint, or a plain agent
+      for external IdP endpoints. Signal-clearance's IdP is always external —
+      do not apply the mTLS agent to the JWKS fetch. Future implementations
+      that use an internal JWKS endpoint must pass the appropriate agent.
+
+  - note: >
+      Base64url decoding of JWT parts uses Buffer.from(part, 'base64url').
+      The signature bytes must not be re-encoded as a string before passing
+      to crypto.subtle.verify() — pass the raw ArrayBuffer. A common mistake
+      is converting the signature Buffer to a string and back, which corrupts
+      the bytes. Always work with Buffer/ArrayBuffer directly for signature
+      operations.
+
+  - note: >
+      Key rotation overlap periods vary by IdP. Azure AD rotates every 6 weeks
+      with a 24-hour overlap. Okta rotates on-demand with a configurable overlap.
+      Set keyTtlSeconds to less than the IdP's overlap period so stale keys
+      expire from the shared cache before the old kid is removed from the JWKS.
+      A safe default is 86400 (24 hours) for most enterprise IdPs.
+
+  - note: >
+      This library is the SETI reference implementation of the JWKS verification
+      pattern. It is not SETI-specific. Any TCA Job that needs to verify OIDC
+      tokens from an external IdP should copy jwks.ts and this contract, not
+      depend on signal-clearance. Copy-per-Job discipline applies to lib files
+      the same as redis.go and jwt.go.

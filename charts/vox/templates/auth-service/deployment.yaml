@@ -1,0 +1,168 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: auth-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auth-service
+  template:
+    metadata:
+      labels:
+        app: auth-service
+        {{- include "vox.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "vox.waitForCertForge" . | nindent 8 }}
+        {{- include "vox.waitForRedis" . | nindent 8 }}
+        {{- include "vox.waitForAuthMongo" . | nindent 8 }}
+        {{- include "vox.waitForPaymentWr4ngler" . | nindent 8 }}
+        {{- include "vox.waitForObservability" . | nindent 8 }}
+        {{- include "vox.waitForAugurCanis" . | nindent 8 }}
+        - name: obtain-db-client-cert
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}tca-mongo:{{ .Values.mongo.tag }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              FORGE_PUBLIC="http://cert-forge:{{ .Values.certForge.publicPort }}"
+              FORGE_ENROLL="https://cert-forge:{{ .Values.certForge.enrollmentPort }}"
+              ENROLLMENT_CERT="/certs/enrollment.crt"
+              ENROLLMENT_KEY="/certs/enrollment.key"
+
+              echo "Waiting for cert-forge..."
+              until curl -sf "$FORGE_PUBLIC/ca" > /dev/null; do sleep 3; done
+
+              curl -sf "$FORGE_PUBLIC/ca" | \
+                jq -r '.ca_cert' > /db-certs/ca.crt
+
+              echo "Enrolling auth-service-db client cert..."
+              curl -sf \
+                --cert "$ENROLLMENT_CERT" \
+                --key "$ENROLLMENT_KEY" \
+                --cacert /db-certs/ca.crt \
+                --insecure \
+                -X POST \
+                -H "Content-Type: application/json" \
+                -d '{"service_name":"auth-service-db","instance_id":"auth-service-db-client","common_name":"auth-service-db","organizational_unit":"db-client"}' \
+                "$FORGE_ENROLL/instance-cert" > /db-certs/response.json
+
+              jq -r '.cert' /db-certs/response.json > /db-certs/client.crt
+              jq -r '.key'  /db-certs/response.json > /db-certs/client.key
+              cat /db-certs/client.crt /db-certs/client.key > /db-certs/auth-service-db-combined.pem
+              chmod 600 /db-certs/auth-service-db-combined.pem
+              echo "DB client cert obtained."
+          volumeMounts:
+            - name: vox-certs
+              mountPath: /certs
+              readOnly: true
+            - name: db-certs
+              mountPath: /db-certs
+          volumeMounts:
+            - name: vox-certs
+              mountPath: /certs
+              readOnly: true
+            - name: db-certs
+              mountPath: /db-certs
+      containers:
+        - name: auth-service
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}auth-service:{{ .Values.authService.tag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ .Values.authService.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.authService.port | quote }}
+            - name: SERVICE_NAME
+              value: "auth-service"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: REDIS_URL
+              value: "redis:6379"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PAYMENT_WR4NGLER_URL
+              value: "https://payment-wr4ngler:{{ .Values.paymentWr4ngler.port }}"
+            - name: EMAIL_SERVICE_URL
+              value: "https://email-service:{{ .Values.emailService.port }}"
+            - name: OBSERVABILITY_URL
+              value: "https://observability-service:{{ .Values.observabilityService.port }}"
+            - name: APP_BASE_URL
+              value: "https://localhost:{{ .Values.gateway.port }}"
+            - name: RP_ID
+              value: "localhost"
+            - name: RP_NAME
+              value: "TCA Vox"
+            - name: RP_ORIGIN
+              value: "http://localhost:{{ .Values.gateway.port }}"
+            - name: MONGO_URL
+              value: "mongodb://auth-mongo:27017/auth?authMechanism=MONGODB-X509&tls=true&tlsCertificateKeyFile=/db-certs/auth-service-db-combined.pem&tlsCAFile=/db-certs/ca.crt"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: vox-credentials
+                  key: jwtSecret
+            - name: SERVICE_ACCOUNT_USER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: vox-credentials
+                  key: serviceAccountUserId
+            - name: SERVICE_ACCOUNT_TIER
+              value: "basic"
+            - name: AC_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: DEV_MODE
+              value: {{ .Values.authService.devMode | default "false" | quote }}
+          volumeMounts:
+            - name: vox-certs
+              mountPath: /certs
+              readOnly: true
+            - name: db-certs
+              mountPath: /db-certs
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: vox-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+        - name: db-certs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: auth-service
+spec:
+  selector:
+    app: auth-service
+  ports:
+    - port: {{ .Values.authService.port }}
+      targetPort: {{ .Values.authService.port }}

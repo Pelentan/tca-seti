@@ -11,8 +11,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // ---------------------------------------------------------------------------
@@ -138,15 +136,15 @@ func queryEvents(appID, caller, callee, since string, limit int) []Constellation
 // ---------------------------------------------------------------------------
 
 var (
-	localRDB       *redis.Client // SETI's own Redis
+	localRDB       *RedisClient
 	upstreamClient *http.Client
 )
 
 func connectRedis() {
 	for i := 0; i < 10; i++ {
-		localRDB = redis.NewClient(&redis.Options{Addr: redisURL})
+		localRDB = NewRedisClient(redisURL)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, err := localRDB.Ping(ctx).Result()
+		err := localRDB.Ping(ctx)
 		cancel()
 		if err == nil {
 			log.Printf("[signal-aggregator] Connected to Redis at %s", redisURL)
@@ -167,8 +165,7 @@ func startSubscription(sub *Subscription) {
 	sub.cancel = cancel
 
 	go func() {
-		rdb := redis.NewClient(&redis.Options{Addr: sub.RedisURL})
-		defer rdb.Close()
+		rdb := NewRedisClient(sub.RedisURL)
 
 		for {
 			select {
@@ -177,26 +174,33 @@ func startSubscription(sub *Subscription) {
 			default:
 			}
 
-			pubsub := rdb.Subscribe(ctx, sub.Channels...)
-			ch := pubsub.Channel()
+			subCtx, subCancel := context.WithCancel(ctx)
+			ch, err := rdb.SubscribeMulti(subCtx, sub.Channels...)
+			if err != nil {
+				subCancel()
+				sub.Status = "reconnecting"
+				log.Printf("[signal-aggregator] Subscribe failed for %s — retrying in 2s: %v", sub.ApplicationID, err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
 			sub.Status = "active"
 			log.Printf("[signal-aggregator] Subscribed to %v for %s", sub.Channels, sub.ApplicationID)
 
 			for {
 				select {
 				case <-ctx.Done():
-					pubsub.Close()
+					subCancel()
 					return
 				case msg, ok := <-ch:
 					if !ok {
+						subCancel()
 						goto reconnect
 					}
-					processEvent(sub, msg.Channel, msg.Payload)
+					processEvent(sub, msg)
 				}
 			}
 
 		reconnect:
-			pubsub.Close()
 			sub.Status = "reconnecting"
 			log.Printf("[signal-aggregator] %s subscription dropped — reconnecting in 2s", sub.ApplicationID)
 			time.Sleep(2 * time.Second)
@@ -204,7 +208,7 @@ func startSubscription(sub *Subscription) {
 	}()
 }
 
-func processEvent(sub *Subscription, channel, payload string) {
+func processEvent(sub *Subscription, payload string) {
 	sub.EventsReceived++
 
 	// Parse the raw event
@@ -242,16 +246,6 @@ func processEvent(sub *Subscription, channel, payload string) {
 
 	appendEvent(sub.ApplicationID, ev)
 
-	// Re-publish to seti:events for dashboard and other subscribers
-	enriched, _ := json.Marshal(ev)
-	localRDB.Publish(context.Background(), "seti:aggregated", enriched)
-
-	// Write to bad-whiff buffer — tier 2 of the three-tier storage model.
-	// Every event writes regardless of pass/fail. AI-lien needs baseline data,
-	// not just anomaly data. The buffer is a 24-hour sliding window of everything
-	// that crossed the constellation boundary for this application.
-	// Key: seti:whiff:{application_id}  Stream: MAXLEN ~10000 approximate trim.
-	// A full buffer (10k entries) is itself a signal worth investigating.
 	writeWhiffBuffer(sub.ApplicationID, ev)
 }
 
@@ -263,25 +257,18 @@ func writeWhiffBuffer(applicationID string, ev ConstellationEvent) {
 	go func() {
 		key := "seti:whiff:" + applicationID
 		ctx := context.Background()
-
-		args := &redis.XAddArgs{
-			Stream: key,
-			MaxLen: 10000,
-			Approx: true,
-			ID:     "*",
-			Values: map[string]interface{}{
-				"application_id": applicationID,
-				"caller":         ev.Caller,
-				"callee":         ev.Callee,
-				"method":         ev.Method,
-				"path":           ev.Path,
-				"status_code":    fmt.Sprintf("%d", ev.StatusCode),
-				"latency_ms":     fmt.Sprintf("%d", ev.LatencyMs),
-				"protocol":       ev.Protocol,
-				"received_at":    ev.ReceivedAt,
-			},
+		fields := map[string]string{
+			"application_id": applicationID,
+			"caller":         ev.Caller,
+			"callee":         ev.Callee,
+			"method":         ev.Method,
+			"path":           ev.Path,
+			"status_code":    fmt.Sprintf("%d", ev.StatusCode),
+			"latency_ms":     fmt.Sprintf("%d", ev.LatencyMs),
+			"protocol":       ev.Protocol,
+			"received_at":    ev.ReceivedAt,
 		}
-		if err := localRDB.XAdd(ctx, args).Err(); err != nil {
+		if _, err := localRDB.XAdd(ctx, key, 10000, fields); err != nil {
 			log.Printf("[signal-aggregator] whiff buffer write failed for %s: %v", applicationID, err)
 		}
 	}()
@@ -295,7 +282,7 @@ func selfSubscribe() {
 	sub := &Subscription{
 		ApplicationID: "seti",
 		RedisURL:      redisURL,
-		Channels:      []string{"seti:events", "tca:augur-canis"},
+		Channels:      []string{"tca:augur-canis"},
 		Status:        "active",
 		SubscribedAt:  time.Now().UTC().Format(time.RFC3339),
 	}
@@ -306,7 +293,7 @@ func selfSubscribe() {
 	windows["seti"] = []ConstellationEvent{}
 	windowMu.Unlock()
 	startSubscription(sub)
-	log.Printf("[signal-aggregator] Self-subscribed to seti (tca:events, tca:augur-canis)")
+	log.Printf("[signal-aggregator] Self-subscribed to seti (tca:augur-canis)")
 }
 
 // ---------------------------------------------------------------------------
@@ -601,7 +588,6 @@ func main() {
 	certMat = obtainCerts("signal-aggregator")
 	buildUpstreamClient()
 	connectRedis()
-	loadStarGazer()
 	go selfRegisterWithAC(certMat, "https://signal-aggregator:4006")
 	selfSubscribe()
 	go initFederationOnStartup()
@@ -614,6 +600,7 @@ func main() {
 	mux.HandleFunc("/verify/call-chain", handleVerify)
 	mux.HandleFunc("/federation/subscriptions", handleFederationSubscriptions)
 	mux.HandleFunc("/federation/subscriptions/", handleFederationReconnect)
+	mux.HandleFunc("/federation/proxy/", handleFederationProxy)
 
 	server := &http.Server{
 		Addr: ":" + port, Handler: mux, TLSConfig: loadServerTLS(),
@@ -622,7 +609,10 @@ func main() {
 	log.Printf("[signal-aggregator] Listening on :%s (mTLS, TLS 1.3)", port)
 	log.Printf("[signal-aggregator] Self-subscribed to seti — watching tca:events and tca:augur-canis")
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[signal-aggregator] %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[signal-aggregator] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }

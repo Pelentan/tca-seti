@@ -116,6 +116,19 @@ x-tca-observability:
     enabled). Redis session management is not HTTP and is instrumented
     via structured logging only.
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - disconnect-redis
+      - exit-0
+    notes: >
+      signal-clearance holds a Redis connection for session management. The connection must be closed after the HTTP server drains to ensure active session reads complete. Node.js server.close() stops new connections while allowing in-flight requests to complete.
+
 servers:
   - url: https://signal-clearance:4001
     description: Internal SETI network (mTLS enforced)

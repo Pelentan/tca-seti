@@ -1,0 +1,113 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+        {{- include "vox.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "vox.waitForCertForge" . | nindent 8 }}
+        {{- include "vox.waitForRedis" . | nindent 8 }}
+        {{- include "vox.waitForObservability" . | nindent 8 }}
+        {{- include "vox.waitForUI" . | nindent 8 }}
+        {{- include "vox.waitForAugurCanis" . | nindent 8 }}
+      containers:
+        - name: gateway
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}gateway:{{ .Values.gateway.tag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ .Values.gateway.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.gateway.port | quote }}
+            - name: SERVICE_NAME
+              value: "gateway"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: REDIS_URL
+              value: "redis:6379"
+            - name: OBSERVABILITY_URL
+              value: "https://observability-service:{{ .Values.observabilityService.port }}"
+            - name: AUTH_SERVICE_URL
+              value: "https://auth-service:{{ .Values.authService.port }}"
+            - name: PAGE_BUILDER_URL
+              value: "https://page-builder:{{ .Values.pageBuilder.port }}"
+            - name: POLL_BUILDER_URL
+              value: "https://poll-builder:{{ .Values.pollBuilder.port }}"
+            - name: POLL_WR4NGLER_URL
+              value: "https://poll-wr4ngler:{{ .Values.pollWr4ngler.port }}"
+            - name: REPORT_WR4NGLER_URL
+              value: "https://report-wr4ngler:{{ .Values.reportWr4ngler.port }}"
+            - name: USER_WR4NGLER_URL
+              value: "https://user-wr4ngler:{{ .Values.userWr4ngler.port }}"
+            - name: UI_URL
+              value: "http://ui:{{ .Values.ui.port }}"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: vox-credentials
+                  key: jwtSecret
+            - name: DEV_MODE
+              value: {{ .Values.gateway.devMode | default "false" | quote }}
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- if .Values.gateway.externalHostname }}
+            - name: GATEWAY_EXTERNAL_HOSTNAME
+              value: {{ .Values.gateway.externalHostname | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: vox-certs
+              mountPath: /certs
+              readOnly: true
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: vox-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: gateway
+spec:
+  selector:
+    app: gateway
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.gateway.port }}
+      targetPort: {{ .Values.gateway.port }}

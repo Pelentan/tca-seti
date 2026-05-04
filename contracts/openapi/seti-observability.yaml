@@ -53,6 +53,19 @@ x-tca-security:
     Connections without a valid client certificate must be rejected — not
     downgraded to unauthenticated.
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - close-redis
+      - exit-0
+    notes: >
+      seti-observability publishes to the seti:events Redis channel but holds no subscriptions. In-flight event publishes complete within the drain window before the Redis connection closes.
+
 servers:
   - url: https://seti-observability:4011
     description: Internal Docker network (mTLS enforced)

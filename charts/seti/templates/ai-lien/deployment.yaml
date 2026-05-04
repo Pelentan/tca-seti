@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-lien
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: ai-lien
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ai-lien
+  template:
+    metadata:
+      labels:
+        app: ai-lien
+        {{- include "seti.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "seti.waitForCertForge" . | nindent 8 }}
+        {{- include "seti.waitForAugurCanis" . | nindent 8 }}
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: ai-lien
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}ai-lien:{{ .Values.aiLien.tag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ .Values.aiLien.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.aiLien.port | quote }}
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            - name: SERVICE_NAME
+              value: "ai-lien"
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OBSERVABILITY_URL
+              value: "https://seti-observability:{{ .Values.setiObservability.port }}"
+            - name: POLICY_URL
+              value: "https://policy:{{ .Values.policy.port }}"
+            - name: RESULTS_URL
+              value: "https://results:{{ .Values.results.port }}"
+            - name: LORE_URL
+              value: "https://lore:{{ .Values.lore.port }}"
+          volumeMounts:
+            - name: seti-certs
+              mountPath: /certs
+              readOnly: true
+          livenessProbe:
+            exec:
+              command: ["python3", "/healthcheck.py"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: seti-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-lien
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: ai-lien
+spec:
+  selector:
+    app: ai-lien
+  ports:
+    - port: {{ .Values.aiLien.port }}
+      targetPort: {{ .Values.aiLien.port }}

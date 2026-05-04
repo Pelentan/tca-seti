@@ -57,6 +57,18 @@ x-tca-security:
   ca-cert: /certs/ca.crt
   service-cert: /certs/lore.crt
   service-key: /certs/lore.key
+  database-auth:
+    mechanism: x509-client-certificate
+    cert: /certs/lore-db.crt
+    key: /certs/lore-db.key
+    ca: /certs/ca.crt
+    pg-role: lore
+    notes: >
+      lore authenticates to PostgreSQL using its cert-forge-issued client
+      certificate (CN=lore-db). The CN maps to the lore PostgreSQL role via
+      pg_hba.conf hostssl cert clientcert=verify-full. No password exists for
+      the lore role. The postgres superuser retains a cert-forge-generated
+      password for emergency DBA access only — it is never used by any Job.
   implementation:
     server:
       load-ca-cert: true
@@ -98,6 +110,19 @@ x-tca-observability:
     Lore's outbound calls are primarily to its PostgreSQL database.
     All inbound calls from authorized callers are visible in the
     observability feed as normal inter-service traffic.
+
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - close-database
+      - exit-0
+    notes: >
+      lore holds a PostgreSQL connection pool (max 25 open connections). The pool must be closed after the HTTP server drains to ensure all in-flight queries complete before the connections are released. lore holds no Redis connections.
 
 servers:
   - url: https://lore:4110

@@ -212,7 +212,10 @@ func main() {
 	log.Printf("[notifier] See contracts/openapi/notifier.yaml for the contract")
 	log.Printf("[notifier] See comments in handleNotify() for implementation guidance")
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[notifier] Server error: %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[notifier] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }

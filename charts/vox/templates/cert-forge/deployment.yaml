@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cert-forge
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: cert-forge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cert-forge
+  template:
+    metadata:
+      labels:
+        app: cert-forge
+        {{- include "vox.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: cert-forge
+      initContainers:
+        {{- include "vox.waitForRedis" . | nindent 8 }}
+      containers:
+        - name: cert-forge
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}cert-forge:{{ .Values.certForge.tag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ .Values.certForge.port }}
+            - containerPort: {{ .Values.certForge.enrollmentPort }}
+            - containerPort: {{ .Values.certForge.publicPort }}
+          env:
+            - name: PORT
+              value: {{ .Values.certForge.port | quote }}
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: SERVICE_NAME
+              value: "cert-forge"
+            - name: K8S_SECRET_NAME
+              value: {{ .Values.certSecretName | quote }}
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          livenessProbe:
+            httpGet:
+              path: /ca
+              port: {{ .Values.certForge.publicPort }}
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cert-forge
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: cert-forge
+spec:
+  selector:
+    app: cert-forge
+  ports:
+    - name: sign
+      port: {{ .Values.certForge.port }}
+      targetPort: {{ .Values.certForge.port }}
+    - name: enrollment
+      port: {{ .Values.certForge.enrollmentPort }}
+      targetPort: {{ .Values.certForge.enrollmentPort }}
+    - name: public
+      port: {{ .Values.certForge.publicPort }}
+      targetPort: {{ .Values.certForge.publicPort }}

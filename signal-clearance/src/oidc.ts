@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { JWKSClient } from './jwks.js';
 import https from 'https';
 import { FederationConfig } from './types.js';
 import { buildUpstreamAgent } from './mtls.js';
@@ -31,22 +31,23 @@ export async function discoverOIDC(discoveryUrl: string): Promise<{
 }
 
 // ---------------------------------------------------------------------------
-// JWKS caching
+// JWKS caching — TCA JWKSClient (stdlib, no jose)
 // ---------------------------------------------------------------------------
 
-const jwksSets = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+const jwksClients = new Map<string, JWKSClient>();
 
-export function getJWKS(jwksUri: string) {
-  if (!jwksSets.has(jwksUri)) {
-    jwksSets.set(jwksUri, createRemoteJWKSet(new URL(jwksUri)));
+export function getJWKSClient(jwksUri: string): JWKSClient {
+  if (!jwksClients.has(jwksUri)) {
+    jwksClients.set(jwksUri, new JWKSClient(jwksUri));
   }
-  return jwksSets.get(jwksUri)!;
+  return jwksClients.get(jwksUri)!;
 }
 
 export function refreshJWKS(jwksUri: string): void {
-  // Force re-fetch on next validation by removing cached set
-  jwksSets.delete(jwksUri);
-  console.log(`[signal-clearance] JWKS cache cleared for ${jwksUri}`);
+  // Drop the client — next getJWKSClient() call creates a fresh one
+  // with an empty cache, forcing a JWKS re-fetch on next verify().
+  jwksClients.delete(jwksUri);
+  console.log(`[signal-clearance] JWKS client cleared for ${jwksUri}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -68,12 +69,8 @@ export async function validateIDToken(
     throw new Error('JWKS URI not configured — run OIDC discovery first');
   }
 
-  const JWKS = getJWKS(config.jwks_uri);
-
-  const { payload } = await jwtVerify(idToken, JWKS, {
-    audience: config.audience,
-    issuer: undefined, // Issuer validated by JWKS origin
-  });
+  const client = getJWKSClient(config.jwks_uri);
+  const payload = await client.verify(idToken, { audience: config.audience });
 
   const raw = payload as Record<string, unknown>;
 

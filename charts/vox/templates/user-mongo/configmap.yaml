@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-mongo-init
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+data:
+  init.js: |
+    // TCA Vox — MongoDB user-mongo X.509 Authentication Initialization
+    // Creates a least-privilege X.509 user authenticated by certificate
+    // subject rather than username/password.
+    // No passwords. Client authenticates via mTLS client certificate.
+    //
+    // X.509 subject maps to cert issued by cert-forge for user-wr4ngler-db.
+
+    const subject = "CN=user-wr4ngler-db,OU=db-client,O=TCA Vox,C=US";
+    const db_name = "users";
+
+    // Create x509 user in $external database (required for x509 auth)
+    const external = db.getSiblingDB("$external");
+    const existing = external.getUser(subject);
+
+    if (!existing) {
+      external.createUser({
+        user: subject,
+        roles: [{ role: "readWrite", db: db_name }]
+      });
+      print("[user-mongo-init] Created X.509 user: " + subject);
+    } else {
+      print("[user-mongo-init] X.509 user already exists: " + subject);
+    }

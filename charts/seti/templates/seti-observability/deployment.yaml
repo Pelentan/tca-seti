@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seti-observability
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: seti-observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: seti-observability
+  template:
+    metadata:
+      labels:
+        app: seti-observability
+        {{- include "seti.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "seti.waitForCertForge" . | nindent 8 }}
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: seti-observability
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}seti-observability:{{ .Values.setiObservability.tag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ .Values.setiObservability.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.setiObservability.port | quote }}
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            - name: SERVICE_NAME
+              value: "seti-observability"
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:4010"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: seti-certs
+              mountPath: /certs
+              readOnly: true
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: seti-certs
+          secret:
+            # K8s holds this pod Pending until cert-forge creates the Secret.
+            # No init container needed — the volume mount is the gate.
+            secretName: {{ .Values.certSecretName }}

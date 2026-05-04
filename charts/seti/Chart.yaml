@@ -1,0 +1,11 @@
+apiVersion: v2
+name: seti
+description: S.E.T.I. — Search for Erroneous Tessellated Interactions
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - tca
+  - monitoring
+  - observability
+home: https://github.com/Pelentan/tca-seti

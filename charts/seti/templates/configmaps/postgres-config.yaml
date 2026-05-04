@@ -1,0 +1,55 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: seti-postgres-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+data:
+  pg_hba.conf: |
+    # TYPE   DATABASE  USER      ADDRESS  METHOD
+    # Unix socket — init scripts and pg_isready only. Never exposed externally.
+    local    all       all                trust
+    # lore application user — X.509 client certificate, CN mapped via pg_ident.conf.
+    hostssl  lore      lore      all      cert clientcert=verify-full map=certmap
+    # postgres superuser — scram-sha-256 for emergency DBA access only.
+    hostssl  all       postgres  all      scram-sha-256
+    # Reject everything else.
+    host     all       all       all      reject
+
+  pg_ident.conf: |
+    # MAPNAME   SYSTEM-USERNAME    PG-USERNAME
+    # Maps the cert CN (lore-db) to the postgres role (lore).
+    certmap     lore-db            lore
+
+  postgresql.conf: |
+    # Accept connections from all addresses — required for K8s pod-to-pod.
+    listen_addresses = '*'
+    # TLS — server cert and key from cert-forge via seti-certs Secret.
+    ssl = on
+    ssl_ca_file   = '/certs/ca.crt'
+    ssl_cert_file = '/certs/postgres-server.crt'
+    ssl_key_file  = '/certs/postgres-server.key'
+    # Config files are mounted from this ConfigMap, not the data directory.
+    hba_file    = '/etc/postgresql/pg_hba.conf'
+    ident_file  = '/etc/postgresql/pg_ident.conf'
+
+  init.sql: |
+    -- Runs once on first data directory initialization via unix socket.
+    -- Creates the lore application role (no password) and the lore database.
+    -- The lore role authenticates exclusively via X.509 client certificate.
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'lore') THEN
+        CREATE ROLE lore WITH LOGIN;
+      END IF;
+    END $$;
+
+    SELECT 'CREATE DATABASE lore OWNER lore'
+    WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'lore')\gexec
+
+    -- PostgreSQL 15+ removed default CREATE on public schema.
+    -- Grant lore full control of its own database's public schema.
+    \c lore
+    GRANT ALL ON SCHEMA public TO lore;
+    ALTER SCHEMA public OWNER TO lore;

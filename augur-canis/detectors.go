@@ -74,23 +74,22 @@ const (
 
 // AutoBaseline is established by AC from observed data.
 type AutoBaseline struct {
-	ServiceName    string  `json:"service_name"`
-	MeanLatencyMs  float64 `json:"mean_latency_ms"`
-	SampleCount    int     `json:"sample_count"`
-	EstablishedAt  string  `json:"established_at"`
-	LastUpdatedAt  string  `json:"last_updated_at"`
+	ServiceName   string  `json:"service_name"`
+	MeanLatencyMs float64 `json:"mean_latency_ms"`
+	SampleCount   int     `json:"sample_count"`
+	EstablishedAt string  `json:"established_at"`
+	LastUpdatedAt string  `json:"last_updated_at"`
 }
 
 // WranglerBaseline is set explicitly by a Sec Wr4ngler.
-// Maps directly to Notifier severity — the Wr4ngler decides what fires the pager.
 type WranglerBaseline struct {
-	ServiceName       string `json:"service_name"`
-	LatencyThresholdMs int64  `json:"latency_threshold_ms"`   // 0 = not set
-	FailureRateThresh  float64 `json:"failure_rate_threshold"` // 0 = not set
-	AlertLevel        string `json:"alert_level"`   // critical | high | medium | low
-	SetBy             string `json:"set_by"`
-	SetAt             string `json:"set_at"`
-	Notes             string `json:"notes,omitempty"`
+	ServiceName        string  `json:"service_name"`
+	LatencyThresholdMs int64   `json:"latency_threshold_ms"`
+	FailureRateThresh  float64 `json:"failure_rate_threshold"`
+	AlertLevel         string  `json:"alert_level"`
+	SetBy              string  `json:"set_by"`
+	SetAt              string  `json:"set_at"`
+	Notes              string  `json:"notes,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -98,8 +97,8 @@ type WranglerBaseline struct {
 // ---------------------------------------------------------------------------
 
 func loadAutoBaseline(ctx context.Context, serviceName string) *AutoBaseline {
-	raw, err := rdb.Get(ctx, fmt.Sprintf(keyAutoBaseline, serviceName)).Result()
-	if err != nil {
+	raw, ok, err := rdb.Get(ctx, fmt.Sprintf(keyAutoBaseline, serviceName))
+	if !ok || err != nil {
 		return nil
 	}
 	var b AutoBaseline
@@ -111,12 +110,12 @@ func loadAutoBaseline(ctx context.Context, serviceName string) *AutoBaseline {
 
 func saveAutoBaseline(ctx context.Context, b AutoBaseline) {
 	payload, _ := json.Marshal(b)
-	rdb.Set(ctx, fmt.Sprintf(keyAutoBaseline, b.ServiceName), payload, 0)
+	rdb.Set(ctx, fmt.Sprintf(keyAutoBaseline, b.ServiceName), string(payload), 0)
 }
 
 func loadWranglerBaseline(ctx context.Context, serviceName string) *WranglerBaseline {
-	raw, err := rdb.Get(ctx, fmt.Sprintf(keyWranglerBaseline, serviceName)).Result()
-	if err != nil {
+	raw, ok, err := rdb.Get(ctx, fmt.Sprintf(keyWranglerBaseline, serviceName))
+	if !ok || err != nil {
 		return nil
 	}
 	var b WranglerBaseline
@@ -128,7 +127,7 @@ func loadWranglerBaseline(ctx context.Context, serviceName string) *WranglerBase
 
 func saveWranglerBaseline(ctx context.Context, b WranglerBaseline) {
 	payload, _ := json.Marshal(b)
-	rdb.Set(ctx, fmt.Sprintf(keyWranglerBaseline, b.ServiceName), payload, 0)
+	rdb.Set(ctx, fmt.Sprintf(keyWranglerBaseline, b.ServiceName), string(payload), 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -136,24 +135,17 @@ func saveWranglerBaseline(ctx context.Context, b WranglerBaseline) {
 // ---------------------------------------------------------------------------
 
 // readLatencyWindow reads the last N latency samples from the Stream.
-// Returns samples and their rolling mean.
 func readLatencyWindow(ctx context.Context, serviceName string) ([]float64, float64) {
 	msgs, err := rdb.XRevRangeN(ctx,
-		fmt.Sprintf(keyLatencyStream, serviceName), "+", "-", 20).Result()
+		fmt.Sprintf(keyLatencyStream, serviceName), "+", "-", 20)
 	if err != nil || len(msgs) == 0 {
 		return nil, 0
 	}
 	samples := make([]float64, 0, len(msgs))
 	sum := 0.0
 	for _, msg := range msgs {
-		if v, ok := msg.Values["latency_ms"]; ok {
-			var n float64
-			switch val := v.(type) {
-			case string:
-				n, _ = strconv.ParseFloat(val, 64)
-			case float64:
-				n = val
-			}
+		if v, ok := msg.Fields["latency_ms"]; ok {
+			n, _ := strconv.ParseFloat(v, 64)
 			if n > 0 {
 				samples = append(samples, n)
 				sum += n
@@ -167,23 +159,16 @@ func readLatencyWindow(ctx context.Context, serviceName string) ([]float64, floa
 }
 
 // readHealthWindow reads the last N health samples from the Stream.
-// Returns failure count and total sample count.
 func readHealthWindow(ctx context.Context, serviceName string) (int, int) {
 	msgs, err := rdb.XRevRangeN(ctx,
-		fmt.Sprintf(keyHealthStream, serviceName), "+", "-", 20).Result()
+		fmt.Sprintf(keyHealthStream, serviceName), "+", "-", 20)
 	if err != nil || len(msgs) == 0 {
 		return 0, 0
 	}
 	failures := 0
 	for _, msg := range msgs {
-		if v, ok := msg.Values["healthy"]; ok {
-			var h int
-			switch val := v.(type) {
-			case string:
-				h, _ = strconv.Atoi(val)
-			case float64:
-				h = int(val)
-			}
+		if v, ok := msg.Fields["healthy"]; ok {
+			h, _ := strconv.Atoi(v)
 			if h == 0 {
 				failures++
 			}
@@ -193,34 +178,25 @@ func readHealthWindow(ctx context.Context, serviceName string) (int, int) {
 }
 
 // ReadMetricsWindow reads time-bounded latency and health samples for the UI.
-// sinceMs is a Unix millisecond timestamp; pass 0 for all available data.
 func ReadMetricsWindow(ctx context.Context, serviceName string, sinceMs int64) []MetricSample {
 	start := "-"
 	if sinceMs > 0 {
 		start = fmt.Sprintf("%d-0", sinceMs)
 	}
 	msgs, err := rdb.XRange(ctx,
-		fmt.Sprintf(keyLatencyStream, serviceName), start, "+").Result()
+		fmt.Sprintf(keyLatencyStream, serviceName), start, "+")
 	if err != nil {
 		return nil
 	}
 
-	// Fetch health stream for the same window
 	healthMsgs, _ := rdb.XRange(ctx,
-		fmt.Sprintf(keyHealthStream, serviceName), start, "+").Result()
+		fmt.Sprintf(keyHealthStream, serviceName), start, "+")
 	healthByID := map[string]int{}
 	for _, msg := range healthMsgs {
-		// Match health to latency by closest timestamp
-		// Use stream ID prefix (ms portion) for correlation
 		msID := strings.SplitN(msg.ID, "-", 2)[0]
-		if v, ok := msg.Values["healthy"]; ok {
-			switch val := v.(type) {
-			case string:
-				h, _ := strconv.Atoi(val)
-				healthByID[msID] = h
-			case float64:
-				healthByID[msID] = int(val)
-			}
+		if v, ok := msg.Fields["healthy"]; ok {
+			h, _ := strconv.Atoi(v)
+			healthByID[msID] = h
 		}
 	}
 
@@ -230,13 +206,8 @@ func ReadMetricsWindow(ctx context.Context, serviceName string, sinceMs int64) [
 		tsMs, _ := strconv.ParseInt(msID, 10, 64)
 
 		var latency float64
-		if v, ok := msg.Values["latency_ms"]; ok {
-			switch val := v.(type) {
-			case string:
-				latency, _ = strconv.ParseFloat(val, 64)
-			case float64:
-				latency = val
-			}
+		if v, ok := msg.Fields["latency_ms"]; ok {
+			latency, _ = strconv.ParseFloat(v, 64)
 		}
 
 		healthy := 1
@@ -281,12 +252,11 @@ func runLatencyDriftDetector() {
 
 func checkLatencyDriftAllServices() {
 	ctx := context.Background()
-	keys, err := rdb.Keys(ctx, "ac:metrics:*:latency").Result()
+	keys, err := rdb.Keys(ctx, "ac:metrics:*:latency")
 	if err != nil {
 		return
 	}
 	for _, key := range keys {
-		// Extract service name: ac:metrics:{service}:latency
 		serviceName := strings.TrimPrefix(key, "ac:metrics:")
 		serviceName = strings.TrimSuffix(serviceName, ":latency")
 		checkLatencyDrift(ctx, serviceName)
@@ -296,15 +266,13 @@ func checkLatencyDriftAllServices() {
 func checkLatencyDrift(ctx context.Context, serviceName string) {
 	samples, currentMean := readLatencyWindow(ctx, serviceName)
 	if len(samples) < minBaselineSamples {
-		return // Not enough data yet
+		return
 	}
 
-	// Load or establish auto-baseline
 	auto := loadAutoBaseline(ctx, serviceName)
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	if auto == nil {
-		// Establish baseline from current data
 		auto = &AutoBaseline{
 			ServiceName:   serviceName,
 			MeanLatencyMs: currentMean,
@@ -318,26 +286,22 @@ func checkLatencyDrift(ctx context.Context, serviceName string) {
 		return
 	}
 
-	// Update baseline with slight decay toward current mean (exponential moving average)
-	// This lets the baseline track gradual legitimate improvement without losing history
 	alpha := 0.05
 	auto.MeanLatencyMs = (1-alpha)*auto.MeanLatencyMs + alpha*currentMean
 	auto.SampleCount++
 	auto.LastUpdatedAt = now
 	saveAutoBaseline(ctx, *auto)
 
-	// Check drift against auto-baseline
 	driftThreshold := auto.MeanLatencyMs * latencyDriftMultiplier
 	if currentMean > driftThreshold {
-		// Require N consecutive cycles above threshold before firing
 		driftKey := fmt.Sprintf(keyDriftCycles, serviceName)
 		rdb.Incr(ctx, driftKey)
 		rdb.Expire(ctx, driftKey, 5*time.Minute)
-		cyclesStr, _ := rdb.Get(ctx, driftKey).Result()
+		cyclesStr, _, _ := rdb.Get(ctx, driftKey)
 		cycles, _ := strconv.Atoi(cyclesStr)
 
 		if cycles >= consecutiveDriftCycles {
-			isActive, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertActive, serviceName)).Result()
+			isActive, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertActive, serviceName))
 			if isActive != "1" {
 				msg := fmt.Sprintf("Latency drift: %s current mean %.1fms is %.1fx above auto-baseline %.1fms",
 					serviceName, currentMean, currentMean/auto.MeanLatencyMs, auto.MeanLatencyMs)
@@ -347,15 +311,13 @@ func checkLatencyDrift(ctx context.Context, serviceName string) {
 			rdb.Del(ctx, driftKey)
 		}
 	} else {
-		// Reset consecutive counter on healthy reading
 		rdb.Del(ctx, fmt.Sprintf(keyDriftCycles, serviceName))
 	}
 
-	// Check against Wr4ngler baseline if set
 	wr4ngler := loadWranglerBaseline(ctx, serviceName)
 	if wr4ngler != nil && wr4ngler.LatencyThresholdMs > 0 {
 		if currentMean > float64(wr4ngler.LatencyThresholdMs) {
-			isActive, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertActive, serviceName)).Result()
+			isActive, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertActive, serviceName))
 			if isActive != "1" {
 				severity := wranglerSeverity(wr4ngler.AlertLevel)
 				msg := fmt.Sprintf("Latency SLA breach: %s current mean %.1fms exceeds Wr4ngler threshold %dms (level: %s)",
@@ -386,12 +348,11 @@ func runFailureRateDetector() {
 
 func checkFailureRateAllServices() {
 	ctx := context.Background()
-	keys, err := rdb.Keys(ctx, "ac:metrics:*:health").Result()
+	keys, err := rdb.Keys(ctx, "ac:metrics:*:health")
 	if err != nil {
 		return
 	}
 	for _, key := range keys {
-		// Extract service name: ac:metrics:{service}:health
 		serviceName := strings.TrimPrefix(key, "ac:metrics:")
 		serviceName = strings.TrimSuffix(serviceName, ":health")
 		checkFailureRate(ctx, serviceName)
@@ -407,9 +368,8 @@ func checkFailureRate(ctx context.Context, serviceName string) {
 	rate := float64(failures) / float64(total)
 	now := time.Now().UTC().Format(time.RFC3339)
 
-	// Check against auto threshold
 	if rate > failureRateThreshold {
-		isActive, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertActive, serviceName)).Result()
+		isActive, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertActive, serviceName))
 		if isActive != "1" {
 			msg := fmt.Sprintf("Failure rate: %s reporting %.0f%% failures (%d/%d checks)",
 				serviceName, rate*100, failures, total)
@@ -418,11 +378,10 @@ func checkFailureRate(ctx context.Context, serviceName string) {
 		}
 	}
 
-	// Check against Wr4ngler baseline if set
 	wr4ngler := loadWranglerBaseline(ctx, serviceName)
 	if wr4ngler != nil && wr4ngler.FailureRateThresh > 0 {
 		if rate > wr4ngler.FailureRateThresh {
-			isActive, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertActive, serviceName)).Result()
+			isActive, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertActive, serviceName))
 			if isActive != "1" {
 				severity := wranglerSeverity(wr4ngler.AlertLevel)
 				msg := fmt.Sprintf("Failure rate SLA breach: %s at %.0f%% failures exceeds Wr4ngler threshold %.0f%% (level: %s)",
@@ -453,7 +412,6 @@ func wranglerSeverity(level string) Severity {
 // Admin API — Wr4ngler baseline management
 // ---------------------------------------------------------------------------
 
-// handleSetWranglerBaseline handles POST /baselines/{service}
 func handleSetWranglerBaseline(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -474,7 +432,7 @@ func handleSetWranglerBaseline(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		LatencyThresholdMs int64   `json:"latency_threshold_ms"`
 		FailureRateThresh  float64 `json:"failure_rate_threshold"`
-		AlertLevel         string  `json:"alert_level"` // critical | high | medium | low
+		AlertLevel         string  `json:"alert_level"`
 		SetBy              string  `json:"set_by"`
 		Notes              string  `json:"notes"`
 	}
@@ -527,7 +485,6 @@ func handleSetWranglerBaseline(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleGetWranglerBaseline handles GET /baselines/{service}
 func handleGetWranglerBaseline(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -549,9 +506,6 @@ func handleGetWranglerBaseline(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleMetrics handles GET /metrics?since_ms=N
-// Returns time-series latency and health samples for all Jobs.
-// since_ms is a Unix millisecond timestamp; omit for all available data (up to stream max).
 func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	ctx := context.Background()
@@ -561,8 +515,7 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 		sinceMs, _ = strconv.ParseInt(s, 10, 64)
 	}
 
-	// Discover all services with latency streams
-	keys, err := rdb.Keys(ctx, "ac:metrics:*:latency").Result()
+	keys, err := rdb.Keys(ctx, "ac:metrics:*:latency")
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"code": "REDIS_ERROR", "message": err.Error()})
@@ -570,9 +523,9 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type ServiceMetrics struct {
-		ServiceName string         `json:"service_name"`
-		Samples     []MetricSample `json:"samples"`
-		AutoBaseline *AutoBaseline  `json:"auto_baseline,omitempty"`
+		ServiceName      string            `json:"service_name"`
+		Samples          []MetricSample    `json:"samples"`
+		AutoBaseline     *AutoBaseline     `json:"auto_baseline,omitempty"`
 		WranglerBaseline *WranglerBaseline `json:"wr4ngler_baseline,omitempty"`
 	}
 
@@ -592,19 +545,19 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"services":  result,
-		"total":     len(result),
-		"since_ms":  sinceMs,
+		"services":   result,
+		"total":      len(result),
+		"since_ms":   sinceMs,
 		"fetched_at": time.Now().UnixMilli(),
 	})
 }
+
 func handleListBaselines(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	ctx := context.Background()
 
-	// Gather all services that have any kind of baseline
-	autoKeys, _ := rdb.Keys(ctx, "ac:baseline:auto:*").Result()
-	wr4nglerKeys, _ := rdb.Keys(ctx, "ac:baseline:wr4ngler:*").Result()
+	autoKeys, _ := rdb.Keys(ctx, "ac:baseline:auto:*")
+	wr4nglerKeys, _ := rdb.Keys(ctx, "ac:baseline:wr4ngler:*")
 
 	seen := map[string]bool{}
 	services := []string{}

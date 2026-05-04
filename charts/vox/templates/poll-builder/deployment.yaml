@@ -1,0 +1,138 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: poll-builder
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: poll-builder
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: poll-builder
+  template:
+    metadata:
+      labels:
+        app: poll-builder
+        {{- include "vox.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "vox.waitForCertForge" . | nindent 8 }}
+        {{- include "vox.waitForPollMongo" . | nindent 8 }}
+        {{- include "vox.waitForObservability" . | nindent 8 }}
+        {{- include "vox.waitForAugurCanis" . | nindent 8 }}
+        - name: obtain-db-client-cert
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}tca-mongo:{{ .Values.mongo.tag }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              FORGE_PUBLIC="http://cert-forge:{{ .Values.certForge.publicPort }}"
+              FORGE_ENROLL="https://cert-forge:{{ .Values.certForge.enrollmentPort }}"
+              ENROLLMENT_CERT="/certs/enrollment.crt"
+              ENROLLMENT_KEY="/certs/enrollment.key"
+
+              echo "Waiting for cert-forge..."
+              until curl -sf "$FORGE_PUBLIC/ca" > /dev/null; do sleep 3; done
+
+              curl -sf "$FORGE_PUBLIC/ca" | \
+                jq -r '.ca_cert' > /db-certs/ca.crt
+
+              echo "Enrolling poll-builder-db client cert..."
+              curl -sf \
+                --cert "$ENROLLMENT_CERT" \
+                --key "$ENROLLMENT_KEY" \
+                --cacert /db-certs/ca.crt \
+                --insecure \
+                -X POST \
+                -H "Content-Type: application/json" \
+                -d '{"service_name":"poll-builder-db","instance_id":"poll-builder-db-client","common_name":"poll-builder-db","organizational_unit":"db-client"}' \
+                "$FORGE_ENROLL/instance-cert" > /db-certs/response.json
+
+              jq -r '.cert' /db-certs/response.json > /db-certs/client.crt
+              jq -r '.key'  /db-certs/response.json > /db-certs/client.key
+              cat /db-certs/client.crt /db-certs/client.key > /db-certs/poll-builder-db-combined.pem
+              chmod 600 /db-certs/poll-builder-db-combined.pem
+              echo "DB client cert obtained."
+          volumeMounts:
+            - name: vox-certs
+              mountPath: /certs
+              readOnly: true
+            - name: db-certs
+              mountPath: /db-certs
+          volumeMounts:
+            - name: vox-certs
+              mountPath: /certs
+              readOnly: true
+            - name: db-certs
+              mountPath: /db-certs
+      containers:
+        - name: poll-builder
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}poll-builder:{{ .Values.pollBuilder.tag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ .Values.pollBuilder.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.pollBuilder.port | quote }}
+            - name: SERVICE_NAME
+              value: "poll-builder"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: REDIS_URL
+              value: "redis:6379"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OBSERVABILITY_URL
+              value: "https://observability-service:{{ .Values.observabilityService.port }}"
+            - name: MONGO_URL
+              value: "mongodb://poll-mongo:27017/polls?authMechanism=MONGODB-X509&tls=true&tlsCertificateKeyFile=/db-certs/poll-builder-db-combined.pem&tlsCAFile=/db-certs/ca.crt"
+          volumeMounts:
+            - name: vox-certs
+              mountPath: /certs
+              readOnly: true
+            - name: db-certs
+              mountPath: /db-certs
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: vox-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+        - name: db-certs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: poll-builder
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: poll-builder
+spec:
+  selector:
+    app: poll-builder
+  ports:
+    - port: {{ .Values.pollBuilder.port }}
+      targetPort: {{ .Values.pollBuilder.port }}

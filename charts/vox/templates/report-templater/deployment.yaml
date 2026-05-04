@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: report-templater
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: report-templater
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: report-templater
+  template:
+    metadata:
+      labels:
+        app: report-templater
+        {{- include "vox.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "vox.waitForCertForge" . | nindent 8 }}
+        {{- include "vox.waitForReportTemplaterDb" . | nindent 8 }}
+        {{- include "vox.waitForObservability" . | nindent 8 }}
+        {{- include "vox.waitForAugurCanis" . | nindent 8 }}
+      containers:
+        - name: report-templater
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}report-templater:{{ .Values.reportTemplater.tag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ .Values.reportTemplater.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.reportTemplater.port | quote }}
+            - name: SERVICE_NAME
+              value: "report-templater"
+            - name: CERT_FORGE_URL
+              value: "https://cert-forge:{{ .Values.certForge.port }}"
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: ENROLLMENT_CERT
+              value: "/certs/enrollment.crt"
+            - name: ENROLLMENT_KEY
+              value: "/certs/enrollment.key"
+            - name: ENROLLMENT_CA
+              value: "/certs/enrollment-ca.crt"
+            - name: AUGUR_CANIS_URL
+              value: "https://augur-canis:{{ .Values.augurCanis.port }}"
+            - name: REDIS_URL
+              value: "redis:6379"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OBSERVABILITY_URL
+              value: "https://observability-service:{{ .Values.observabilityService.port }}"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vox-credentials
+                  key: reportTemplaterDbUrl
+          volumeMounts:
+            - name: vox-certs
+              mountPath: /certs
+              readOnly: true
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: vox-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: report-templater
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: report-templater
+spec:
+  selector:
+    app: report-templater
+  ports:
+    - port: {{ .Values.reportTemplater.port }}
+      targetPort: {{ .Values.reportTemplater.port }}

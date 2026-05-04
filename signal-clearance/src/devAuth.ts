@@ -9,7 +9,8 @@
 // Swap point: AUTH_MODE environment variable
 // ---------------------------------------------------------------------------
 
-import { Router, Request, Response } from 'express';
+import { Router } from './router.js';
+import type { TCARequest as Request, TCAResponse as Response } from './router.js';
 import { issueJWT } from './jwt.js';
 import { issueRefreshToken } from './sessions.js';
 import {
@@ -21,7 +22,7 @@ import {
 } from './store.js';
 import { WranglerType } from './types.js';
 
-export const devAuthRouter = Router();
+export const devAuthRouter = new Router();
 
 // ---------------------------------------------------------------------------
 // Seed dev group mappings so dev logins resolve to clearance levels

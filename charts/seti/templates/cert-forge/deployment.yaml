@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cert-forge
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: cert-forge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cert-forge
+  template:
+    metadata:
+      labels:
+        app: cert-forge
+        {{- include "seti.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: cert-forge
+      initContainers:
+        {{- include "seti.waitForRedis" . | nindent 8 }}
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: cert-forge
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}cert-forge:{{ .Values.certForge.tag }}
+          imagePullPolicy: Always
+          ports:
+            - name: sign
+              containerPort: {{ .Values.certForge.port }}
+            - name: enrollment
+              containerPort: {{ .Values.certForge.enrollmentPort }}
+            - name: public
+              containerPort: {{ .Values.certForge.publicPort }}
+          env:
+            - name: PORT
+              value: {{ .Values.certForge.port | quote }}
+            - name: ENROLLMENT_PORT
+              value: {{ .Values.certForge.enrollmentPort | quote }}
+            - name: PUBLIC_PORT
+              value: {{ .Values.certForge.publicPort | quote }}
+            - name: SERVICE_NAME
+              value: "cert-forge"
+            - name: K8S_SECRET_NAME
+              value: {{ .Values.certSecretName | quote }}
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          # Readiness gates on /ca — plain HTTP, available once CA is generated
+          # and the Secret has been written. All other pods wait on this.
+          livenessProbe:
+            httpGet:
+              path: /ca
+              port: {{ .Values.certForge.publicPort }}
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3

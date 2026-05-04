@@ -1,0 +1,45 @@
+---
+# ServiceAccount for connie-agent.
+# Bound to the ClusterRole below which permits Secret writes in registered
+# constellation namespaces. Scoped as narrowly as possible.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: connie-agent
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+---
+# ClusterRole — permits reading and writing Secrets in any namespace.
+# Required for writing seti-stargazer-cert into constellation namespaces.
+#
+# SECURITY NOTE: This is deliberately a ClusterRole rather than per-namespace
+# Roles because the set of monitored constellations is dynamic (driven by
+# remote-apps.json). In production, replace with per-namespace Roles scoped
+# to each constellation namespace listed in remote-apps.json.
+# Track as: K8S-MIGRATION-PRIMER.md open item — RBAC scope review.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: connie-agent-secret-writer
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: connie-agent-secret-writer
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: connie-agent-secret-writer
+subjects:
+  - kind: ServiceAccount
+    name: connie-agent
+    namespace: {{ .Values.namespace }}

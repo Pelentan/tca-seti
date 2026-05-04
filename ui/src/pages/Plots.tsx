@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 import { useConstellation } from '../hooks/useConstellation';
@@ -12,6 +12,7 @@ interface PlotStep {
   method: string;
   path: string;
   expected_status: number;
+  expected_statuses?: number[];
   expected_chain?: Array<{ caller: string; callee: string; method?: string; path?: string }>;
   verify_within_seconds?: number;
 }
@@ -66,6 +67,12 @@ interface PlotResult {
   steps?: StepResult[];
 }
 
+interface RunAllEntry {
+  plot: Plot;
+  result: PlotResult | null;
+  error?: string;
+}
+
 const METHOD_COLORS: Record<string, string> = {
   GET: '#3fb950', POST: '#e3b341', PUT: '#58a6ff',
   DELETE: '#f85149', PATCH: '#d2a8ff',
@@ -77,16 +84,25 @@ export default function Plots() {
   const [plots, setPlots] = useState<Plot[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [selectedPlot, setSelectedPlot] = useState<Plot | null>(null);
-  const [running, setRunning] = useState<string | null>(null);
-  const [runMessage, setRunMessage] = useState<string | null>(null);
-  const [runMsgOk, setRunMsgOk] = useState(true);
+
+  // FIX 2: Set-based expansion — each plot toggles independently, no mutual collapse
+  const [expandedPlots, setExpandedPlots] = useState<Set<string>>(new Set());
+
   const [plotResults, setPlotResults] = useState<Record<string, PlotResult[]>>({});
   const [loadingResults, setLoadingResults] = useState<Record<string, boolean>>({});
   const [expandedStep, setExpandedStep] = useState<string | null>(null);
 
-  const [runAll, setRunAll] = useState(false);
-  const [runAllResults, setRunAllResults] = useState<Array<{plot: Plot; result: PlotResult | null; error?: string}> | null>(null);
+  // FIX 3: Scoped per-plot running state — individual run never touches Run All state
+  const [runningPlot, setRunningPlot] = useState<string | null>(null);
+  const [runStatus, setRunStatus] = useState<Record<string, { msg: string; ok: boolean }>>({});
+
+  // FIX 1: Run All — progress counter only during run, full state update only at end
+  const [runAllInProgress, setRunAllInProgress] = useState(false);
+  const [runAllProgress, setRunAllProgress] = useState<{ current: number; total: number } | null>(null);
+  const [runAllResults, setRunAllResults] = useState<RunAllEntry[] | null>(null);
+
+  // FIX 4: Clipboard feedback
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   async function authFetch(path: string, options: RequestInit = {}) {
     const freshJwt = await getFreshJWT();
@@ -103,8 +119,6 @@ export default function Plots() {
 
   async function loadPlots() {
     setLoading(true);
-    setSelectedPlot(null);
-    setPlotResults({});
     try {
       const res = await authFetch(`/plots?application_id=${active.id}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -121,6 +135,20 @@ export default function Plots() {
     }
   }
 
+  // FIX 2: Toggle individual plot without affecting others
+  function togglePlot(plot: Plot) {
+    setExpandedPlots(prev => {
+      const next = new Set(prev);
+      if (next.has(plot.plot_id)) {
+        next.delete(plot.plot_id);
+      } else {
+        next.add(plot.plot_id);
+        if (!plotResults[plot.plot_id]) fetchResults(plot.plot_id);
+      }
+      return next;
+    });
+  }
+
   async function fetchResults(plotId: string): Promise<PlotResult[]> {
     setLoadingResults(prev => ({ ...prev, [plotId]: true }));
     try {
@@ -132,7 +160,7 @@ export default function Plots() {
         return runs;
       }
     } catch {
-      // ignore — results panel shows empty state
+      // silent
     } finally {
       setLoadingResults(prev => ({ ...prev, [plotId]: false }));
     }
@@ -142,28 +170,55 @@ export default function Plots() {
   async function pollResults(plotId: string) {
     for (let i = 0; i < 8; i++) {
       await new Promise(r => setTimeout(r, 2500));
-      // Use returned value directly — avoids stale closure on plotResults state
       const runs = await fetchResults(plotId);
       if (runs.length > 0 && runs[0].status !== 'running') break;
     }
   }
 
-  async function runAllPlots() {
-    if (plots.length === 0) return;
-    setRunAll(true);
+  // FIX 3: Individual run — scoped, no interaction with Run All
+  async function runPlot(plot: Plot) {
+    if (runningPlot) return;
+    setRunningPlot(plot.plot_id);
+    setRunStatus(prev => ({ ...prev, [plot.plot_id]: { msg: 'Running — results will appear below', ok: true } }));
+    setExpandedPlots(prev => new Set(prev).add(plot.plot_id));
+    try {
+      const freshJwt = await getJWTWithRefresh();
+      if (!freshJwt) throw new Error('Session expired');
+      const res = await fetch(`${GATEWAY}/run-plot-test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${freshJwt}` },
+        body: JSON.stringify({ plot_id: plot.plot_id, application_id: plot.application_id }),
+      });
+      if (res.ok) {
+        pollResults(plot.plot_id).then(() => {
+          setRunStatus(prev => { const next = { ...prev }; delete next[plot.plot_id]; return next; });
+        });
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setRunStatus(prev => ({ ...prev, [plot.plot_id]: { msg: `Failed: ${(data as Record<string, string>).message || res.status}`, ok: false } }));
+      }
+    } catch (e: unknown) {
+      setRunStatus(prev => ({ ...prev, [plot.plot_id]: { msg: e instanceof Error ? e.message : 'Unknown error', ok: false } }));
+    } finally {
+      setRunningPlot(null);
+    }
+  }
+
+  // FIX 1: Run All — background loop, zero state updates during loop, single batch at end
+  const runAllPlots = useCallback(async () => {
+    if (plots.length === 0 || runAllInProgress) return;
+    setRunAllInProgress(true);
     setRunAllResults(null);
-    setRunMessage(null);
+    setRunAllProgress({ current: 0, total: plots.length });
 
-    const results: Array<{plot: Plot; result: PlotResult | null; error?: string}> = [];
+    const collected: RunAllEntry[] = [];
 
-    for (const plot of plots) {
+    for (let i = 0; i < plots.length; i++) {
+      const plot = plots[i];
+      setRunAllProgress({ current: i + 1, total: plots.length });
       try {
-        // Get a fresh JWT once per plot — don't thrash silentRefresh in the poll loop
         const freshJwt = await getJWTWithRefresh();
-        if (!freshJwt) {
-          results.push({ plot, result: null, error: 'Session expired — re-login required' });
-          continue;
-        }
+        if (!freshJwt) { collected.push({ plot, result: null, error: 'Session expired' }); continue; }
 
         const res = await fetch(`${GATEWAY}/run-plot-test`, {
           method: 'POST',
@@ -172,60 +227,89 @@ export default function Plots() {
         });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
-          results.push({ plot, result: null, error: data.message || `HTTP ${res.status}` });
+          collected.push({ plot, result: null, error: (data as Record<string, string>).message || `HTTP ${res.status}` });
           continue;
         }
 
-        // Poll for completion — use the same JWT, only refresh if it expires
         let runResult: PlotResult | null = null;
         let pollJwt = freshJwt;
-        for (let i = 0; i < 20; i++) {
+        for (let p = 0; p < 20; p++) {
           await new Promise(r => setTimeout(r, 3000));
-          // Refresh JWT if it has been a while (every 5 polls ~15s)
-          if (i > 0 && i % 5 === 0) {
-            const refreshed = await getJWTWithRefresh();
-            if (refreshed) pollJwt = refreshed;
-          }
+          if (p > 0 && p % 5 === 0) { const r2 = await getJWTWithRefresh(); if (r2) pollJwt = r2; }
           const rRes = await fetch(`${GATEWAY}/plot-results?plot_id=${plot.plot_id}&limit=1`, {
             headers: { Authorization: `Bearer ${pollJwt}` },
           });
           if (rRes.ok) {
             const data = await rRes.json();
             const run = (data.runs || [])[0];
-            if (run && run.status !== 'running') {
-              runResult = run;
-              setPlotResults(prev => ({ ...prev, [plot.plot_id]: [run, ...(prev[plot.plot_id] || []).slice(0, 4)] }));
-              break;
-            }
+            if (run && run.status !== 'running') { runResult = run; break; }
           }
         }
-        results.push({ plot, result: runResult });
+        collected.push({ plot, result: runResult });
       } catch (e: unknown) {
-        results.push({ plot, result: null, error: e instanceof Error ? e.message : 'Unknown error' });
+        collected.push({ plot, result: null, error: e instanceof Error ? e.message : 'Unknown error' });
       }
     }
 
-    setRunAllResults(results);
-    setRunAll(false);
+    // Single batch state update — one re-render total
+    const resultMap: Record<string, PlotResult[]> = {};
+    for (const { plot, result } of collected) {
+      if (result) resultMap[plot.plot_id] = [result];
+    }
+    setPlotResults(prev => ({ ...prev, ...resultMap }));
+    setRunAllResults(collected);
+    setRunAllProgress(null);
+    setRunAllInProgress(false);
+  }, [plots, runAllInProgress, getJWTWithRefresh]);
+
+  // FIX 4: Copy full run detail to clipboard
+  function copyRunToClipboard(plot: Plot, run: PlotResult, key: string) {
+    const lines: string[] = [];
+    const icon = run.status === 'passed' ? '✓' : '✗';
+    lines.push(`${icon} ${plot.name}  [${run.status.toUpperCase()}]`);
+    lines.push(`  application: ${plot.application_id}  version: v${plot.version || '?'}`);
+    lines.push(`  steps: ${run.passed_steps}/${run.total_steps} passed  run: ${run.run_id}`);
+    lines.push(`  started: ${run.started_at ? new Date(run.started_at).toISOString() : 'unknown'}`);
+    if (run.steps && run.steps.length > 0) {
+      lines.push('');
+      lines.push('  STEPS:');
+      for (const step of run.steps) {
+        const si = step.passed ? '  ✓' : '  ✗';
+        lines.push(`${si} Step ${step.step_number}: ${step.description}`);
+        lines.push(`       status: ${step.actual_status}/${step.expected_status}  latency: ${step.latency_ms ?? 0}ms  chain: ${step.chain_passed ? 'ok' : 'FAIL'}`);
+        if (!step.passed) {
+          if (step.failure_reason) lines.push(`       reason: ${step.failure_reason}`);
+          // FIX 5: include response body
+          if (step.response_body !== undefined) lines.push(`       response: ${JSON.stringify(step.response_body)}`);
+          if (step.chain_unmatched && step.chain_unmatched.length > 0) {
+            lines.push('       missing calls:');
+            for (const c of step.chain_unmatched)
+              lines.push(`         - ${c.caller} → ${c.callee}${c.method ? ' ' + c.method : ''}${c.path ? ' ' + c.path : ''}`);
+          }
+        }
+      }
+    }
+    navigator.clipboard.writeText(lines.join('\n')).then(() => {
+      setCopiedKey(key);
+      setTimeout(() => setCopiedKey(null), 2000);
+    });
   }
 
-  function downloadReport(results: Array<{plot: Plot; result: PlotResult | null; error?: string}>) {
+  // FIX 5: Report includes response_body on failed steps
+  function downloadReport(results: RunAllEntry[]) {
     const ts = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
     const passed = results.filter(r => r.result?.status === 'passed').length;
-    const total = results.length;
     const lines: string[] = [];
-
     lines.push('='.repeat(70));
     lines.push('  S.E.T.I. — BEHAVIORAL TEST PLOT REPORT');
     lines.push(`  Generated: ${ts}`);
-    lines.push(`  Summary: ${passed}/${total} plots passed`);
+    lines.push(`  Summary: ${passed}/${results.length} plots passed`);
     lines.push('='.repeat(70));
     lines.push('');
 
     for (const { plot, result, error } of results) {
-      const status = result?.status === 'passed' ? 'PASSED' : 'FAILED';
       const icon = result?.status === 'passed' ? '✓' : '✗';
-      lines.push(`${icon} ${plot.name}  [${status}]`);
+      lines.push(`${icon} ${plot.name}  [${result?.status === 'passed' ? 'PASSED' : 'FAILED'}]`);
       lines.push(`  application: ${plot.application_id}  version: v${plot.version || '?'}`);
       if (error) {
         lines.push(`  ERROR: ${error}`);
@@ -236,26 +320,16 @@ export default function Plots() {
           lines.push('');
           lines.push('  STEPS:');
           for (const step of result.steps) {
-            const stepIcon = step.passed ? '  ✓' : '  ✗';
-            lines.push(`${stepIcon} Step ${step.step_number}: ${step.description}`);
+            const si = step.passed ? '  ✓' : '  ✗';
+            lines.push(`${si} Step ${step.step_number}: ${step.description}`);
             lines.push(`       status: ${step.actual_status}/${step.expected_status}  latency: ${step.latency_ms ?? 0}ms  chain: ${step.chain_passed ? 'ok' : 'FAIL'}`);
             if (!step.passed) {
               if (step.failure_reason) lines.push(`       reason: ${step.failure_reason}`);
+              if (step.response_body !== undefined) lines.push(`       response: ${JSON.stringify(step.response_body)}`);
               if (step.chain_unmatched && step.chain_unmatched.length > 0) {
                 lines.push('       missing calls:');
-                for (const c of step.chain_unmatched) {
+                for (const c of step.chain_unmatched)
                   lines.push(`         - ${c.caller} → ${c.callee}${c.method ? ' ' + c.method : ''}${c.path ? ' ' + c.path : ''}`);
-                }
-              }
-              if ((step as unknown as {assertion_results?: Array<{field: string; operator: string; passed: boolean; expected_value?: unknown; actual_value?: unknown}>}).assertion_results) {
-                const ar = (step as unknown as {assertion_results: Array<{field: string; operator: string; passed: boolean; expected_value?: unknown; actual_value?: unknown}>}).assertion_results;
-                const failed = ar.filter(a => !a.passed);
-                if (failed.length > 0) {
-                  lines.push('       failed assertions:');
-                  for (const a of failed) {
-                    lines.push(`         - ${a.field} ${a.operator} ${JSON.stringify(a.expected_value)} (got: ${JSON.stringify(a.actual_value)})`);
-                  }
-                }
               }
             }
           }
@@ -265,58 +339,19 @@ export default function Plots() {
       lines.push('-'.repeat(70));
       lines.push('');
     }
-
-    lines.push(`Report generated by S.E.T.I. — Search for Erroneous Tessellated Interactions`);
+    lines.push('Report generated by S.E.T.I. — Search for Erroneous Tessellated Interactions');
 
     const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    const _now = new Date();
-    a.download = `seti-plot-report-${_now.toISOString().slice(0, 10)}-${_now.toTimeString().slice(0, 8).replace(/:/g, '-')}.txt`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    const now = new Date();
+    a.download = `seti-plot-report-${now.toISOString().slice(0, 10)}-${now.toTimeString().slice(0, 8).replace(/:/g, '-')}.txt`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
     URL.revokeObjectURL(url);
   }
 
   useEffect(() => { if (jwt) loadPlots(); }, [jwt, active.id]);
-
-  async function runPlot(plot: Plot) {
-    setRunning(plot.plot_id);
-    setRunMessage(null);
-    try {
-      const freshJwt = await getJWTWithRefresh();
-      if (!freshJwt) throw new Error('Session expired');
-      const res = await fetch(`${GATEWAY}/run-plot-test`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${freshJwt}` },
-        body: JSON.stringify({ plot_id: plot.plot_id, application_id: plot.application_id }),
-      });
-      if (res.ok) {
-        setRunMsgOk(true);
-        setRunMessage(`"${plot.name}" running — results will appear below`);
-        setSelectedPlot(plot);
-        fetchResults(plot.plot_id);
-        pollResults(plot.plot_id);
-      } else {
-        const data = await res.json();
-        setRunMsgOk(false);
-        setRunMessage(`Failed: ${data.message || res.status}`);
-      }
-    } catch (e: unknown) {
-      setRunMsgOk(false);
-      setRunMessage(e instanceof Error ? e.message : 'Unknown error');
-    } finally {
-      setRunning(null);
-    }
-  }
-
-  function togglePlot(plot: Plot) {
-    const opening = selectedPlot?.plot_id !== plot.plot_id;
-    setSelectedPlot(opening ? plot : null);
-    if (opening && !plotResults[plot.plot_id]) fetchResults(plot.plot_id);
-  }
 
   return (
     <div style={s.root}>
@@ -338,11 +373,7 @@ export default function Plots() {
         </div>
       </div>
 
-      <ConstellationNav
-        constellations={constellations}
-        active={active}
-        onSelect={setConstellation}
-      />
+      <ConstellationNav constellations={constellations} active={active} onSelect={setConstellation} />
 
       <div style={s.body}>
         <div style={s.intro}>
@@ -357,16 +388,19 @@ export default function Plots() {
             </div>
             {plots.length > 0 && (
               <button
-                style={{ ...s.runAllBtn, opacity: runAll ? 0.5 : 1, flexShrink: 0 }}
+                style={{ ...s.runAllBtn, opacity: runAllInProgress ? 0.5 : 1, flexShrink: 0 }}
                 onClick={runAllPlots}
-                disabled={runAll}
+                disabled={runAllInProgress}
               >
-                {runAll ? `Running ${plots.length} plots...` : `>> Run All (${plots.length})`}
+                {runAllInProgress && runAllProgress
+                  ? `Running ${runAllProgress.current}/${runAllProgress.total}...`
+                  : `>> Run All (${plots.length})`}
               </button>
             )}
           </div>
         </div>
 
+        {/* Run All results — appears only after entire run completes */}
         {runAllResults && (
           <div style={s.runAllPanel}>
             <div style={s.runAllHeader}>
@@ -377,12 +411,7 @@ export default function Plots() {
               }}>
                 {runAllResults.filter(r => r.result?.status === 'passed').length}/{runAllResults.length} passed
               </span>
-              <button
-                style={s.reportBtn}
-                onClick={() => downloadReport(runAllResults)}
-              >
-                ↓ Report
-              </button>
+              <button style={s.reportBtn} onClick={() => downloadReport(runAllResults)}>↓ Report</button>
               <button style={s.bannerClose} onClick={() => setRunAllResults(null)}>x</button>
             </div>
             {runAllResults.map(({ plot, result, error }) => (
@@ -390,29 +419,39 @@ export default function Plots() {
                 ...s.runAllRow,
                 borderLeftColor: result?.status === 'passed' ? '#3fb950' : '#f85149',
               }}>
-                <span style={{ color: result?.status === 'passed' ? '#3fb950' : '#f85149', fontSize: 12, flexShrink: 0 }}>
-                  {result?.status === 'passed' ? '+' : 'x'}
-                </span>
-                <span style={s.runAllPlotName}>{plot.name}</span>
-                {result ? (
-                  <span style={s.runAllSteps}>
-                    {result.passed_steps}/{result.total_steps} steps
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ color: result?.status === 'passed' ? '#3fb950' : '#f85149', fontSize: 12, flexShrink: 0 }}>
+                    {result?.status === 'passed' ? '+' : 'x'}
                   </span>
-                ) : (
-                  <span style={{ fontSize: 11, color: '#f85149', fontStyle: 'italic' }}>
-                    {error || 'No result'}
-                  </span>
-                )}
-                {result?.steps && result.steps.some(s => !s.passed) && (
-                  <div style={s.runAllFailDetail}>
-                    {result.steps.filter(s => !s.passed).map(step => (
-                      <div key={step.step_number} style={s.runAllFailStep}>
-                        <span style={{ color: '#484f58' }}>Step {step.step_number}:</span>
-                        <span style={{ color: '#f85149' }}>{step.failure_reason || 'failed'}</span>
-                        {step.actual_status !== undefined && (
-                          <span style={{ color: '#484f58', fontFamily: "'Courier New', monospace", fontSize: 10 }}>
-                            got {step.actual_status}, expected {step.expected_status}
+                  <span style={s.runAllPlotName}>{plot.name}</span>
+                  {result
+                    ? <span style={s.runAllSteps}>{result.passed_steps}/{result.total_steps} steps</span>
+                    : <span style={{ fontSize: 11, color: '#f85149', fontStyle: 'italic' }}>{error || 'No result'}</span>}
+                </div>
+                {/* FIX 5: Show all steps in Run All panel including response bodies */}
+                {result?.steps && result.steps.length > 0 && (
+                  <div style={s.runAllStepList}>
+                    {result.steps.map(step => (
+                      <div key={step.step_number} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                        <div style={s.runAllStepRow}>
+                          <span style={{ color: step.passed ? '#3fb950' : '#f85149', fontSize: 11, flexShrink: 0 }}>
+                            {step.passed ? '+' : 'x'}
                           </span>
+                          <span style={{ fontSize: 11, color: '#8b949e', flex: 1 }}>{step.description}</span>
+                          <span style={{ fontSize: 11, color: '#6e7681', fontFamily: "'Courier New', monospace" }}>
+                            {step.actual_status} / {step.expected_status}
+                          </span>
+                          <span style={{ fontSize: 11, color: '#484f58' }}>{step.latency_ms ?? 0}ms</span>
+                        </div>
+                        {!step.passed && step.failure_reason && (
+                          <div style={{ fontSize: 11, color: '#f85149', fontStyle: 'italic', paddingLeft: 16 }}>
+                            {step.failure_reason}
+                          </div>
+                        )}
+                        {!step.passed && step.response_body !== undefined && (
+                          <pre style={{ ...s.stepDetailPre, marginLeft: 16 }}>
+                            {JSON.stringify(step.response_body, null, 2)}
+                          </pre>
                         )}
                       </div>
                     ))}
@@ -420,13 +459,6 @@ export default function Plots() {
                 )}
               </div>
             ))}
-          </div>
-        )}
-
-        {runMessage && (
-          <div style={runMsgOk ? s.bannerOk : s.bannerErr}>
-            <span>{runMsgOk ? '+ ' : 'x '}{runMessage}</span>
-            <button style={s.bannerClose} onClick={() => setRunMessage(null)}>x</button>
           </div>
         )}
 
@@ -440,11 +472,11 @@ export default function Plots() {
         {loading ? (
           <div style={s.empty}>Loading plots...</div>
         ) : plots.length === 0 ? (
-          <div style={s.empty}>No plots found for {active.label}. Plot Store loads from contracts/plots/ on startup.</div>
+          <div style={s.empty}>No plots found for {active.label}.</div>
         ) : (
           <div style={s.plotList}>
             {plots.map(plot => {
-              const expanded = selectedPlot?.plot_id === plot.plot_id;
+              const expanded = expandedPlots.has(plot.plot_id);
               const results = plotResults[plot.plot_id] || [];
               const isLoadingR = loadingResults[plot.plot_id];
               const lastRun = results[0];
@@ -460,9 +492,7 @@ export default function Plots() {
                           <span style={s.metaItem}>{plot.application_id}</span>
                           <span style={s.metaDot}>.</span>
                           <span style={s.metaItem}>{plot.steps.length} step{plot.steps.length !== 1 ? 's' : ''}</span>
-                          {plot.version && (
-                            <><span style={s.metaDot}>.</span><span style={s.metaItem}>v{plot.version}</span></>
-                          )}
+                          {plot.version && (<><span style={s.metaDot}>.</span><span style={s.metaItem}>v{plot.version}</span></>)}
                           {lastRun && (
                             <span style={{ ...s.lastRunBadge, color: lastRun.status === 'passed' ? '#3fb950' : '#f85149' }}>
                               last: {lastRun.status}
@@ -472,11 +502,11 @@ export default function Plots() {
                       </div>
                     </div>
                     <button
-                      style={{ ...s.runBtn, opacity: running === plot.plot_id ? 0.5 : 1 }}
+                      style={{ ...s.runBtn, opacity: runningPlot === plot.plot_id ? 0.5 : 1 }}
                       onClick={e => { e.stopPropagation(); runPlot(plot); }}
-                      disabled={running === plot.plot_id}
+                      disabled={runningPlot === plot.plot_id || runAllInProgress}
                     >
-                      {running === plot.plot_id ? 'Running...' : '> Run'}
+                      {runningPlot === plot.plot_id ? 'Running...' : '> Run'}
                     </button>
                   </div>
 
@@ -499,7 +529,9 @@ export default function Plots() {
                               <span style={s.stepDesc}>{step.description}</span>
                               <span style={{ ...s.stepMethod, color: METHOD_COLORS[step.method] || '#8b949e' }}>{step.method}</span>
                               <span style={s.stepPath}>{step.path}</span>
-                              <span style={s.stepExpected}>→ {step.expected_status}</span>
+                              <span style={s.stepExpected}>
+                                → {step.expected_statuses ? `[${step.expected_statuses.join('|')}]` : step.expected_status}
+                              </span>
                             </div>
                             {step.expected_chain && step.expected_chain.length > 0 && (
                               <div style={s.chainRow}>
@@ -515,6 +547,19 @@ export default function Plots() {
                         ))}
                       </div>
 
+                      {runStatus[plot.plot_id] && (
+                        <div style={{
+                          fontSize: 11,
+                          color: runStatus[plot.plot_id].ok ? '#3fb950' : '#f85149',
+                          marginBottom: 10,
+                          padding: '6px 10px',
+                          border: `1px solid ${runStatus[plot.plot_id].ok ? '#3fb950' : '#f85149'}`,
+                          borderRadius: 4,
+                        }}>
+                          {runStatus[plot.plot_id].ok ? '+ ' : 'x '}{runStatus[plot.plot_id].msg}
+                        </div>
+                      )}
+
                       <div style={s.section}>
                         <div style={s.resultsSectionHeader}>
                           <div style={s.sectionTitle}>RECENT RUNS</div>
@@ -528,99 +573,112 @@ export default function Plots() {
                         ) : results.length === 0 ? (
                           <div style={s.noResults}>No runs yet — click Run to execute this plot</div>
                         ) : (
-                          results.map(run => (
-                            <div key={run.run_id} style={{
-                              ...s.resultRow,
-                              borderLeftColor: run.status === 'passed' ? '#3fb950' : run.status === 'failed' ? '#f85149' : '#e3b341',
-                            }}>
-                              <div style={s.resultHeader}>
-                                <span style={{ ...s.resultStatus, color: run.status === 'passed' ? '#3fb950' : run.status === 'failed' ? '#f85149' : '#e3b341' }}>
-                                  {run.status === 'passed' ? '+' : 'x'} {run.status.toUpperCase()}
-                                </span>
-                                <span style={s.resultSteps}>{run.passed_steps}/{run.total_steps} steps passed</span>
-                                <span style={s.resultTime}>{run.started_at ? new Date(run.started_at).toLocaleString() : ''}</span>
-                                <span style={s.resultId}>{run.run_id.slice(-12)}</span>
-                              </div>
-                              {run.steps && run.steps.length > 0 && (
-                                <div style={s.stepResultList}>
-                                  {run.steps.map(step => {
-                                    const stepKey = `${run.run_id}-${step.step_number}`;
-                                    const isExpanded = expandedStep === stepKey;
-                                    return (
-                                      <div key={step.step_number}>
-                                        <div
-                                          style={{ ...s.stepResultRow, cursor: 'pointer' }}
-                                          onClick={() => setExpandedStep(isExpanded ? null : stepKey)}
-                                        >
-                                          <span style={{ color: step.passed ? '#3fb950' : '#f85149', fontSize: 11, flexShrink: 0 }}>
-                                            {step.passed ? '+' : 'x'}
-                                          </span>
-                                          <span style={s.stepResultDesc}>{step.description}</span>
-                                          {step.actual_status !== undefined && (
-                                            <span style={s.stepResultCode}>{step.actual_status} / {step.expected_status}</span>
-                                          )}
-                                          {step.latency_ms !== undefined && (
-                                            <span style={s.stepResultLatency}>{step.latency_ms}ms</span>
-                                          )}
-                                          {!step.passed && <span style={{ fontSize: 10, color: '#484f58' }}>{isExpanded ? 'v' : '>'}</span>}
-                                        </div>
-                                        {isExpanded && (
-                                          <div style={s.stepDetail}>
-                                            <div style={s.stepDetailRow}>
-                                              <span style={s.stepDetailLabel}>Request:</span>
-                                              <span style={s.stepDetailValue}>{step.request_method} {step.description}</span>
-                                            </div>
-                                            {step.request_body !== undefined && (
-                                              <div style={s.stepDetailRow}>
-                                                <span style={s.stepDetailLabel}>Body sent:</span>
-                                                <pre style={s.stepDetailPre}>{String(JSON.stringify(step.request_body, null, 2))}</pre>
-                                              </div>
-                                            )}
-                                            {step.response_body !== undefined && (
-                                              <div style={s.stepDetailRow}>
-                                                <span style={s.stepDetailLabel}>Response:</span>
-                                                <pre style={{...s.stepDetailPre, borderColor: step.passed ? '#3fb950' : '#f85149'}}>{String(JSON.stringify(step.response_body, null, 2))}</pre>
-                                              </div>
-                                            )}
-                                            {step.failure_reason && (
-                                              <div style={s.stepDetailRow}>
-                                                <span style={s.stepDetailLabel}>Reason:</span>
-                                                <span style={s.stepResultError}>{step.failure_reason}</span>
-                                              </div>
-                                            )}
-                                            {step.chain_unmatched && step.chain_unmatched.length > 0 && (
-                                              <div style={s.stepDetailRow}>
-                                                <span style={s.stepDetailLabel}>Missing calls:</span>
-                                                <div style={s.chainDetailList}>
-                                                  {step.chain_unmatched.map((c, i) => (
-                                                    <span key={i} style={s.chainDetailItemFail}>
-                                                      {c.caller} {'→'} {c.callee}{c.method ? ` ${c.method}` : ''}{c.path ? ` ${c.path}` : ''}
-                                                    </span>
-                                                  ))}
-                                                </div>
-                                              </div>
-                                            )}
-                                            {step.chain_matched && step.chain_matched.length > 0 && (
-                                              <div style={s.stepDetailRow}>
-                                                <span style={s.stepDetailLabel}>Observed:</span>
-                                                <div style={s.chainDetailList}>
-                                                  {step.chain_matched.map((c, i) => (
-                                                    <span key={i} style={s.chainDetailItemPass}>
-                                                      {c.caller} {'→'} {c.callee}{c.method ? ` ${c.method}` : ''}{c.path ? ` ${c.path}` : ''}
-                                                    </span>
-                                                  ))}
-                                                </div>
-                                              </div>
-                                            )}
-                                          </div>
-                                        )}
-                                      </div>
-                                    );
-                                  })}
+                          results.map(run => {
+                            const copyKey = `copy-${run.run_id}`;
+                            return (
+                              <div key={run.run_id} style={{
+                                ...s.resultRow,
+                                borderLeftColor: run.status === 'passed' ? '#3fb950' : run.status === 'failed' ? '#f85149' : '#e3b341',
+                              }}>
+                                <div style={s.resultHeader}>
+                                  <span style={{ ...s.resultStatus, color: run.status === 'passed' ? '#3fb950' : run.status === 'failed' ? '#f85149' : '#e3b341' }}>
+                                    {run.status === 'passed' ? '+' : 'x'} {run.status.toUpperCase()}
+                                  </span>
+                                  <span style={s.resultSteps}>{run.passed_steps}/{run.total_steps} steps passed</span>
+                                  <span style={s.resultTime}>{run.started_at ? new Date(run.started_at).toLocaleString() : ''}</span>
+                                  <span style={s.resultId}>{run.run_id.slice(-12)}</span>
+                                  {/* FIX 4: Copy to Clipboard button */}
+                                  <button
+                                    style={s.copyBtn}
+                                    onClick={e => { e.stopPropagation(); copyRunToClipboard(plot, run, copyKey); }}
+                                    title="Copy run detail to clipboard"
+                                  >
+                                    {copiedKey === copyKey ? '✓ Copied' : '⎘ Copy'}
+                                  </button>
                                 </div>
-                              )}
-                            </div>
-                          ))
+                                {run.steps && run.steps.length > 0 && (
+                                  <div style={s.stepResultList}>
+                                    {run.steps.map(step => {
+                                      const stepKey = `${run.run_id}-${step.step_number}`;
+                                      const isExpandedStep = expandedStep === stepKey;
+                                      return (
+                                        <div key={step.step_number}>
+                                          <div
+                                            style={{ ...s.stepResultRow, cursor: 'pointer' }}
+                                            onClick={() => setExpandedStep(isExpandedStep ? null : stepKey)}
+                                          >
+                                            <span style={{ color: step.passed ? '#3fb950' : '#f85149', fontSize: 11, flexShrink: 0 }}>
+                                              {step.passed ? '+' : 'x'}
+                                            </span>
+                                            <span style={s.stepResultDesc}>{step.description}</span>
+                                            {step.actual_status !== undefined && (
+                                              <span style={s.stepResultCode}>{step.actual_status} / {step.expected_status}</span>
+                                            )}
+                                            {step.latency_ms !== undefined && (
+                                              <span style={s.stepResultLatency}>{step.latency_ms}ms</span>
+                                            )}
+                                            <span style={{ fontSize: 10, color: '#484f58' }}>{isExpandedStep ? 'v' : '>'}</span>
+                                          </div>
+                                          {isExpandedStep && (
+                                            <div style={s.stepDetail}>
+                                              <div style={s.stepDetailRow}>
+                                                <span style={s.stepDetailLabel}>Request:</span>
+                                                <span style={s.stepDetailValue}>{step.request_method} {step.description}</span>
+                                              </div>
+                                              {step.request_body !== undefined && (
+                                                <div style={s.stepDetailRow}>
+                                                  <span style={s.stepDetailLabel}>Body sent:</span>
+                                                  <pre style={s.stepDetailPre}>{JSON.stringify(step.request_body, null, 2)}</pre>
+                                                </div>
+                                              )}
+                                              {step.response_body !== undefined && (
+                                                <div style={s.stepDetailRow}>
+                                                  <span style={s.stepDetailLabel}>Response:</span>
+                                                  <pre style={{ ...s.stepDetailPre, borderColor: step.passed ? '#3fb950' : '#f85149' }}>
+                                                    {JSON.stringify(step.response_body, null, 2)}
+                                                  </pre>
+                                                </div>
+                                              )}
+                                              {step.failure_reason && (
+                                                <div style={s.stepDetailRow}>
+                                                  <span style={s.stepDetailLabel}>Reason:</span>
+                                                  <span style={s.stepResultError}>{step.failure_reason}</span>
+                                                </div>
+                                              )}
+                                              {step.chain_unmatched && step.chain_unmatched.length > 0 && (
+                                                <div style={s.stepDetailRow}>
+                                                  <span style={s.stepDetailLabel}>Missing calls:</span>
+                                                  <div style={s.chainDetailList}>
+                                                    {step.chain_unmatched.map((c, i) => (
+                                                      <span key={i} style={s.chainDetailItemFail}>
+                                                        {c.caller} {'→'} {c.callee}{c.method ? ` ${c.method}` : ''}{c.path ? ` ${c.path}` : ''}
+                                                      </span>
+                                                    ))}
+                                                  </div>
+                                                </div>
+                                              )}
+                                              {step.chain_matched && step.chain_matched.length > 0 && (
+                                                <div style={s.stepDetailRow}>
+                                                  <span style={s.stepDetailLabel}>Observed:</span>
+                                                  <div style={s.chainDetailList}>
+                                                    {step.chain_matched.map((c, i) => (
+                                                      <span key={i} style={s.chainDetailItemPass}>
+                                                        {c.caller} {'→'} {c.callee}{c.method ? ` ${c.method}` : ''}{c.path ? ` ${c.path}` : ''}
+                                                      </span>
+                                                    ))}
+                                                  </div>
+                                                </div>
+                                              )}
+                                            </div>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })
                         )}
                       </div>
                     </div>
@@ -690,6 +748,7 @@ const s: Record<string, React.CSSProperties> = {
   resultSteps: { fontSize: 11, color: '#6e7681' },
   resultTime: { fontSize: 11, color: '#484f58', flex: 1, textAlign: 'right' },
   resultId: { fontSize: 10, color: '#30363d', fontFamily: "'Courier New', monospace" },
+  copyBtn: { background: 'none', border: '1px solid #30363d', borderRadius: 4, color: '#6e7681', fontSize: 10, cursor: 'pointer', padding: '2px 8px', fontFamily: 'inherit', whiteSpace: 'nowrap', flexShrink: 0 },
   stepResultList: { marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 },
   stepResultRow: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
   stepResultDesc: { fontSize: 11, color: '#8b949e', flex: 1 },
@@ -705,8 +764,9 @@ const s: Record<string, React.CSSProperties> = {
   runAllRow: { display: 'flex', flexDirection: 'column' as const, gap: 4, padding: '8px 10px', marginBottom: 6, borderLeft: '3px solid', borderTop: '1px solid #21262d', borderRight: '1px solid #21262d', borderBottom: '1px solid #21262d', borderRadius: '0 4px 4px 0', background: '#0d1117' },
   runAllPlotName: { fontSize: 13, fontWeight: 600, color: '#e6edf3', flex: 1 },
   runAllSteps: { fontSize: 11, color: '#6e7681' },
-  runAllFailDetail: { display: 'flex', flexDirection: 'column' as const, gap: 3, marginTop: 4, paddingLeft: 12 },
-  runAllFailStep: { display: 'flex', gap: 8, fontSize: 11, flexWrap: 'wrap' as const },
+  runAllStepList: { display: 'flex', flexDirection: 'column' as const, gap: 4, marginTop: 4, paddingLeft: 12 },
+  runAllStepRow: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' as const, fontSize: 11 },
+  stepDetail: { background: '#161b22', borderRadius: 4, padding: '8px 12px', marginTop: 4, marginLeft: 16 },
   stepDetailRow: { display: 'flex', gap: 8, marginTop: 6, alignItems: 'flex-start' },
   stepDetailLabel: { fontSize: 10, color: '#484f58', letterSpacing: 1, flexShrink: 0, marginTop: 2 },
   stepDetailValue: { fontSize: 11, color: '#8b949e' },

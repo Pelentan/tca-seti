@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongo-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+data:
+  mongod.conf: |
+    systemLog:
+      quiet: true
+      verbosity: 0
+
+    net:
+      bindIp: "*"
+      tls:
+        mode: requireTLS
+        certificateKeyFile: /mongo-certs/server-combined.pem
+        CAFile: /mongo-certs/ca.crt
+        allowConnectionsWithoutCertificates: false
+
+    security:
+      authorization: enabled

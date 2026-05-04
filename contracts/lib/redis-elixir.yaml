@@ -1,0 +1,162 @@
+tca-lib: 1.0.0
+
+info:
+  name: redis-elixir
+  description: |
+    Thin RESP2 client for Redis operations in Elixir Jobs.
+    Covers synchronous command connections (PUBLISH and other
+    request/response commands) and event-driven subscribe connections
+    (pub/sub with push message delivery to a registered pid).
+    No external dependencies — :gen_tcp only.
+
+    Two connection modes are intentionally separate because Redis enters
+    a dedicated pub/sub mode after SUBSCRIBE — that connection can no
+    longer issue regular commands.  Callers hold one command socket and
+    one subscriber pid, not a single multi-purpose handle.
+
+    Subscribe connections run in a dedicated spawned process.  The process
+    owns its TCP socket (active: true), loops on receive, and forwards
+    push messages to the caller's pid.  This design is GenServer-safe:
+    subscribe/4 performs connect and SUBSCRIBE synchronously in the caller,
+    then transfers socket ownership to the spawned process.  No receive/after
+    block runs inside a GenServer handler.
+
+    TCA immutability discipline: function signatures are frozen on first
+    production use.  Add functions; never remove, rename, or change
+    signatures.  A changed signature is a silent breaking change across
+    every Job that uses this library.
+  version: 1.0.0
+  language: elixir
+  source-file: redis.ex
+
+x-tca-lib-constraints:
+  external-dependencies: none
+  stdlib-only: true
+  notes: >
+    This library must never introduce external dependencies.  The only
+    Erlang/OTP modules used are :gen_tcp, :inet, and IO.  If a capability
+    requires an external hex package, that is a signal to reconsider
+    whether it belongs here or should be implemented directly in the Job.
+
+    Violations of the zero-external-dependencies constraint are contract
+    violations, not style choices.  A PR that adds a dep to mix.exs for
+    this library must be rejected regardless of justification.
+
+functions:
+
+  - name: connect
+    signature: "connect(host :: String.t(), port :: non_neg_integer()) :: {:ok, socket} | {:error, term()}"
+    description: >
+      Open a command connection to Redis.  The socket is used for
+      synchronous request/response commands via command/2.  Not safe
+      for concurrent use from multiple processes — each caller needs
+      its own connection.  Connection timeout is 10 seconds.
+    errors:
+      - condition: Redis unreachable
+        behavior: returns {:error, reason}
+      - condition: timeout
+        behavior: returns {:error, :etimedout} or {:error, :timeout}
+
+  - name: command
+    signature: "command(socket :: :gen_tcp.socket(), args :: [String.t()]) :: {:ok, term()} | {:error, term()}"
+    description: >
+      Send a RESP2 command and return the parsed response.  args is a
+      list of strings, e.g. ["PUBLISH", "chan", "msg"] or ["PING"].
+      The parsed return value type depends on the Redis command:
+      integers for PUBLISH/INCR, strings for GET, nil for null bulk
+      strings.  Redis error responses are returned as {:error, message}.
+    errors:
+      - condition: Redis returns an error response
+        behavior: returns {:error, error_message_string}
+      - condition: socket closed or TCP error
+        behavior: returns {:error, reason}
+      - condition: recv timeout (5 seconds)
+        behavior: returns {:error, :timeout}
+
+  - name: disconnect
+    signature: "disconnect(socket :: :gen_tcp.socket()) :: :ok"
+    description: >
+      Close a command connection.  Always returns :ok.  Safe to call
+      on an already-closed socket.
+    errors: none
+
+  - name: subscribe
+    signature: >
+      subscribe(host :: String.t(), port :: non_neg_integer(),
+                channel :: String.t(), notify_pid :: pid())
+        :: {:ok, pid()} | {:error, term()}
+    description: >
+      Subscribe to a Redis pub/sub channel.  Connects to Redis with
+      active: false, sends SUBSCRIBE synchronously, then spawns a
+      dedicated process that takes socket ownership, enables active mode,
+      and forwards push messages to notify_pid.
+
+      GenServer-safe: no receive/after block executes in the caller.
+      Connect and SUBSCRIBE happen in the caller process; the receive
+      loop runs entirely in the spawned process.
+
+      The spawned process is linked to the caller.  If the subscriber
+      crashes abnormally, the link propagates and the caller's supervisor
+      restarts it.  Disconnects are signalled via {:redis_disconnected}
+      before the process exits normally.
+
+      Push messages delivered to notify_pid:
+        {:redis_message,    channel :: String.t(), payload :: String.t()}
+        {:redis_subscribed, channel :: String.t()}
+        {:redis_disconnected}
+    errors:
+      - condition: Redis unreachable during connect
+        behavior: returns {:error, reason} — no process spawned
+      - condition: SUBSCRIBE send failure
+        behavior: returns {:error, reason} — no process spawned
+      - condition: connection lost after subscribe
+        behavior: sends {:redis_disconnected} to notify_pid, process exits normally
+
+  - name: stop_subscriber
+    signature: "stop_subscriber(pid :: pid()) :: :ok"
+    description: >
+      Stop a subscriber process cleanly.  Sends :stop to the process,
+      which closes the socket and exits.  Returns :ok immediately
+      (fire-and-forget).  Safe to call on a process that has already
+      exited.
+    errors: none
+
+message-protocol:
+  description: >
+    Messages sent by subscribe/4 to notify_pid.  All three message
+    shapes must be handled.  The catch-all handle_info clause should
+    be present to discard other messages gracefully.
+
+  messages:
+    - shape: "{:redis_message, channel :: String.t(), payload :: String.t()}"
+      description: >
+        A message was published to the subscribed channel.  payload is
+        the raw string exactly as stored in Redis — the caller is
+        responsible for decoding (e.g. Jason.decode/1 for JSON payloads).
+
+    - shape: "{:redis_subscribed, channel :: String.t()}"
+      description: >
+        The Redis server confirmed the subscription.  Sent once after
+        subscribe/4 returns.  Callers may ignore this or use it to log
+        confirmation.  No action is required.
+
+    - shape: "{:redis_disconnected}"
+      description: >
+        The subscriber's TCP connection was lost.  The subscriber process
+        has exited.  The caller is responsible for cleanup and reconnect
+        (typically: close publish connection, schedule reconnect via
+        Process.send_after).
+
+notes: >
+  Elixir 1.16 / OTP 26 target.  Uses :gen_tcp from the :kernel OTP
+  application, which is always available.  No hex dependencies are
+  introduced or permitted.
+
+  RESP2 parser handles all standard types: simple strings (+), errors (-),
+  integers (:), bulk strings ($), and arrays (*).  Null bulk strings ($-1)
+  and null arrays (*-1) are returned as nil.  Inline commands are not
+  used — all commands are encoded as RESP arrays.
+
+  The incremental buffer parser correctly handles bulk string payloads
+  that contain CRLF sequences (e.g. JSON with embedded newlines) because
+  body reads are byte-count-based, not delimiter-based.

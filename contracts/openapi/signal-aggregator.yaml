@@ -104,6 +104,21 @@ x-tca-observability:
     registry reads on startup and registration change events) and
     to the Feed Wr4ngler (forwarding matched events to live feeds).
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - unsubscribe-all-federation-channels
+      - unsubscribe-seti-events-channel
+      - close-redis
+      - exit-0
+    notes: >
+      signal-aggregator holds multiple Redis subscriptions: seti:events for its own constellation, plus one channel per federated application. All subscriptions must be cancelled in order before the Redis connection closes. Federation subscriptions are cancelled first, then the local constellation subscription.
+
 servers:
   - url: https://signal-aggregator:4006
     description: Internal SETI network (mTLS enforced)
@@ -1141,3 +1156,59 @@ components:
         message:
           type: string
           example: "Application 'app-tca-vox-prod' has no active subscription"
+
+  /federation/proxy/{tag}/run-contract-tests:
+    post:
+      summary: Trigger contract tests on a remote constellation's AC via monitor cert mTLS
+      operationId: proxyRunContractTests
+      tags: [Federation]
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Contract tests triggered
+        '503':
+          description: Constellation not active
+
+  /federation/proxy/{tag}/contract-suites:
+    get:
+      summary: List contract suites from a remote constellation's AC
+      operationId: proxyListContractSuites
+      tags: [Federation]
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Contract suites list
+        '503':
+          description: Constellation not active
+
+  /federation/proxy/{tag}/contract-suites/{runId}:
+    get:
+      summary: Get a specific contract suite from a remote constellation's AC
+      operationId: proxyGetContractSuite
+      tags: [Federation]
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: runId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Contract suite detail
+        '503':
+          description: Constellation not active

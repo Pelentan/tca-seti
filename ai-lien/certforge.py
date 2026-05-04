@@ -165,7 +165,7 @@ def _sign_payload(payload: str) -> str:
         'payload':      encoded,
     }).encode()
 
-    for attempt in range(1, 11):
+    for attempt in range(1, 10**9):
         try:
             req = urllib.request.Request(
                 url, data=body,
@@ -201,7 +201,7 @@ def self_register_with_ac(service_name: str, endpoint: str) -> None:
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     payload   = service_name + endpoint + mat.fingerprint + timestamp
 
-    for attempt in range(1, 11):
+    for attempt in range(1, 10**9):
         try:
             signature = _sign_payload(payload)
             cert_pem  = mat.instance_cert.decode()
@@ -228,4 +228,4 @@ def self_register_with_ac(service_name: str, endpoint: str) -> None:
         except Exception as e:
             log.info(f'[{service_name}] selfRegister: attempt {attempt}/10: {e}')
             time.sleep(3)
-    log.warning(f'[{service_name}] selfRegister: giving up after 10 attempts')
+    

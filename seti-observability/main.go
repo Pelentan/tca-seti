@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 )
 
 // ---------------------------------------------------------------------------
@@ -96,7 +95,7 @@ var (
 // Redis client
 // ---------------------------------------------------------------------------
 
-var rdb *redis.Client
+var rdb *RedisClient
 
 func connectRedis() {
 	redisURL := os.Getenv("REDIS_URL")
@@ -105,9 +104,9 @@ func connectRedis() {
 	}
 
 	for i := 0; i < 10; i++ {
-		rdb = redis.NewClient(&redis.Options{Addr: redisURL})
+		rdb = NewRedisClient(redisURL)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, err := rdb.Ping(ctx).Result()
+		err := rdb.Ping(ctx)
 		cancel()
 		if err == nil {
 			log.Printf("[observability] Connected to Redis at %s", redisURL)
@@ -170,7 +169,7 @@ func handleEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := context.Background()
-	if err := rdb.Publish(ctx, "seti:events", payload).Err(); err != nil {
+	if err := rdb.Publish(ctx, "seti:events", string(payload)); err != nil {
 		eventsDropped.Add(1)
 		log.Printf("[observability] Failed to publish to Redis: %v", err)
 		return
@@ -183,7 +182,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	redisStatus := "connected"
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := rdb.Ping(ctx).Err(); err != nil {
+	if err := rdb.Ping(ctx); err != nil {
 		redisStatus = "disconnected"
 	}
 
@@ -270,7 +269,10 @@ func main() {
 	log.Printf("[observability] Publishing to Redis channel: seti:events")
 	log.Printf("[observability] Known callers: %d services", len(knownServices))
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[observability] Server error: %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[observability] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }

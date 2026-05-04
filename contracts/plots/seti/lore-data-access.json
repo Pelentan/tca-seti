@@ -1,0 +1,70 @@
+{
+  "name": "Lore Data Access",
+  "description": "Reads trend-points, incidents, patterns, and corrections from Lore via the gateway. Tests the read paths that are live today. corrections returns 501 (stub) \u2014 when that flips to 200 this plot will fail, which is the signal that a write/read lifecycle plot needs to be written for corrections.",
+  "application_id": "seti",
+  "author": "seti",
+  "version": "1.0.0",
+  "tags": [
+    "lore",
+    "trends",
+    "incidents",
+    "patterns"
+  ],
+  "steps": [
+    {
+      "step_number": 1,
+      "description": "List trend-points \u2014 confirms lore is receiving and storing constellation telemetry",
+      "method": "GET",
+      "path": "/lore/trend-points",
+      "expected_status": 200,
+      "expected_chain": [
+        {
+          "caller": "gateway",
+          "callee": "lore",
+          "method": "GET",
+          "path": "/trend-points"
+        }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 2,
+      "description": "List incidents \u2014 confirms incident tracking is operational",
+      "method": "GET",
+      "path": "/lore/incidents",
+      "expected_status": 200,
+      "expected_chain": [
+        {
+          "caller": "gateway",
+          "callee": "lore",
+          "method": "GET",
+          "path": "/incidents"
+        }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 3,
+      "description": "List patterns \u2014 confirms pattern recognition store is accessible",
+      "method": "GET",
+      "path": "/lore/patterns",
+      "expected_status": 200,
+      "expected_chain": [
+        {
+          "caller": "gateway",
+          "callee": "lore",
+          "method": "GET",
+          "path": "/patterns"
+        }
+      ],
+      "verify_within_seconds": 10
+    },
+    {
+      "step_number": 4,
+      "description": "List corrections \u2014 stub, returns 501. When this returns 200 the stub is implemented and this plot needs a full corrections lifecycle test.",
+      "method": "GET",
+      "path": "/lore/corrections",
+      "expected_status": 501
+    }
+  ]
+}

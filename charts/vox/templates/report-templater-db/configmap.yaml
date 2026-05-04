@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: report-templater-db-init
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+data:
+  init.sql: |
+    -- report-templater scratchpad database init
+    -- Creates the app user and grants access.
+    -- Tables are created by the service at startup.
+    
+    CREATE USER report_templater WITH PASSWORD 'templater_dev_password_change_in_prod';
+    CREATE DATABASE scratchpad OWNER report_templater;
+    GRANT ALL PRIVILEGES ON DATABASE scratchpad TO report_templater;

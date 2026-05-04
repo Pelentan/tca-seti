@@ -1,5 +1,5 @@
 # Build context: feed-wrangler/ (subdirectory)
-FROM elixir:1.16-slim AS builder
+FROM elixir:1.18-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openssl ca-certificates \
@@ -17,7 +17,7 @@ COPY lib/ lib/
 COPY config/ config/
 RUN mix release
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 libncurses6 libstdc++6 ca-certificates nodejs curl openssl \
     && rm -rf /var/lib/apt/lists/* \

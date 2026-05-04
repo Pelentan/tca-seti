@@ -45,7 +45,7 @@ export function useConstellation(jwt: string | null) {
           name: string;
           application_id?: string;
         }) => ({
-          id: a.application_id || `app-${a.tag}`,
+          id: a.tag,
           label: a.name,
           tag: a.tag,
           isSelf: false,

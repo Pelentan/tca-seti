@@ -7,10 +7,40 @@
     "valid_days": 3650,
     "backdate_minutes": 5
   },
+  "traefik_ca_secret": "seti-traefik-ca",
   "services": [
-    { "name": "star-gazer", "sans": ["star-gazer", "localhost"] }
+    { "name": "star-gazer",      "sans": ["star-gazer", "localhost"] },
+    { "name": "seti-traefik",    "sans": ["seti.tca.local"], "tls_secret": "seti-traefik-tls" },
+    { "name": "postgres-server", "sans": ["postgres", "localhost"] },
+    { "name": "lore-db",         "sans": [] }
   ],
   "output_dir": "/certs",
   "key_bits": 2048,
-  "valid_days": 3650
+  "valid_days": 3650,
+  "rotation": {
+    "instance_interval_days": 30,
+    "ca_interval_days": 30,
+    "ca_overlap_hours": 24,
+    "strategy": "simultaneous",
+    "deployments": [
+      { "name": "cert-forge",         "namespace": "seti" },
+      { "name": "gateway",            "namespace": "seti" },
+      { "name": "seti-observability", "namespace": "seti" },
+      { "name": "signal-clearance",   "namespace": "seti" },
+      { "name": "policy",             "namespace": "seti" },
+      { "name": "contract-test",      "namespace": "seti" },
+      { "name": "results",            "namespace": "seti" },
+      { "name": "signal-aggregator",  "namespace": "seti" },
+      { "name": "plot-store",         "namespace": "seti" },
+      { "name": "plot-test",          "namespace": "seti" },
+      { "name": "interactions",       "namespace": "seti" },
+      { "name": "feed-wrangler",      "namespace": "seti" },
+      { "name": "integration",        "namespace": "seti" },
+      { "name": "ai-lien",            "namespace": "seti" },
+      { "name": "notifier",           "namespace": "seti" },
+      { "name": "ui",                 "namespace": "seti" },
+      { "name": "augur-canis",        "namespace": "seti" },
+      { "name": "lore",               "namespace": "seti" }
+    ]
+  }
 }

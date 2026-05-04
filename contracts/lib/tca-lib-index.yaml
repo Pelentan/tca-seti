@@ -1,0 +1,98 @@
+# TCA Library Index
+#
+# AI INSTRUCTIONS — READ BEFORE INTRODUCING ANY DEPENDENCY:
+#
+# 1. Before writing any import statement for a third-party package,
+#    scan this index for a lib that covers the capability you need.
+#
+# 2. If a matching lib exists, use it. Copy the source file referenced
+#    in source-file into the Job. Do not pull an external package to
+#    solve a problem this index already covers.
+#
+# 3. If no lib covers what you need, STOP. Do not reach for an external
+#    package. Do not add a require line to go.mod. Ask the engineer:
+#    "This capability isn't in the TCA lib index. Do you want me to
+#    write a lib contract for it, use an external package, or handle
+#    it a different way?" Wait for direction before proceeding.
+#
+# 4. This rule has no exceptions based on how small or well-known the
+#    external package is. The engineer decides what enters the supply
+#    chain. You surface the gap. They make the call.
+
+libs:
+
+  - name: redis-client
+    contract: contracts/lib/redis-client.yaml
+    language: go
+    source-file: redis.go
+    capabilities:
+      - Redis pub/sub (Publish, Subscribe)
+      - Redis Streams (XAdd, XRange, XLen, XTrim)
+      - Key operations (Get, Set, Expire, Del, Incr)
+      - Healthcheck (Ping)
+    external-dependencies: none
+    notes: >
+      Use for any Go Job that needs Redis. Covers the full range of
+      Redis operations used across TCA constellations. If an operation
+      you need is not listed under capabilities, do not implement it
+      ad-hoc — follow instruction 3 above.
+
+  - name: redis-elixir
+    contract: contracts/lib/redis-elixir.yaml
+    language: elixir
+    source-file: redis.ex
+    capabilities:
+      - Redis pub/sub subscribe (event-driven, spawned process, push messages to pid)
+      - Redis pub/sub publish (PUBLISH command via command connection)
+      - Synchronous command connections (any RESP2 request/response command)
+    external-dependencies: none
+    notes: >
+      Use for any Elixir Job that needs Redis.  Replaces the redix hex
+      package.  Two connection modes are intentionally separate — command
+      connections for request/response, subscriber process for push messages.
+      GenServer-safe: subscribe/4 does not block a GenServer handler with a
+      receive/after loop.  If an operation you need is not listed under
+      capabilities, do not implement it ad-hoc — follow instruction 3 above.
+
+  - name: jwks-client
+    contract: contracts/lib/jwks-client.yaml
+    language: typescript
+    source-file: jwks.ts
+    capabilities:
+      - JWKS endpoint fetch and caching
+      - RS256 JWT signature verification (crypto.subtle)
+      - Key rotation handling (unknown kid triggers re-fetch)
+      - Rate-limited JWKS refresh (DoS prevention)
+      - Pluggable cache backend (in-memory default, Redis adapter optional)
+    external-dependencies: none
+    notes: >
+      Use for any TypeScript Job that needs to verify OIDC ID tokens from
+      an external identity provider. Replaces the jose npm package.
+      RS256 only — algorithm agility is a security risk, not a feature.
+      For horizontally scaled deployments, implement the JWKSCache interface
+      backed by Redis (see contract for reference adapter). For single-pod
+      deployments, use the default in-memory cache. If an algorithm other
+      than RS256 is required, do not extend this lib — create a new contract
+      for the new algorithm.
+
+  - name: router
+    contract: contracts/lib/router.yaml
+    language: typescript
+    source-file: router.ts
+    capabilities:
+      - HTTP method routing (GET, POST, PUT, DELETE)
+      - URL parameter extraction (:param syntax)
+      - JSON body parsing
+      - Cookie parsing (request) and setting (response)
+      - Sub-router mounting with path prefix
+      - 404 and 500 error handling
+    external-dependencies: none
+    notes: >
+      Use for any TypeScript Job that needs HTTP routing. Replaces express
+      and cookie-parser. Handler interface is intentionally compatible with
+      express (req, res pattern, same property names) so migrating from
+      express requires only changing the app setup — handler bodies are
+      unchanged. Does not implement middleware chains — cross-cutting concerns
+      go in handler helper functions. If a capability not listed under
+      capabilities is needed, surface the gap to the engineer before reaching
+      for express.

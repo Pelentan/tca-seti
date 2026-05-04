@@ -59,7 +59,7 @@ defmodule FeedWrangler.CertForge do
     url = String.trim_trailing(public_url, "/") <> "/ca"
     {output, code} = System.cmd("curl", ["--silent", "--fail", url], stderr_to_stdout: true)
     if code == 0 do
-      case Jason.decode(output) do
+      case JSON.decode(output) do
         {:ok, %{"ca_cert" => ca_cert}} ->
           Logger.info("[cert-forge] CA cert obtained")
           {:ok, ca_cert}
@@ -79,7 +79,7 @@ defmodule FeedWrangler.CertForge do
   defp request_instance_cert(_, _, 31), do: {:error, "Could not obtain instance cert after 30 attempts"}
   defp request_instance_cert(enroll_url, instance_id, attempt) do
     url  = String.trim_trailing(enroll_url, "/") <> "/instance-cert"
-    body = Jason.encode!(%{service_name: @service_name, instance_id: instance_id})
+    body = JSON.encode!(%{service_name: @service_name, instance_id: instance_id})
 
     enroll_cert = System.get_env("ENROLLMENT_CERT", "/certs/enrollment.crt")
     enroll_key  = System.get_env("ENROLLMENT_KEY",  "/certs/enrollment.key")
@@ -96,7 +96,7 @@ defmodule FeedWrangler.CertForge do
     ], stderr_to_stdout: true)
 
     if code == 0 do
-      case Jason.decode(output) do
+      case JSON.decode(output) do
         {:ok, %{"cert" => cert, "key" => key, "fingerprint" => fp, "instance_cn" => cn}} ->
           {:ok, cert, key, fp, cn}
         _ ->
@@ -115,7 +115,7 @@ defmodule FeedWrangler.CertForge do
   def sign_payload(mat, payload) do
     forge_url  = System.get_env("CERT_FORGE_URL", "https://cert-forge:4014")
     encoded    = Base.encode64(payload)
-    body       = Jason.encode!(%{
+    body       = JSON.encode!(%{
       service_name: @service_name,
       instance_id:  mat.instance_id,
       payload:      encoded,
@@ -133,7 +133,7 @@ defmodule FeedWrangler.CertForge do
            "--data",    body,
            forge_url <> "/sign"
          ], stderr_to_stdout: true),
-         {:ok, %{"signature" => sig}} <- Jason.decode(output) do
+         {:ok, %{"signature" => sig}} <- JSON.decode(output) do
       cleanup_temp_files([cert_path, key_path, ca_path])
       {:ok, sig}
     else
@@ -160,7 +160,7 @@ defmodule FeedWrangler.CertForge do
   defp do_register(mat, ac_url, timestamp, payload, attempt) do
     case sign_payload(mat, payload) do
       {:ok, sig} ->
-        body = Jason.encode!(%{
+        body = JSON.encode!(%{
           service_name:     @service_name,
           network_endpoint: @endpoint,
           cert_fingerprint: mat.fingerprint,
@@ -180,7 +180,7 @@ defmodule FeedWrangler.CertForge do
                "--data",    body,
                url
              ], stderr_to_stdout: true),
-             {:ok, ack} <- Jason.decode(response) do
+             {:ok, ack} <- JSON.decode(response) do
           cleanup_temp_files([cert_path, key_path, ca_path])
           Logger.info("[feed-wrangler] selfRegister: registered with AC (status=#{ack["status"]})")
         else

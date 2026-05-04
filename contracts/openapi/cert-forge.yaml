@@ -1,7 +1,7 @@
 openapi: 3.1.0
 
 info:
-  title: TCA SETI - cert-forge
+  title: TCA - cert-forge
   description: |
     PKI abstraction layer for the TCA constellation. Every Job that needs
     cryptographic material — instance certificates, CA trust anchors, signed
@@ -28,7 +28,11 @@ info:
     Internal service — mTLS on all endpoints. /ca is the one exception:
     it is unauthenticated because services must retrieve the CA cert before
     they have an instance cert to present.
-  version: 1.0.0
+
+    cert-forge manages automatic rotation of both the constellation CA and
+    instance certificates on a configurable schedule. See x-tca-rotation for
+    the rotation model and forge.json for per-constellation configuration.
+  version: 1.2.0
 
 x-tca-security:
   transport: mtls
@@ -52,19 +56,94 @@ x-tca-security:
 
     cert-forge generates its own certificate on first startup before the HTTP
     server comes up. The bootstrap sequence is: generate own cert in memory →
-    start mTLS server using that cert → generate CA → write CA to volume →
-    generate static certs (star-gazer, etc.) → ready.
+    start mTLS server using that cert → generate CA → load or generate symmetric
+    secrets (postgres-password, jwt-secret) → write all material to Secret →
+    generate static certs (star-gazer, postgres-server, lore-db, etc.) → ready.
+
+    Static certs generated:
+      star-gazer       — federation identity for Signal Aggregator (SANs: star-gazer, localhost)
+      seti-traefik     — Traefik TLS termination cert (SAN: seti.tca.local)
+      postgres-server  — PostgreSQL server TLS cert (SANs: postgres, localhost)
+      lore-db          — lore client cert for PostgreSQL X.509 auth (CN=lore-db)
+
+    Symmetric secrets generated on first startup, persisted in the K8s Secret:
+      postgres-password — superuser password for emergency DBA access only
+      jwt-secret        — HMAC-SHA256 signing key for SETI JWTs
 
 x-tca-observability:
   report-outbound-calls: false
   notes: >
-    cert-forge makes no outbound calls. It is a pure responder.
-    The x-tca-observability block is present but inactive — cert-forge
-    has nothing to report to the Observability Job.
+    cert-forge makes no outbound calls during normal operation. It is a pure
+    responder on its three ports. The x-tca-observability block is present
+    but inactive for inbound/outbound call reporting.
+
+    During rotation, cert-forge makes outbound K8s API calls to patch
+    Deployment annotations. These are infrastructure calls, not constellation
+    calls, and are not reported to the Observability Job.
+
+x-tca-rotation:
+  notes: >
+    cert-forge manages two rotation tiers on independent schedules, both
+    configured in forge.json under the "rotation" key.
+
+    Instance cert rotation: cert-forge generates new instance certs for all
+    enrolled services and patches a restart annotation on the Deployments
+    listed in forge.json rotation.deployments. Pods roll, re-enroll, and
+    receive new certs. In healthy production environments most pods roll
+    before the instance interval fires naturally — the rotation list should
+    contain only stateful workloads (Mongo, PostgreSQL, Redis) that do not
+    roll on their own.
+
+    CA rotation: cert-forge generates a new CA and enters an overlap window
+    during which both the old and new CAs are trusted. This prevents hard
+    failures during the transition. After the overlap window expires, the old
+    CA is retired. All Deployments in rotation.deployments are rolled during
+    CA rotation regardless of whether they appear to need it — every service
+    must re-enroll against the new CA.
+
+    Rotation strategies:
+      simultaneous — all listed Deployments are patched at once. Default.
+      staged — Deployments are rolled in batches. Not yet implemented;
+               falls back to simultaneous with a log warning.
+
+    forge.json rotation block:
+      instance_interval_days: int   — instance cert rotation interval (default 30)
+      ca_interval_days: int         — CA rotation interval (default 30)
+      ca_overlap_hours: int         — overlap window during CA rotation (default 24)
+      strategy: string              — "simultaneous" | "staged" (default "simultaneous")
+      deployments: array            — list of {name, namespace} objects identifying
+                                      Deployments to explicitly roll on rotation.
+                                      Omit Deployments that roll frequently on their
+                                      own — they will pick up new certs naturally.
+
+    cert-forge does not restart itself during rotation. It holds the CA in
+    memory and continues issuing certs from the new CA immediately after
+    generation. All services that re-enroll after the rotation receive certs
+    signed by the new CA.
+
+    K8s API access: cert-forge patches the
+    kubectl.kubernetes.io/restartedAt annotation on each listed Deployment.
+    The same ServiceAccount used to write cert Secrets is used for this —
+    no additional RBAC is required beyond patch permission on Deployments
+    in the constellation namespace.
+
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - exit-0
+    notes: >
+      cert-forge holds no persistent downstream connections. Its three servers (sign, enrollment, public) are stopped in order. In-flight certificate issuance requests complete within the drain window. The in-memory CA and enrollment CA are discarded on exit — they are regenerated from the K8s Secret on next startup.
 
 servers:
+  - url: https://cert-forge:3020
+    description: Internal K8s network (mTLS on all endpoints except /ca)
   - url: https://cert-forge:4014
-    description: Internal Docker network (mTLS on all endpoints except /ca)
+    description: Internal K8s network — SETI constellation
 
 tags:
   - name: trust
@@ -93,6 +172,11 @@ paths:
         This endpoint also serves as Augur Canis's canned query for cert-forge
         health verification — if this returns 200, cert-forge is alive and
         the CA is initialized.
+
+        During CA rotation, this endpoint returns the new CA cert as soon as
+        the new CA is generated — before the overlap window expires. Services
+        that call /ca during the overlap window will build their trust pool
+        against the new CA and be ready for the cutover.
       responses:
         '200':
           description: CA certificate PEM
@@ -128,6 +212,10 @@ paths:
 
         mTLS required. On first startup, the calling service presents the
         bootstrap cert issued during cert-forge's static cert generation.
+
+        On rotation-triggered restarts, services re-enroll normally. The new
+        cert is signed by the current CA — whether that is the same CA or a
+        newly rotated one depends on which rotation tier fired.
       requestBody:
         required: true
         content:
@@ -237,15 +325,42 @@ components:
           type: string
           description: >
             The service's name as it appears in the constellation.
-            Must match the service's Docker Compose service name.
             Example: "gateway"
         instance_id:
           type: string
           description: >
             Unique identifier for this specific container instance.
-            Use $HOSTNAME — Docker sets this to the container ID,
-            providing a stable unique identity for each container.
+            Use $HOSTNAME — provides a stable unique identity per container.
             Example: "a3f2c1d8e4b7"
+        common_name:
+          type: string
+          description: >
+            Optional. Overrides the default CN of {service_name}-{instance_id}.
+            Use when the cert subject must match a specific identity, such as
+            a MongoDB X.509 user or an external hostname.
+        organizational_unit:
+          type: string
+          description: >
+            Optional. Sets the OU field in the certificate subject.
+            Used to differentiate cert roles within the same constellation —
+            for example, "server" for MongoDB server certs and "db-client"
+            for MongoDB client certs, satisfying MongoDB's requirement that
+            cluster member certs and client certs have distinct subject fields.
+        locality:
+          type: string
+          description: Optional. Sets the L (locality) field in the certificate subject.
+        province:
+          type: string
+          description: Optional. Sets the ST (state/province) field in the certificate subject.
+        sans:
+          type: array
+          items:
+            type: string
+          description: >
+            Optional. Overrides the default SANs of [service_name, instance_cn, localhost].
+            Use when the cert must be valid for specific hostnames — for example,
+            including an Ingress hostname such as "seti.tca.local" so the browser
+            trusts the certificate presented by the gateway.
 
     InstanceCertResponse:
       type: object
@@ -314,6 +429,23 @@ components:
             Example: "RSASSA-PKCS1-v1_5-SHA256". Callers should log this
             but must not depend on a specific value — it will change when
             cryptographic requirements change, which is the point.
+
+    RotationDeployment:
+      type: object
+      required: [name, namespace]
+      description: >
+        Identifies a Kubernetes Deployment that cert-forge will explicitly
+        restart on rotation. Only stateful or long-lived workloads that do
+        not roll frequently on their own should be listed here.
+      properties:
+        name:
+          type: string
+          description: Deployment name — must match the K8s Deployment metadata.name exactly.
+        namespace:
+          type: string
+          description: >
+            Kubernetes namespace containing the Deployment. Must be a namespace
+            the cert-forge ServiceAccount has patch permission on.
 
     Error:
       type: object

@@ -1,0 +1,295 @@
+tca-lib: 1.0.0
+
+info:
+  name: router
+  description: |
+    HTTP router for TCA Jobs implemented in TypeScript/Node.js. Provides
+    method + path routing, URL parameter extraction, JSON body parsing,
+    cookie parsing and setting, and sub-router mounting. Zero external
+    dependencies — stdlib Node.js http/https only.
+
+    Replaces express and cookie-parser with a purpose-built implementation
+    covering exactly the HTTP surface TCA Jobs need. The handler interface
+    is intentionally compatible with express conventions (req, res pattern,
+    same property names) so handler bodies require no changes when migrating
+    from express.
+
+    ADDING ROUTES
+
+    Routes are registered on an App instance using the standard HTTP method
+    names. The handler signature is (req: TCARequest, res: TCAResponse).
+    URL parameters use :param syntax identical to express.
+
+      const app = new App();
+      app.get('/health', (req, res) => { res.json({ status: 'ok' }); });
+      app.get('/wranglers/:id', (req, res) => {
+        const id = req.params.id;  // extracted from URL
+        res.json({ id });
+      });
+      app.post('/things', async (req, res) => {
+        const { name } = req.body;  // parsed from JSON body
+        res.status(201).json({ name });
+      });
+
+    SUB-ROUTERS
+
+    Group related routes into a Router instance and mount under a prefix:
+
+      const adminRouter = new Router();
+      adminRouter.get('/status', handler);
+      adminRouter.post('/restart', handler);
+
+      app.use('/admin', adminRouter);
+      // mounts as: GET /admin/status, POST /admin/restart
+
+    COOKIES
+
+    Set cookies using res.cookie(). Options mirror express conventions.
+    maxAge is in milliseconds (express convention), converted to seconds
+    for the Set-Cookie Max-Age attribute automatically.
+
+      res.cookie('session', token, {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'lax',
+        maxAge: 7 * 24 * 60 * 60 * 1000,  // 7 days in ms
+        path: '/',
+      });
+
+    DISPATCH
+
+    The App instance exposes a dispatch() method that accepts a raw Node.js
+    IncomingMessage and ServerResponse. Pass this as the https.createServer()
+    callback:
+
+      const server = https.createServer(tlsOptions, (req, res) => app.dispatch(req, res));
+
+    UNMATCHED ROUTES
+
+    Requests that match no registered route receive a 404 JSON response:
+      { "code": "NOT_FOUND", "message": "METHOD /path not found" }
+
+    ERRORS IN HANDLERS
+
+    Unhandled exceptions thrown inside route handlers are caught and returned
+    as 500 JSON responses:
+      { "code": "INTERNAL_ERROR", "message": "<error message>" }
+    This only applies if headers have not already been sent. Handlers that
+    call res.json() before throwing will not have the error intercepted.
+
+    BODY PARSING
+
+    Only application/json bodies are parsed. Other content types result in
+    an empty req.body object. Malformed JSON results in an empty req.body
+    object — no error thrown.
+
+  version: 1.0.0
+  language: typescript
+  source-file: router.ts
+
+x-tca-lib-constraints:
+  external-dependencies: none
+  stdlib-only: true
+  notes: >
+    This library uses only Node.js stdlib: http (types), url (implicit via
+    string parsing). No external npm packages. The import list is:
+    type { IncomingMessage, ServerResponse } from 'http' — types only, no
+    runtime import.
+
+    Violations of the zero-external-dependencies constraint are contract
+    violations, not style choices. A PR that adds a package.json dependency
+    must be rejected regardless of the justification.
+
+    This library intentionally does not implement middleware chains, streaming
+    body parsers, multipart form parsing, template rendering, or static file
+    serving. These are out of scope for TCA Job HTTP layers. If a capability
+    not listed below is needed, follow the lib index instructions: surface the
+    gap to the engineer, do not reach for express.
+
+interfaces:
+  - name: TCARequest
+    description: >
+      Represents an inbound HTTP request. Properties mirror express Request
+      so handler bodies require no changes when migrating from express.
+    properties:
+      - name: method
+        type: string
+        description: HTTP method, uppercase (GET, POST, PUT, DELETE)
+      - name: url
+        type: string
+        description: Full URL path including query string
+      - name: headers
+        type: "Record<string, string | string[] | undefined>"
+        description: Raw request headers, lowercase keys
+      - name: params
+        type: "Record<string, string>"
+        description: URL parameters extracted from :param placeholders
+      - name: query
+        type: "Record<string, string>"
+        description: Query string parameters, URL-decoded
+      - name: cookies
+        type: "Record<string, string>"
+        description: Cookies parsed from the Cookie header, URL-decoded
+      - name: body
+        type: "Record<string, unknown>"
+        description: >
+          JSON-parsed request body. Empty object if Content-Type is not
+          application/json or if the body is empty or malformed.
+      - name: raw
+        type: IncomingMessage
+        description: >
+          The raw Node.js IncomingMessage. Use only when the higher-level
+          properties are insufficient — e.g. for streaming or non-JSON bodies.
+
+  - name: TCAResponse
+    description: >
+      Represents an outbound HTTP response. Methods mirror express Response
+      so handler bodies require no changes when migrating from express.
+    methods:
+      - name: status
+        signature: "status(code: number): TCAResponse"
+        description: >
+          Sets the HTTP status code. Returns this for chaining.
+          Must be called before json(), send(), or redirect().
+
+      - name: json
+        signature: "json(data: unknown): void"
+        description: >
+          Serializes data as JSON, sets Content-Type: application/json,
+          writes Content-Length, and ends the response. Flushes any pending
+          Set-Cookie headers. Call exactly once per request — calling after
+          headers are sent is a no-op.
+
+      - name: send
+        signature: "send(body: string, contentType?: string): void"
+        description: >
+          Sends a plain string response. Default contentType is text/plain.
+          Flushes any pending Set-Cookie headers.
+
+      - name: cookie
+        signature: "cookie(name: string, value: string, options?: CookieOptions): TCAResponse"
+        description: >
+          Queues a Set-Cookie header to be sent with the next json() or send()
+          call. Returns this for chaining. Multiple cookies may be queued.
+          maxAge is in milliseconds (express convention) — the library converts
+          to seconds for the Set-Cookie Max-Age attribute.
+
+      - name: clearCookie
+        signature: "clearCookie(name: string, options?: { path?: string }): TCAResponse"
+        description: >
+          Queues a Set-Cookie header that expires the named cookie immediately
+          (Max-Age=0). Returns this for chaining.
+
+      - name: redirect
+        signature: "redirect(url: string, code?: number): void"
+        description: >
+          Sends a redirect response. Default code is 302.
+
+      - name: setHeader
+        signature: "setHeader(name: string, value: string): TCAResponse"
+        description: >
+          Sets a raw response header. Use for headers not covered by the
+          higher-level methods. Returns this for chaining.
+
+  - name: CookieOptions
+    description: Options for res.cookie(). Mirror express CookieOptions.
+    properties:
+      - name: httpOnly
+        type: boolean
+        description: Sets the HttpOnly flag. Default false.
+      - name: secure
+        type: boolean
+        description: Sets the Secure flag. Default false.
+      - name: sameSite
+        type: "'strict' | 'lax' | 'none'"
+        description: Sets the SameSite attribute.
+      - name: maxAge
+        type: number
+        description: >
+          Cookie lifetime in milliseconds (express convention).
+          Converted to seconds for Set-Cookie Max-Age automatically.
+          Set to 0 to expire immediately.
+      - name: path
+        type: string
+        description: Cookie path. Default '/'.
+      - name: domain
+        type: string
+        description: Cookie domain.
+
+functions:
+  - name: App (constructor)
+    signature: "new App()"
+    description: >
+      Creates a new top-level router. App extends Router and adds the
+      dispatch() method for integration with Node.js https.createServer().
+      One App per Job — mount sub-routers onto it with app.use().
+
+  - name: Router (constructor)
+    signature: "new Router()"
+    description: >
+      Creates a sub-router for grouping related routes under a prefix.
+      Mount onto an App instance with app.use('/prefix', router).
+
+  - name: App.dispatch
+    signature: "dispatch(raw: IncomingMessage, rawRes: ServerResponse): Promise<void>"
+    description: >
+      Dispatches a raw Node.js request to the matching route handler.
+      Pass as the https.createServer() callback:
+        https.createServer(tlsOptions, (req, res) => app.dispatch(req, res))
+      Unmatched routes return 404. Unhandled handler errors return 500.
+      Never throws — all errors are written to the response.
+
+  - name: Router.get
+    signature: "get(path: string, handler: Handler): this"
+    description: Registers a GET handler. Returns this for chaining.
+
+  - name: Router.post
+    signature: "post(path: string, handler: Handler): this"
+    description: Registers a POST handler. Returns this for chaining.
+
+  - name: Router.put
+    signature: "put(path: string, handler: Handler): this"
+    description: Registers a PUT handler. Returns this for chaining.
+
+  - name: Router.delete
+    signature: "delete(path: string, handler: Handler): this"
+    description: Registers a DELETE handler. Returns this for chaining.
+
+  - name: Router.use
+    signature: "use(prefix: string, subRouter: Router): this"
+    description: >
+      Mounts a sub-router under a path prefix. All routes registered on
+      the sub-router are accessible under the prefix. Returns this for chaining.
+    errors:
+      - condition: subRouter is undefined
+        behavior: throws at registration time — not deferred to dispatch
+
+implementation-notes:
+  - note: >
+      URL parameter extraction uses :param syntax. Parameters are URL-decoded
+      before being placed in req.params. Parameter names must be valid
+      JavaScript identifiers ([a-zA-Z_][a-zA-Z0-9_]*).
+
+  - note: >
+      Route matching is first-match. Routes are checked in registration order.
+      Register more specific paths before less specific ones. There is no
+      automatic priority ordering by specificity.
+
+  - note: >
+      Cookie values are URL-encoded on set and URL-decoded on parse. Do not
+      double-encode — pass raw values to res.cookie() and read raw values
+      from req.cookies.
+
+  - note: >
+      This router does not implement middleware chains. There is no next()
+      function. Cross-cutting concerns (authentication, logging, observability)
+      are implemented directly in route handlers or in helper functions called
+      from handlers. This is intentional — middleware chains obscure control
+      flow and make it harder to understand what a route handler does.
+
+  - note: >
+      This library is the SETI reference implementation of the TCA HTTP routing
+      pattern for TypeScript Jobs. It is not SETI-specific. Any TCA Job that
+      needs HTTP routing should copy router.ts and this contract, not depend
+      on signal-clearance. Copy-per-Job discipline applies to lib files the
+      same as redis.go and jwt.go.

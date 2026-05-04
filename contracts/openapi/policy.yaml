@@ -85,6 +85,19 @@ x-tca-observability:
     Plots for regeneration on contract version change) and to the
     scheduler trigger endpoints on Contract Test and Plot Test Jobs.
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - close-redis
+      - exit-0
+    notes: >
+      policy publishes schedule events to Redis but holds no subscriptions. In-memory application registry state is not persisted on shutdown — services re-register with AC on their next startup.
+
 servers:
   - url: https://policy:4002
     description: Internal SETI network (mTLS enforced)

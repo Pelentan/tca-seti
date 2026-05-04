@@ -157,6 +157,21 @@ x-tca-observability:
     Watchdog check traffic visible in the SETI observability stream
     separately from normal application traffic.
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - unsubscribe-check-requests-channel
+      - stop-health-feed-publisher
+      - close-redis
+      - exit-0
+    notes: >
+      augur-canis holds a Redis subscription on tca:check-requests and publishes to tca:augur-canis. The subscription loop must be cancelled before the Redis connection closes to avoid a blocked goroutine on shutdown.
+
 servers:
   - url: https://augur-canis:4010
     description: Internal SETI network (mTLS enforced) — admin API only
@@ -602,70 +617,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
-
-  /federation/register:
-    post:
-      tags: [federation]
-      summary: Register SETI as a verified federation observer
-      description: |
-        Called by SETI when a Sec Wr4ngler adds a new constellation to
-        the monitoring board. SETI presents its star-gazer certificate
-        signature to prove its identity.
-
-        On receipt, AC:
-        1. Verifies the request signature against the known SETI star-gazer
-           public key (pre-distributed via the orchestrator at deploy time).
-        2. Generates a new session key pair specific to this SETI registration.
-        3. Returns the session public certificate to SETI.
-        4. Begins signing all tca:augur-canis feed events with the session
-           private key.
-
-        The session key pair is ephemeral — it lives in AC memory only.
-        If AC restarts, the session certificate is lost. SETI detects feed
-        silence or signature verification failure and re-submits registration.
-        AC treats every registration request identically regardless of whether
-        it is a first registration or a re-registration after restart.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/FederationRegistrationRequest'
-      responses:
-        '200':
-          description: Registration accepted, session certificate returned
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FederationRegistrationResponse'
-        '401':
-          description: Star-gazer signature verification failed
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '400':
-          description: Malformed request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-
-  /federation/status:
-    get:
-      tags: [federation]
-      summary: Get current federation registration status
-      description: |
-        Returns whether SETI is currently registered as a federation
-        observer, and when the session certificate was last issued.
-        Useful for diagnosing feed delivery issues.
-      responses:
-        '200':
-          description: Federation status
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FederationStatus'
 
   /services/register:
     post:
@@ -1125,83 +1076,6 @@ components:
           type: integer
 
 
-    FederationRegistrationRequest:
-      type: object
-      required: [seti_instance_id, star_gazer_public_cert, timestamp, signature]
-      properties:
-        seti_instance_id:
-          type: string
-          description: >
-            Unique identifier for this SETI instance. Allows AC to associate
-            the registration with a specific SETI deployment.
-        star_gazer_public_cert:
-          type: string
-          description: >
-            SETI's star-gazer public certificate in PEM format.
-            AC stores this for verifying future requests from this SETI instance.
-        timestamp:
-          type: string
-          format: date-time
-          description: >
-            Registration request timestamp. Included in the signed payload
-            to prevent replay attacks.
-        signature:
-          type: string
-          description: >
-            Base64-encoded signature of (seti_instance_id + timestamp) signed
-            with the star-gazer private key. AC verifies this against the
-            star-gazer public cert before proceeding.
-
-    FederationRegistrationResponse:
-      type: object
-      required: [session_cert, session_cert_id, issued_at, feed_channel]
-      properties:
-        session_cert:
-          type: string
-          description: >
-            Session public certificate in PEM format. SETI stores this and
-            uses it to verify the signature on every event published to
-            the tca:augur-canis Redis channel. Ephemeral — invalidated when
-            AC restarts.
-        session_cert_id:
-          type: string
-          description: >
-            Short identifier for the session certificate. Included in every
-            signed event so SETI can detect certificate rotation without
-            attempting verification with a stale cert.
-        issued_at:
-          type: string
-          format: date-time
-        feed_channel:
-          type: string
-          description: >
-            Redis channel name for this constellation's AC health feed.
-            Typically tca:augur-canis but may be namespaced in multi-tenant
-            deployments.
-        constellation_id:
-          type: string
-          description: >
-            Identifier for this constellation as known to the AC.
-
-    FederationStatus:
-      type: object
-      required: [registered, constellation_id]
-      properties:
-        registered:
-          type: boolean
-        constellation_id:
-          type: string
-        session_cert_id:
-          type: string
-          description: Present when registered is true
-        registered_at:
-          type: string
-          format: date-time
-          description: When the current session was established
-        events_signed:
-          type: integer
-          description: Count of events signed in current session
-
     ServiceRegistrationRequest:
       type: object
       required: [service_name, network_endpoint, cert_fingerprint, timestamp, signature]
@@ -1317,3 +1191,76 @@ components:
   #             passed: bool, actual_status: int, expected_status: int,
   #             actual_response?: object, failure_reason?: string,
   #             latency_ms: int, executed_at: ISO8601 }
+
+  /plots/run:
+    post:
+      summary: Execute a plot synchronously and return complete run results
+      description: >
+        Accepts a plot definition, executes each step against internal services,
+        and returns a complete PlotRun result.  Protected by monitor cert mTLS.
+        This is a standard AC capability — all constellation ACs implement it.
+      operationId: runPlot
+      tags: [Plots]
+      x-tca-security:
+        transport: mTLS
+        client_cert: monitor_cert
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plot_id, constellation, steps]
+              properties:
+                plot_id:
+                  type: string
+                constellation:
+                  type: string
+                steps:
+                  type: array
+                  items:
+                    type: object
+                context:
+                  type: object
+                  additionalProperties:
+                    type: string
+      responses:
+        '200':
+          description: Plot run complete — full results included
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlotRun'
+        '400':
+          description: Invalid request or wrong constellation
+        '503':
+          description: Session not established
+
+  /auth/session-token:
+    post:
+      summary: Issue a short-lived service account token for external plot execution
+      description: >
+        Issues a scoped, short-lived JWT for SETI to use when executing external
+        plot steps against this constellation's gateway.  Protected by monitor cert mTLS.
+      operationId: issueSessionToken
+      tags: [Auth]
+      x-tca-security:
+        transport: mTLS
+        client_cert: monitor_cert
+      responses:
+        '200':
+          description: Short-lived token issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                  gateway_url:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+        '503':
+          description: Session not established

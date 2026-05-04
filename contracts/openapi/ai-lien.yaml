@@ -100,6 +100,18 @@ x-tca-observability:
     operational signal worth tracking here. Two calls per analysis
     request (first tap + second tap) — both are reported.
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - exit-0
+    notes: >
+      ai-lien holds no persistent connections beyond its mTLS server. In-flight analysis requests complete within the drain window before the server closes.
+
 servers:
   - url: https://ai-lien:4252
     description: Internal SETI network (mTLS enforced)

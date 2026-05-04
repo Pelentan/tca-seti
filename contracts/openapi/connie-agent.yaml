@@ -1,0 +1,372 @@
+openapi: 3.1.0
+
+info:
+  title: SETI - Connie Agent
+  description: |
+    Constellation onboarding agent. Reads remote-apps.json and for each
+    registered constellation performs three responsibilities:
+
+    1. STARGAZER CERT DISTRIBUTION — Writes the SETI star-gazer public
+       certificate as a Kubernetes Secret (seti-stargazer-cert) into the
+       constellation's namespace. This is a one-way trust establishment:
+       the constellation's Augur Canis loads this cert to verify that
+       incoming federation registration requests genuinely originate from
+       this SETI instance.
+
+       Requires a ClusterRole permitting Secret create/patch in each
+       registered constellation namespace. Scoped to the specific namespaces
+       listed in remote-apps.json — not cluster-wide Secret write access.
+
+    2. PLOT SYNCHRONISATION — Fetches plot definitions from the
+       constellation's repository (GitHub, GitLab, or generic) and POSTs
+       them to SETI's Plot Store. connie-agent owns all repository
+       connectivity; Plot Store has no registry credentials and no
+       outbound network access to external repositories.
+
+       Sync runs at startup and on a configurable interval. Plot Store is
+       the source of truth for stored plots; connie-agent is the delivery
+       mechanism.
+
+    3. STATUS REPORTING — Exposes a health endpoint and a status endpoint
+       showing the current sync state per constellation (last cert write,
+       last plot sync, plot count, any errors).
+
+    connie-agent does NOT perform:
+    - Federation registration (Signal Aggregator)
+    - Application registration (Policy)
+    - Contract test execution (Augur Canis)
+    - Plot execution (Plot Test)
+
+    Language: Go. Single binary. One K8s ServiceAccount with scoped RBAC.
+  version: 0.1.0
+
+x-tca-security:
+  transport: mtls
+  tls-min-version: "1.3"
+  client-cert-required: true
+  reject-without-client-cert: true
+  ca-cert: /certs/ca.crt
+  service-cert: /certs/connie-agent.crt
+  service-key: /certs/connie-agent.key
+  implementation:
+    server:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      require-and-verify-client-cert: true
+    client:
+      load-ca-cert: true
+      load-service-cert: true
+      load-service-key: true
+      verify-server-cert: true
+  notes: >
+    Every inbound connection must present a certificate signed by the SETI CA.
+    Authorized inbound callers: Gateway (status queries from Wr4ngler interface).
+    Outbound mTLS: Plot Store (POST /plots). Outbound plain HTTPS: constellation
+    repositories (GitHub/GitLab API). Outbound Kubernetes API: Secret writes via
+    in-cluster ServiceAccount.
+
+x-tca-observability:
+  report-outbound-calls: true
+  endpoint: https://seti-observability:4011/event
+  pattern: fire-and-forget
+  caller-name: "connie-agent"
+  required-fields:
+    - caller
+    - callee
+    - method
+    - path
+    - status_code
+    - latency_ms
+    - protocol
+  implementation:
+    timing: wrap-every-outbound-http-call
+    non-blocking: true
+    on-failure: log-and-drop
+    do-not-instrument:
+      - seti-observability
+  notes: >
+    Report outbound calls to Plot Store and constellation repositories.
+    Kubernetes API calls are not reported — they use the in-cluster API
+    server, not an mTLS service, and would pollute the observability stream
+    with infrastructure noise.
+
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - finish-in-progress-sync-cycle
+      - exit-0
+    notes: >
+      connie-agent runs background sync goroutines per constellation. A sync
+      cycle that is mid-flight when SIGTERM arrives should complete its current
+      plot POST before the process exits — aborting mid-sync leaves the Plot
+      Store in a partial state for that constellation. The drain window covers
+      one sync cycle per constellation. If a sync cycle exceeds the drain window,
+      it is abandoned and the next startup will retry.
+
+servers:
+  - url: https://connie-agent:4014
+    description: Internal SETI network (mTLS enforced)
+
+tags:
+  - name: status
+    description: Constellation sync status and health
+  - name: sync
+    description: Manual sync triggers
+
+paths:
+
+  /health:
+    get:
+      tags: [status]
+      summary: Service health
+      responses:
+        '200':
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /status:
+    get:
+      tags: [status]
+      summary: Sync status for all registered constellations
+      description: |
+        Returns the current sync state for every constellation in
+        remote-apps.json — cert write status, plot sync status, last
+        sync timestamps, and any active errors.
+      responses:
+        '200':
+          description: Status for all constellations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /status/{constellation}:
+    get:
+      tags: [status]
+      summary: Sync status for a specific constellation
+      parameters:
+        - name: constellation
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Constellation tag from remote-apps.json (e.g. tca-vox)
+      responses:
+        '200':
+          description: Constellation sync status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConstellationStatus'
+        '404':
+          description: Constellation not found in remote-apps.json
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /sync/{constellation}:
+    post:
+      tags: [sync]
+      summary: Trigger an immediate sync for a constellation
+      description: |
+        Triggers an immediate cert write and plot fetch for the named
+        constellation, regardless of the scheduled interval. Returns
+        immediately — sync runs asynchronously. Check /status/{constellation}
+        for results.
+
+        Useful when a new plot has been pushed to the repository and the
+        Wr4ngler does not want to wait for the next scheduled sync.
+      parameters:
+        - name: constellation
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '202':
+          description: Sync accepted — running asynchronously
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncAccepted'
+        '404':
+          description: Constellation not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Sync already in progress for this constellation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  schemas:
+
+    HealthResponse:
+      type: object
+      required: [status, constellations_loaded, uptime_seconds]
+      properties:
+        status:
+          type: string
+          enum: [healthy]
+        constellations_loaded:
+          type: integer
+          description: Number of constellations loaded from remote-apps.json
+        uptime_seconds:
+          type: integer
+
+    StatusResponse:
+      type: object
+      required: [constellations, total]
+      properties:
+        constellations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConstellationStatus'
+        total:
+          type: integer
+
+    ConstellationStatus:
+      type: object
+      required: [tag, namespace, cert_status, plot_status]
+      properties:
+        tag:
+          type: string
+          description: Constellation tag from remote-apps.json
+          example: tca-vox
+        namespace:
+          type: string
+          description: Kubernetes namespace the constellation runs in
+          example: tca-vox
+        cert_status:
+          type: string
+          enum: [ok, pending, failed, unknown]
+          description: Status of the most recent stargazer cert write
+        cert_last_written_at:
+          type: string
+          format: date-time
+        cert_error:
+          type: string
+          description: Error message if cert_status is failed
+        plot_status:
+          type: string
+          enum: [ok, pending, failed, unknown]
+          description: Status of the most recent plot sync
+        plot_last_synced_at:
+          type: string
+          format: date-time
+        plots_synced:
+          type: integer
+          description: Number of plots successfully posted to Plot Store in last sync
+        plot_error:
+          type: string
+          description: Error message if plot_status is failed
+        sync_in_progress:
+          type: boolean
+
+    SyncAccepted:
+      type: object
+      required: [tag, status]
+      properties:
+        tag:
+          type: string
+        status:
+          type: string
+          enum: [accepted]
+        message:
+          type: string
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+
+  /constellations/{tag}/run-contract-tests:
+    post:
+      summary: Trigger contract tests on a remote constellation's AC
+      operationId: runRemoteContractTests
+      tags: [Constellations]
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Contract tests triggered
+        '404':
+          description: Unknown constellation
+
+  /constellations/{tag}/contract-suites:
+    get:
+      summary: List contract test suites from a remote constellation's AC
+      operationId: listRemoteContractSuites
+      tags: [Constellations]
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Contract suites list
+        '404':
+          description: Unknown constellation
+
+  /constellations/{tag}/contract-suites/{runId}:
+    get:
+      summary: Get a specific contract test suite from a remote constellation's AC
+      operationId: getRemoteContractSuite
+      tags: [Constellations]
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: runId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Contract suite detail
+        '404':
+          description: Unknown constellation or run
+
+  /constellations/{tag}/request-token:
+    post:
+      summary: Request a short-lived token from a remote constellation's AC
+      operationId: requestConstellationToken
+      tags: [Constellations]
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Token issued
+        '503':
+          description: Could not authenticate with remote AC

@@ -1,0 +1,660 @@
+# NetworkPolicy for TCA Vox constellation.
+# Default-deny ingress. Explicit allow per service.
+# Enforced when CNI supports NetworkPolicy (Calico, Cilium).
+# k3d with flannel enforces these — plan accordingly.
+#
+# Key rules derived from lessons learned in SETI migration:
+# - cert-forge and observability-service accept from all constellation pods
+#   (every pod needs cert enrollment and every pod reports events)
+# - Redis accepts from all constellation pods
+#   (every service may use Redis directly)
+# - Per-service ingress lists exact callers at runtime
+
+# ---------------------------------------------------------------------------
+# Default deny all ingress
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# ---------------------------------------------------------------------------
+# cert-forge — accepts from all constellation pods (enrollment is universal)
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cert-forge-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: cert-forge
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: vox
+      ports:
+        - port: {{ .Values.certForge.port }}
+        - port: {{ .Values.certForge.enrollmentPort }}
+        - port: {{ .Values.certForge.publicPort }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: seti
+      ports:
+        - port: {{ .Values.certForge.publicPort }}
+---
+# ---------------------------------------------------------------------------
+# Redis — accepts from all constellation pods
+# (healthcheck binary, sessions, pub/sub, streams)
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: vox
+      ports:
+        - port: 6379
+---
+# ---------------------------------------------------------------------------
+# observability-service — accepts from all constellation pods
+# (every service reports events fire-and-forget)
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: observability-service-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: observability-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: vox
+      ports:
+        - port: {{ .Values.observabilityService.port }}
+---
+# ---------------------------------------------------------------------------
+# MongoDB instances — each accepts only from its owning service
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: auth-mongo-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: auth-mongo
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: auth-service
+      ports:
+        - port: 27017
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: user-mongo-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: user-mongo
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: user-wr4ngler
+      ports:
+        - port: 27017
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: poll-mongo-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: poll-mongo
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: poll-builder
+      ports:
+        - port: 27017
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: poll-styler-mongo-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: poll-styler-mongo
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: poll-styler
+      ports:
+        - port: 27017
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: poll-wr4ngler-mongo-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: poll-wr4ngler-mongo
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: poll-wr4ngler
+      ports:
+        - port: 27017
+---
+# ---------------------------------------------------------------------------
+# report-templater-db — accepts only from report-templater
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: report-templater-db-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: report-templater-db
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: report-templater
+      ports:
+        - port: 5432
+---
+# ---------------------------------------------------------------------------
+# payment-wr4ngler — accepts from auth-service only
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment-wr4ngler-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-wr4ngler
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: auth-service
+      ports:
+        - port: {{ .Values.paymentWr4ngler.port }}
+---
+# ---------------------------------------------------------------------------
+# auth-service — accepts from gateway
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: auth-service-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: auth-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+        - podSelector:
+            matchLabels:
+              app: augur-canis
+      ports:
+        - port: {{ .Values.authService.port }}
+---
+# ---------------------------------------------------------------------------
+# user-wr4ngler — accepts from gateway
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: user-wr4ngler-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: user-wr4ngler
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - port: {{ .Values.userWr4ngler.port }}
+---
+# ---------------------------------------------------------------------------
+# message-wr4ngler — accepts from gateway
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: message-wr4ngler-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: message-wr4ngler
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - port: {{ .Values.messageWr4ngler.port }}
+---
+# ---------------------------------------------------------------------------
+# poll-builder — accepts from gateway, poll-wr4ngler, report-wr4ngler
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: poll-builder-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: poll-builder
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+        - podSelector:
+            matchLabels:
+              app: poll-wr4ngler
+        - podSelector:
+            matchLabels:
+              app: report-wr4ngler
+      ports:
+        - port: {{ .Values.pollBuilder.port }}
+---
+# ---------------------------------------------------------------------------
+# poll-styler — accepts from gateway
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: poll-styler-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: poll-styler
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - port: {{ .Values.pollStyler.port }}
+---
+# ---------------------------------------------------------------------------
+# page-builder — accepts from gateway
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: page-builder-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: page-builder
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - port: {{ .Values.pageBuilder.port }}
+---
+# ---------------------------------------------------------------------------
+# poll-wr4ngler — accepts from gateway
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: poll-wr4ngler-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: poll-wr4ngler
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - port: {{ .Values.pollWr4ngler.port }}
+---
+# ---------------------------------------------------------------------------
+# redis-handler — accepts from poll-wr4ngler
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-handler-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: redis-handler
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: poll-wr4ngler
+      ports:
+        - port: {{ .Values.redisHandler.port }}
+---
+# ---------------------------------------------------------------------------
+# results-handler — accepts from gateway, report-wr4ngler
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: results-handler-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: results-handler
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+        - podSelector:
+            matchLabels:
+              app: report-wr4ngler
+      ports:
+        - port: {{ .Values.resultsHandler.port }}
+---
+# ---------------------------------------------------------------------------
+# report-templater — accepts from report-wr4ngler
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: report-templater-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: report-templater
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: report-wr4ngler
+      ports:
+        - port: {{ .Values.reportTemplater.port }}
+---
+# ---------------------------------------------------------------------------
+# report-wr4ngler — accepts from gateway
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: report-wr4ngler-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: report-wr4ngler
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - port: {{ .Values.reportWr4ngler.port }}
+---
+# ---------------------------------------------------------------------------
+# report-wooz — accepts from report-wr4ngler
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: report-wooz-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: report-wooz
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: report-wr4ngler
+      ports:
+        - port: {{ .Values.reportWooz.port }}
+---
+# ---------------------------------------------------------------------------
+# report-builder — accepts from report-wr4ngler
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: report-builder-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: report-builder
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: report-wr4ngler
+      ports:
+        - port: {{ .Values.reportBuilder.port }}
+---
+# ---------------------------------------------------------------------------
+# email-service — accepts from auth-service
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: email-service-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: email-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: auth-service
+      ports:
+        - port: {{ .Values.emailService.port }}
+---
+# ---------------------------------------------------------------------------
+# ui — accepts from gateway only
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ui-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: ui
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - port: {{ .Values.ui.port }}
+---
+# ---------------------------------------------------------------------------
+# gateway — accepts external traffic (no podSelector restriction)
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: {{ .Values.gateway.port }}
+---
+# ---------------------------------------------------------------------------
+# augur-canis — accepts from all constellation pods.
+# Every service's init container probes augur-canis to gate startup.
+# All services self-register with AC at startup.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: augur-canis-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: augur-canis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: vox
+      ports:
+        - port: {{ .Values.augurCanis.port }}
+        - port: {{ .Values.augurCanis.uiPort }}
+---
+# ---------------------------------------------------------------------------
+# augur-canis — SETI cross-namespace ingress
+#
+# Allows SETI pods (in the seti namespace) to reach augur-canis on the
+# mTLS port only.  SETI's connie-agent initiates federation registration,
+# holds the /stream SSE connection, and triggers /plots/run.
+# The UI port is deliberately excluded — SETI has no need for the dev UI.
+#
+# Requires the seti namespace to carry the label:
+#   kubernetes.io/metadata.name: seti
+# (applied automatically by K8s >= 1.21; verify with:
+#   kubectl get namespace seti --show-labels)
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: augur-canis-seti-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: augur-canis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: seti
+      ports:
+        - port: {{ .Values.augurCanis.port }}
+        - port: {{ .Values.augurCanis.federationPort }}

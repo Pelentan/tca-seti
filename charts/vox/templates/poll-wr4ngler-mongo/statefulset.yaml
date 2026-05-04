@@ -1,0 +1,140 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: poll-wr4ngler-mongo
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: poll-wr4ngler-mongo
+spec:
+  serviceName: poll-wr4ngler-mongo
+  replicas: 1
+  selector:
+    matchLabels:
+      app: poll-wr4ngler-mongo
+  template:
+    metadata:
+      labels:
+        app: poll-wr4ngler-mongo
+        {{- include "vox.labels" . | nindent 8 }}
+    spec:
+      initContainers:
+        - name: obtain-server-cert
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}tca-mongo:{{ .Values.mongo.tag }}
+          imagePullPolicy: Always
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              FORGE_PUBLIC="http://cert-forge:{{ .Values.certForge.publicPort }}"
+              FORGE_ENROLL="https://cert-forge:{{ .Values.certForge.enrollmentPort }}"
+
+              echo "Waiting for cert-forge..."
+              until curl -sf "$FORGE_PUBLIC/ca" > /dev/null; do sleep 3; done
+
+              curl -sf "$FORGE_PUBLIC/ca" | jq -r '.ca_cert' > /mongo-certs/ca.crt
+              echo "CA cert obtained."
+
+              curl -sf \
+                --cert /enroll-certs/enrollment.crt \
+                --key /enroll-certs/enrollment.key \
+                --cacert /mongo-certs/ca.crt \
+                --insecure \
+                -X POST \
+                -H "Content-Type: application/json" \
+                -d '{"service_name":"poll-wr4ngler-mongo","instance_id":"poll-wr4ngler-mongo-server","organizational_unit":"server","sans":["poll-wr4ngler-mongo","poll-wr4ngler-mongo","localhost"]}' \
+                "$FORGE_ENROLL/instance-cert" > /mongo-certs/response.json
+
+              jq -r '.cert' /mongo-certs/response.json > /mongo-certs/server.crt
+              jq -r '.key'  /mongo-certs/response.json > /mongo-certs/server.key
+              cat /mongo-certs/server.crt /mongo-certs/server.key > /mongo-certs/server-combined.pem
+              chmod 600 /mongo-certs/server-combined.pem
+              echo "Server cert enrolled and combined."
+          volumeMounts:
+            - name: enroll-certs
+              mountPath: /enroll-certs
+              readOnly: true
+            - name: mongo-certs
+              mountPath: /mongo-certs
+            - name: init-script
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      containers:
+        - name: poll-wr4ngler-mongo
+          image: {{ .Values.registry }}/{{ .Values.imagePrefix }}tca-mongo:{{ .Values.mongo.tag }}
+          ports:
+            - containerPort: 27017
+          env:
+            - name: REDIS_URL
+              value: "redis:6379"
+            - name: SERVICE_NAME
+              value: "poll-wr4ngler-mongo"
+            - name: MONGO_INITDB_ROOT_USERNAME
+              value: "admin"
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vox-credentials
+                  key: mongoRootPassword
+            - name: MONGO_INITDB_DATABASE
+              value: "poll_wr4ngler"
+          volumeMounts:
+            - name: poll-wr4ngler-mongo-data
+              mountPath: /data/db
+            - name: mongo-config
+              mountPath: /etc/mongod.conf
+              subPath: mongod.conf
+              readOnly: true
+            - name: mongo-certs
+              mountPath: /mongo-certs
+            - name: init-script
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          livenessProbe:
+            exec:
+              command: ["/healthcheck"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 5
+      volumes:
+        - name: enroll-certs
+          secret:
+            secretName: vox-certs
+            items:
+              - key: enrollment.crt
+                path: enrollment.crt
+              - key: enrollment.key
+                path: enrollment.key
+        - name: mongo-certs
+          emptyDir: {}
+        - name: init-script
+          configMap:
+            name: poll-wr4ngler-mongo-init
+        - name: mongo-config
+          configMap:
+            name: mongo-config
+  volumeClaimTemplates:
+    - metadata:
+        name: poll-wr4ngler-mongo-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: poll-wr4ngler-mongo
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "vox.labels" . | nindent 4 }}
+    app: poll-wr4ngler-mongo
+spec:
+  selector:
+    app: poll-wr4ngler-mongo
+  ports:
+    - port: 27017
+      targetPort: 27017
+  type: ClusterIP

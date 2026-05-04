@@ -215,6 +215,29 @@ Every package manager produces a lockfile. Every lockfile is committed. Every Do
 
 `npm install` in a Dockerfile without a committed lockfile produces version drift between local and container builds. The failure mode is builds that work locally and break in Docker, or worse, silently behave differently. Use `npm ci`.
 
+### Build Context — Project Root Required
+
+Every Docker image in a TCA constellation is built from the **project root**, not from the service subdirectory.  This is non-negotiable and must be enforced in `scripts/build-push.sh`.
+
+```bash
+# Correct — build context is project root
+docker build -t registry/service:tag -f service/Dockerfile .
+
+# Wrong — build context is the service directory
+docker build -t registry/service:tag service/
+```
+
+**Why:** TCA Dockerfiles use service-prefixed COPY paths (`COPY service/go.mod ./`) so all files in the constellation are accessible during the build.  A service-directory context will silently appear to succeed on cached layers while failing on fresh builds.  The diagnostic indicator is `transferring context: 2B` in the Docker build output — an empty context.
+
+**build-push.sh format:** The third field is always `.`:
+
+```bash
+services=(
+  "augur-canis:augur-canis/Dockerfile:."
+  "gateway:gateway/Dockerfile:."
+)
+```
+
 ### Dockerfile Layer Order
 Dependencies before source. Cache invalidation on source changes should not re-run dependency installation.
 
@@ -223,6 +246,27 @@ COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
 ```
+
+
+### Container Image Naming in Shared Registries
+
+When multiple constellations share a single container registry — as is standard in the TCA k3d development environment — image names must be prefixed with the constellation name to prevent collision.
+
+**The rule:** `<constellation>-<service>:<tag>`
+
+Examples:
+- `seti-gateway:dev` — SETI constellation gateway
+- `vox-gateway:dev` — Vox constellation gateway
+- `seti-cert-forge:dev` — SETI cert-forge instance
+- `vox-cert-forge:dev` — Vox cert-forge instance
+
+This applies to every image in the constellation, including infrastructure images like `cert-forge` and `augur-canis`. Two constellations may each have a `cert-forge` — they are different binaries with different configurations and must not share an image.
+
+In production deployments where each constellation has a dedicated registry, the prefix is unnecessary and should be omitted. The `imagePrefix` Helm value (empty in `values.yaml`, set to `<constellation>-` in `values/dev.yaml`) controls this without requiring template changes.
+
+**Why this matters:** A `build-push.sh` that pushes `gateway:dev` overwrites any other constellation's `gateway:dev` in the same registry. The last push wins silently. Services then run the wrong binary with no error until runtime behavior diverges. This was discovered during the SETI and Vox K8s migration when both constellations pushed `gateway:dev` to the shared `tca-registry` and SETI's gateway started serving Vox's binary.
+
+**Establish the prefix at project initialization.** Retrofitting it after images are already in the registry requires a full rebuild and redeploy. Add the prefix to `build-push.sh` and the Helm values before the first `docker push`.
 
 ### No "Latest" Versions
 "Latest" is not a version. All dependencies specify explicit versions. Unpinned dependencies are a supply chain risk and a reproducibility failure.
@@ -659,54 +703,104 @@ Retry logic for transient failures (pod recycle, connection refused, 5xx) belong
 
 Every TCA constellation needs certificates. The naive approach — generating all certificates in an init container and distributing them via a shared Docker volume — has a fundamental flaw: every service can read every other service's private key material. A single compromised container exposes the entire constellation's PKI.
 
-cert-forge is the correct architecture. It is a persistent running service that acts as a PKI abstraction layer: generates the CA in memory, issues instance certificates to services on demand over an authenticated enrollment channel, and never writes private key material to any shared storage.
+cert-forge is the correct architecture. It is a persistent running service that acts as a PKI abstraction layer: generates the CA in memory, issues instance certificates to services on demand over an authenticated enrollment channel, and never writes private key material to any shared storage. Like Augur Canis, cert-forge is a standard TCA component that applies to any constellation regardless of domain.
 
 ### Three-Port Design
 
-TLS client authentication is a connection-level property — it cannot be enforced per-path on a single port. cert-forge requires three servers:
+TLS client authentication is a connection-level property — it cannot be enforced per-path on a single port. cert-forge requires three servers on three distinct ports. The port numbers are chosen from the constellation's port pool at design time — they are not fixed across constellations. This is a deliberate security decision: a known standard port for a high-value PKI service creates a known attack surface.
 
-| Port | Transport | Endpoint | Who Can Call |
-|------|-----------|----------|--------------|
-| Plain HTTP | `/ca` | Anyone — CA cert is public |
-| Enrollment mTLS | `/instance-cert` | Holder of enrollment cert only |
-| Constellation mTLS | `/sign` | Holder of a valid instance cert |
+| Role | Transport | Endpoint | Caller |
+|------|-----------|----------|--------|
+| Public (base+2) | Plain HTTP | `/ca` | Anyone — CA cert is public |
+| Enrollment (base+1) | Enrollment mTLS | `/instance-cert` | Holder of enrollment cert only |
+| Sign (base) | Constellation mTLS | `/sign` | Holder of a valid instance cert |
+
+The three ports are consecutive: if the sign port is `N`, enrollment is `N+1`, and public is `N+2`. The certforge client derives enrollment and public URLs automatically from the sign port. Choose ports that are clearly separated from application service ports to avoid confusion.
+
+**Example port assignments:**
+- SETI: 4014 (sign), 4015 (enrollment), 4016 (public)
+- TCA Vox: 3020 (sign), 3021 (enrollment), 3022 (public)
 
 ### Enrollment CA Pattern
 
-cert-forge generates a separate enrollment CA at startup. It issues exactly one enrollment certificate — written to the shared volume as the only key material that ever touches shared storage. Every service container receives this enrollment cert via environment variable. Its sole capability is calling `/instance-cert`. The constellation CA private key never leaves cert-forge's memory.
+cert-forge generates a separate enrollment CA at startup — separate from the constellation CA. It issues exactly one enrollment certificate. This cert's only capability is calling `/instance-cert`. The constellation CA private key never leaves cert-forge's memory.
+
+In Docker Compose, the enrollment cert is written to the shared certs volume and mounted read-only into every service container. In Kubernetes, it is written to a K8s Secret and mounted as a volume.
 
 ### Service Startup Sequence
 
-1. Service starts, reads enrollment cert from environment
-2. Calls cert-forge enrollment server with enrollment cert — proves it is an authorized container
-3. cert-forge issues an instance cert signed by the constellation CA, delivers it over the encrypted enrollment connection
-4. Service builds its mTLS server and client using the instance cert
-5. Service self-registers with AC using its instance cert fingerprint for verification
+1. Service starts, finds enrollment cert at `/certs/enrollment.crt` and `/certs/enrollment.key`
+2. Calls cert-forge's public port to fetch the CA cert (unauthenticated — CA cert is public)
+3. Calls cert-forge's enrollment server presenting the enrollment cert over mTLS
+4. cert-forge verifies the enrollment cert is signed by the enrollment CA, issues an instance cert
+5. Instance cert and key are delivered over the encrypted enrollment channel and held in memory only
+6. Service builds its mTLS server and client configs from the in-memory instance cert
+7. Service self-registers with AC using its instance cert fingerprint for identity verification
 
 ### Key Material Lifecycle
 
-- **CA private key**: generated in memory, never persisted
-- **Instance private keys**: generated in memory, delivered to requesting service, never written to volume
-- **Enrollment cert**: written to volume (the only private key material on shared storage)
-- **star-gazer cert**: static, written to volume (federation identity — different lifecycle)
+| Material | Storage | Notes |
+|----------|---------|-------|
+| Constellation CA key | Memory only | Never written anywhere |
+| Enrollment CA key | Memory only | Never written anywhere |
+| Instance private keys | Memory only | Generated per-service, delivered over enrollment mTLS, never stored |
+| CA public cert | Volume / K8s Secret | Public — safe to store |
+| Enrollment CA public cert | Volume / K8s Secret | Used by cert-forge to verify enrollment callers |
+| Enrollment cert + key | Volume / K8s Secret | Only private key material on shared storage — single capability: call `/instance-cert` |
+| star-gazer cert + key | Volume / K8s Secret | Static federation identity — longer lifecycle than instance certs |
 
-### K8s Production
+### CA Persistence Across Restarts
 
-cert-forge's signing backend points to cert-manager or the organizational CA. The signing responsibility remains with cert-forge. No other service changes when the PKI backend changes. The constellation is fully decoupled from infrastructure PKI choices.
+The constellation CA must survive cert-forge restarts. If cert-forge restarts and generates a new CA, every service's instance cert becomes invalid — inter-service mTLS fails with `unknown certificate authority` because existing certs are signed by the old CA.
 
-### cert-forge Is a Standard TCA Component
+**In Docker Compose:** If the certs volume is destroyed (`docker compose down -v`), a new CA is generated on the next startup. All services restart together, obtaining new instance certs from the new CA. This is correct behavior — the volume and the CA have the same lifecycle.
 
-Like Augur Canis, cert-forge applies to any TCA constellation regardless of domain. Any constellation with more than one service has the shared-volume PKI problem. cert-forge solves it once, in one place, in one language, with a contract any service in any language can consume.
+**In Kubernetes:** cert-forge persists the CA cert and key in the K8s Secret (`ca.crt` and `ca.key`). On startup, cert-forge reads the existing CA from the Secret. If a valid CA exists and is not within 30 days of expiry, it loads the existing CA rather than generating a new one. The CA is stable across cert-forge pod restarts. Only the enrollment material and static certs are regenerated on restart.
 
-### Adding cert-forge to a New TCA Project
+This means cert-forge can be restarted in K8s without requiring a constellation-wide restart. Services continue using their in-memory instance certs — they never see the new CA because it is the same CA.
 
-1. Add cert-forge to the constellation. All other services add `depends_on: cert-forge: condition: service_healthy`.
-2. Pass `ENROLLMENT_CERT` and `ENROLLMENT_KEY` to every service container (from the cert-forge-generated volume).
-3. Replace cert-init with cert-forge in docker-compose.yml — `restart: unless-stopped`, not `restart: "no"`.
-4. Each service calls `obtainCerts(serviceName)` at startup before building any TLS configuration.
-5. Remove all `volumes` mounts of individual service certs — only `ca.crt` and the enrollment cert need to be on the volume.
+### Adding cert-forge to a New TCA Project (Docker Compose)
 
-The certforge client pattern is implemented in Go, TypeScript, Python, and Elixir in the SETI codebase. The Go implementation in `augur-canis/certforge.go` is the canonical reference.
+1. Copy the cert-forge service directory from the SETI repository. cert-forge has no constellation-specific code — copy it verbatim.
+2. Choose three consecutive ports from the constellation's port pool. Update `forge.json` with the constellation CA configuration.
+3. Replace `cert-init` with cert-forge in `docker-compose.yml`. Use `restart: unless-stopped`, not `restart: "no"`. cert-forge is a persistent service, not an init container.
+4. All other services add `depends_on: cert-forge: condition: service_healthy`.
+5. Mount the certs volume read-only into every service container. Pass `CERT_FORGE_URL`, `ENROLLMENT_PORT`, `PUBLIC_PORT`, `ENROLLMENT_CERT`, `ENROLLMENT_KEY`, and `ENROLLMENT_CA` as environment variables.
+6. Each service calls `obtainCerts(serviceName)` at startup before building any TLS configuration.
+7. Remove all pre-generated cert files from the shared volume — only `ca.crt`, `enrollment-ca.crt`, `enrollment.crt`, `enrollment.key`, and static certs (star-gazer) belong on the volume. Instance certs never touch the volume.
+
+### Adding cert-forge to a New TCA Project (Kubernetes)
+
+1. Copy the cert-forge service directory from the SETI repository.
+2. Add the cert-forge Helm templates from the SETI chart: `ServiceAccount`, `Role`, `RoleBinding`, `Deployment`, `Service`. The Role grants `get`, `create`, `update` on secrets in the namespace only.
+3. cert-forge writes all cert material to a K8s Secret on startup. Every other service mounts the Secret at `/certs` read-only.
+4. cert-forge's readiness probe uses `httpGet` on the public port (`/ca`, plain HTTP). Every other service uses `exec: ["/healthcheck"]`.
+5. An init container on each service (`wait-for-cert-forge`) polls the public port until it responds before the main container starts.
+6. The certs volume from Docker Compose is replaced entirely by the K8s Secret. No PVC required for cert material.
+
+### certforge Client — Language Reference
+
+The certforge client is implemented in all four TCA languages. Copy the appropriate file from the SETI codebase — no modification required except service name.
+
+| Language | Reference file | Key function |
+|----------|---------------|--------------|
+| Go | `augur-canis/certforge.go` | `obtainCerts(serviceName string) *CertMaterial` |
+| TypeScript | `signal-clearance/certforge.ts` | `obtainCerts(serviceName: string): Promise<CertMaterial>` |
+| Python | `ai-lien/certforge.py` | `obtain_certs(service_name: str) -> CertMaterial` |
+| Elixir | `feed-wrangler/cert_forge.ex` | `CertForge.obtain_certs(service_name)` |
+
+All four implementations follow the same flow: fetch CA cert → request instance cert over enrollment mTLS → hold both in memory → build TLS configs. The Go implementation is the canonical reference.
+
+### What cert-forge Replaces
+
+| Old approach | cert-forge approach |
+|-------------|---------------------|
+| `cert-init` init container generates all certs | cert-forge persistent service issues certs on demand |
+| All private keys written to shared volume | Instance private keys never touch shared storage |
+| Any compromised service can read all keys | Each service holds only its own key material |
+| Fixed cert set — adding a service requires regenerating all certs | cert-forge issues certs to any service that enrolls |
+| `restart: "no"` — one-shot | `restart: unless-stopped` — persistent |
+| K8s: volume mount with `ReadWriteMany` PVC | K8s: K8s Secret — no PVC, no RWX storage class required |
 
 ---
 

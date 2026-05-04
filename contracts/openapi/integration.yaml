@@ -98,6 +98,18 @@ x-tca-observability:
     usage patterns — which applications are being queried, at what
     frequency, by which service accounts.
 
+x-tca-lifecycle:
+  shutdown:
+    signal: SIGTERM
+    drain-timeout-seconds: 15
+    terminationGracePeriodSeconds: 20
+    steps:
+      - stop-accepting-connections
+      - drain-in-flight-requests
+      - exit-0
+    notes: >
+      integration is a read-only query Job with no persistent downstream connections beyond its mTLS server. It holds no Redis connections or database connections of its own — it reads from other Jobs via mTLS.
+
 servers:
   - url: https://integration:4013
     description: Internal SETI network (mTLS enforced)

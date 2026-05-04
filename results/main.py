@@ -422,4 +422,6 @@ if __name__ == '__main__':
     log.info('Plot results: /plot-results (stub)')
     log.info('Trends: /trends/contract')
 
+    from shutdown import register_shutdown
+    register_shutdown(server)
     server.serve_forever()

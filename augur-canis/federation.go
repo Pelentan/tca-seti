@@ -244,7 +244,7 @@ func publishSignedFeedEvent(event map[string]interface{}) {
 
 	signed, _ := json.Marshal(event)
 	ctx := context.Background()
-	if err := rdb.Publish(ctx, healthFeedChannel, signed).Err(); err != nil {
+	if err := rdb.Publish(ctx, healthFeedChannel, string(signed)); err != nil {
 		log.Printf("[federation] Failed to publish to %s: %v", healthFeedChannel, err)
 	}
 }
@@ -522,7 +522,7 @@ func registerJob(serviceName, endpoint string) {
 	ctx := context.Background()
 	key := fmt.Sprintf("ac:job:%s", serviceName)
 	data, _ := json.Marshal(record)
-	rdb.Set(ctx, key, data, 0)
+	rdb.Set(ctx, key, string(data), 0)
 
 	log.Printf("[federation] Job registered: %s at %s", serviceName, endpoint)
 }

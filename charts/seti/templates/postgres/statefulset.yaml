@@ -1,0 +1,118 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        {{- include "seti.labels" . | nindent 8 }}
+    spec:
+      # fsGroup 70 — postgres user uid in Alpine image.
+      # Ensures the seti-certs Secret volume files are group-readable
+      # by postgres so it can load ssl_key_file without permission errors.
+      securityContext:
+        fsGroup: 70
+      initContainers:
+        {{- include "seti.waitForPostgresPassword" . | nindent 8 }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: postgres
+          image: postgres:{{ .Values.postgres.tag }}
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.user | default "postgres" | quote }}
+            - name: POSTGRES_PASSWORD_FILE
+              value: /certs/postgres-password
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.db | default "lore" | quote }}
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            # Point postgres at the ConfigMap-mounted postgresql.conf
+            - name: POSTGRES_OPTIONS
+              value: "-c config_file=/etc/postgresql/postgresql.conf"
+          command:
+            - docker-entrypoint.sh
+            - postgres
+            - -c
+            - config_file=/etc/postgresql/postgresql.conf
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: seti-certs
+              mountPath: /certs
+              readOnly: true
+            - name: postgres-config
+              mountPath: /etc/postgresql/pg_hba.conf
+              subPath: pg_hba.conf
+              readOnly: true
+            - name: postgres-config
+              mountPath: /etc/postgresql/pg_ident.conf
+              subPath: pg_ident.conf
+              readOnly: true
+            - name: postgres-config
+              mountPath: /etc/postgresql/postgresql.conf
+              subPath: postgresql.conf
+              readOnly: true
+            - name: postgres-config
+              mountPath: /docker-entrypoint-initdb.d/init.sql
+              subPath: init.sql
+              readOnly: true
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - {{ .Values.postgres.user | default "postgres" }}
+                - -d
+                - {{ .Values.postgres.db | default "lore" }}
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+      volumes:
+        - name: seti-certs
+          secret:
+            secretName: {{ .Values.certSecretName }}
+            defaultMode: 0640
+        - name: postgres-config
+          configMap:
+            name: seti-postgres-config
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.postgres.storageClass }}
+        storageClassName: {{ .Values.postgres.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "seti.labels" . | nindent 4 }}
+    app: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  type: ClusterIP

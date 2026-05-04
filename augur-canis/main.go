@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 )
 
 // ---------------------------------------------------------------------------
@@ -118,13 +117,13 @@ var (
 // Redis client
 // ---------------------------------------------------------------------------
 
-var rdb *redis.Client
+var rdb *RedisClient
 
 func connectRedis() {
+	rdb = NewRedisClient(redisURL)
 	for i := 0; i < 10; i++ {
-		rdb = redis.NewClient(&redis.Options{Addr: redisURL})
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, err := rdb.Ping(ctx).Result()
+		err := rdb.Ping(ctx)
 		cancel()
 		if err == nil {
 			log.Printf("[augur-canis] Connected to Redis at %s", redisURL)
@@ -195,19 +194,31 @@ type CheckResult struct {
 	StubActive        bool   `json:"stub_active"`
 }
 
+var checkShutdown context.CancelFunc
+
 func handleCheckRequests() {
-	ctx := context.Background()
+	outerCtx, outerCancel := context.WithCancel(context.Background())
+	checkShutdown = outerCancel
 
 	for {
-		sub := rdb.Subscribe(ctx, checkRequestsChannel)
-		ch := sub.Channel()
+		select {
+		case <-outerCtx.Done():
+			return
+		default:
+		}
+		ch, err := rdb.Subscribe(outerCtx, checkRequestsChannel)
+		if err != nil {
+			log.Printf("[augur-canis] Failed to subscribe to %s: %v — retrying in 2s", checkRequestsChannel, err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
 		log.Printf("[augur-canis] Subscribed to %s", checkRequestsChannel)
 
 		for msg := range ch {
 			checksHandled.Add(1)
 
 			var req CheckRequest
-			if err := json.Unmarshal([]byte(msg.Payload), &req); err != nil {
+			if err := json.Unmarshal([]byte(msg), &req); err != nil {
 				log.Printf("[augur-canis] Failed to parse check request: %v", err)
 				continue
 			}
@@ -221,7 +232,6 @@ func handleCheckRequests() {
 		}
 
 		log.Printf("[augur-canis] %s subscription dropped — reconnecting in 2s", checkRequestsChannel)
-		sub.Close()
 		time.Sleep(2 * time.Second)
 	}
 }
@@ -258,9 +268,9 @@ func processCheckRequest(req CheckRequest) {
 	resultChannel := fmt.Sprintf("tca:check-results:%s", req.RequestID)
 
 	// Publish with TTL so orphaned results don't accumulate
-	pipe := rdb.Pipeline()
-	pipe.Set(ctx, resultChannel+"_data", payload, time.Duration(resultTTLSec)*time.Second)
-	pipe.Publish(ctx, resultChannel, payload)
+	pipe := rdb.NewPipeline()
+	pipe.Set(resultChannel+"_data", string(payload), time.Duration(resultTTLSec)*time.Second)
+	pipe.Publish(resultChannel, string(payload))
 	if _, err := pipe.Exec(ctx); err != nil {
 		log.Printf("[augur-canis] Failed to publish result for %s: %v", req.ServiceName, err)
 		return
@@ -290,39 +300,26 @@ func processCheckRequest(req CheckRequest) {
 // ---------------------------------------------------------------------------
 
 func recordHealthState(ctx context.Context, serviceName, containerID string, healthy int, latencyMs int64, now time.Time) {
-	pipe := rdb.Pipeline()
+	pipe := rdb.NewPipeline()
 
 	// Update last seen timestamp
-	pipe.Set(ctx, fmt.Sprintf(keyLastSeen, serviceName), now.UTC().Format(time.RFC3339), 0)
+	pipe.Set(fmt.Sprintf(keyLastSeen, serviceName), now.UTC().Format(time.RFC3339), 0)
 
 	// Track container ID for K8s replacement detection
-	pipe.Set(ctx, fmt.Sprintf(keyLastContainerID, serviceName), containerID, 0)
+	pipe.Set(fmt.Sprintf(keyLastContainerID, serviceName), containerID, 0)
 
 	// Latency stream — time-series samples for UI and detectors
-	// XADD auto-generates a millisecond timestamp as the stream ID
-	pipe.XAdd(ctx, &redis.XAddArgs{
-		Stream: fmt.Sprintf(keyLatencyStream, serviceName),
-		MaxLen: metricsStreamMaxLen,
-		Approx: true,
-		ID:     "*",
-		Values: map[string]interface{}{
-			"latency_ms":  latencyMs,
-			"service":     serviceName,
-			"container_id": containerID,
-		},
+	pipe.XAdd(fmt.Sprintf(keyLatencyStream, serviceName), metricsStreamMaxLen, map[string]string{
+		"latency_ms":   fmt.Sprintf("%d", latencyMs),
+		"service":      serviceName,
+		"container_id": containerID,
 	})
 
 	// Health stream — 0/1 samples for failure rate detector and UI
-	pipe.XAdd(ctx, &redis.XAddArgs{
-		Stream: fmt.Sprintf(keyHealthStream, serviceName),
-		MaxLen: metricsStreamMaxLen,
-		Approx: true,
-		ID:     "*",
-		Values: map[string]interface{}{
-			"healthy":     healthy,
-			"service":     serviceName,
-			"container_id": containerID,
-		},
+	pipe.XAdd(fmt.Sprintf(keyHealthStream, serviceName), metricsStreamMaxLen, map[string]string{
+		"healthy":      fmt.Sprintf("%d", healthy),
+		"service":      serviceName,
+		"container_id": containerID,
 	})
 
 	pipe.Exec(ctx)
@@ -342,8 +339,8 @@ func checkContainerReplacement(ctx context.Context, serviceName, currentContaine
 
 	// Get the container ID from the previous check
 	prevKey := fmt.Sprintf(keyLastContainerID, serviceName) + ":prev"
-	prev, err := rdb.Get(ctx, prevKey).Result()
-	if err == redis.Nil {
+	prev, ok, err := rdb.Get(ctx, prevKey)
+	if !ok {
 		// First check for this service — store and return
 		rdb.Set(ctx, prevKey, currentContainerID, 0)
 		return
@@ -359,7 +356,7 @@ func checkContainerReplacement(ctx context.Context, serviceName, currentContaine
 
 		// Auto-resolve any active alert for this service
 		alertActiveKey := fmt.Sprintf(keyAlertActive, serviceName)
-		isActive, _ := rdb.Get(ctx, alertActiveKey).Result()
+		isActive, _, _ := rdb.Get(ctx, alertActiveKey)
 		if isActive == "1" {
 			resolveAlert(ctx, serviceName, "container_replaced")
 		}
@@ -404,13 +401,17 @@ func handleContractTestRequests() {
 	ctx := context.Background()
 
 	for {
-		sub := rdb.Subscribe(ctx, contractRequestsChannel)
-		ch := sub.Channel()
+		ch, err := rdb.Subscribe(ctx, contractRequestsChannel)
+		if err != nil {
+			log.Printf("[augur-canis] Failed to subscribe to %s: %v — retrying in 2s", contractRequestsChannel, err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
 		log.Printf("[augur-canis] Subscribed to %s", contractRequestsChannel)
 
 		for msg := range ch {
 			var req ContractTestRequest
-			if err := json.Unmarshal([]byte(msg.Payload), &req); err != nil {
+			if err := json.Unmarshal([]byte(msg), &req); err != nil {
 				log.Printf("[augur-canis] Failed to parse contract test request: %v", err)
 				continue
 			}
@@ -424,7 +425,6 @@ func handleContractTestRequests() {
 		}
 
 		log.Printf("[augur-canis] %s subscription dropped — reconnecting in 2s", contractRequestsChannel)
-		sub.Close()
 		time.Sleep(2 * time.Second)
 	}
 }
@@ -563,12 +563,12 @@ func executeContractTest(req ContractTestRequest) {
 
 func publishContractTestResult(ctx context.Context, result ContractTestResult) {
 	payload, _ := json.Marshal(result)
-	pipe := rdb.Pipeline()
+	pipe := rdb.NewPipeline()
 	// Publish for Contract Test Job subscriber
-	pipe.Publish(ctx, contractResultsChannel, payload)
+	pipe.Publish(contractResultsChannel, string(payload))
 	// Also store with TTL for late subscribers
-	pipe.Set(ctx, fmt.Sprintf("tca:contract-result:%s", result.RequestID),
-		payload, contractResultTTL)
+	pipe.Set(fmt.Sprintf("tca:contract-result:%s", result.RequestID),
+		string(payload), contractResultTTL)
 	pipe.Exec(ctx)
 }
 
@@ -589,8 +589,8 @@ func getRegisteredJob(ctx context.Context, serviceName string) (*RegisteredJobRe
 	}
 	// Fall back to Redis for jobs registered via the admin API
 	key := fmt.Sprintf("ac:job:%s", serviceName)
-	data, err := rdb.Get(ctx, key).Result()
-	if err == redis.Nil {
+	data, ok, err := rdb.Get(ctx, key)
+	if !ok {
 		return nil, fmt.Errorf("job %s not registered", serviceName)
 	}
 	if err != nil {
@@ -614,15 +614,15 @@ func getRegisteredJob(ctx context.Context, serviceName string) (*RegisteredJobRe
 // for the first health check cycle after each service comes up.
 func loadPersistedJobs() {
 	ctx := context.Background()
-	keys, err := rdb.Keys(ctx, "ac:job:*").Result()
+	keys, err := rdb.Keys(ctx, "ac:job:*")
 	if err != nil {
 		log.Printf("[augur-canis] Could not load persisted jobs from Redis: %v", err)
 		return
 	}
 	loaded := 0
 	for _, key := range keys {
-		data, err := rdb.Get(ctx, key).Result()
-		if err != nil {
+		data, ok, err := rdb.Get(ctx, key)
+		if !ok || err != nil {
 			continue
 		}
 		var job RegisteredJobRecord
@@ -659,7 +659,7 @@ func checkSilence() {
 	threshold := time.Duration(silenceThresholdSec) * time.Second
 
 	// Find all tracked services
-	keys, err := rdb.Keys(ctx, "ac:state:*:last_seen").Result()
+	keys, err := rdb.Keys(ctx, "ac:state:*:last_seen")
 	if err != nil {
 		return
 	}
@@ -676,8 +676,8 @@ func checkSilence() {
 			continue
 		}
 
-		lastSeenStr, err := rdb.Get(ctx, key).Result()
-		if err != nil {
+		lastSeenStr, ok, err := rdb.Get(ctx, key)
+		if !ok || err != nil {
 			continue
 		}
 
@@ -688,7 +688,7 @@ func checkSilence() {
 
 		silent := time.Since(lastSeen) > threshold
 		alertActiveKey := fmt.Sprintf(keyAlertActive, serviceName)
-		isActive, _ := rdb.Get(ctx, alertActiveKey).Result()
+		isActive, _, _ := rdb.Get(ctx, alertActiveKey)
 
 		if silent && isActive != "1" {
 			// New silence — fire initial alert
@@ -703,7 +703,7 @@ func checkSilence() {
 
 		} else if !silent && isActive == "1" {
 			// Condition cleared — auto-resolve
-			alertTypeStr, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertType, serviceName)).Result()
+			alertTypeStr, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertType, serviceName))
 			if AlertType(alertTypeStr) == AlertSilence {
 				resolveAlert(ctx, serviceName, "condition_cleared")
 			}
@@ -724,15 +724,15 @@ func fireAlert(ctx context.Context, serviceName string, alertType AlertType, sev
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	// Set alert state in Redis
-	pipe := rdb.Pipeline()
-	pipe.Set(ctx, fmt.Sprintf(keyAlertActive, serviceName), "1", 0)
-	pipe.Set(ctx, fmt.Sprintf(keyAlertID, serviceName), alertID, 0)
-	pipe.Set(ctx, fmt.Sprintf(keyAlertType, serviceName), string(alertType), 0)
-	pipe.Set(ctx, fmt.Sprintf(keyBarkCount, serviceName), "1", 0)
-	pipe.Set(ctx, fmt.Sprintf(keyLastBarkAt, serviceName), now, 0)
-	pipe.Set(ctx, fmt.Sprintf(keyAlertFirstAt, serviceName), now, 0)
+	pipe := rdb.NewPipeline()
+	pipe.Set(fmt.Sprintf(keyAlertActive, serviceName), "1", 0)
+	pipe.Set(fmt.Sprintf(keyAlertID, serviceName), alertID, 0)
+	pipe.Set(fmt.Sprintf(keyAlertType, serviceName), string(alertType), 0)
+	pipe.Set(fmt.Sprintf(keyBarkCount, serviceName), "1", 0)
+	pipe.Set(fmt.Sprintf(keyLastBarkAt, serviceName), now, 0)
+	pipe.Set(fmt.Sprintf(keyAlertFirstAt, serviceName), now, 0)
 	// Store reverse lookup: alert_id → service_name
-	pipe.Set(ctx, fmt.Sprintf(keyAlertByID, alertID), serviceName,
+	pipe.Set(fmt.Sprintf(keyAlertByID, alertID), serviceName,
 		time.Duration(24)*time.Hour)
 	pipe.Exec(ctx)
 
@@ -754,12 +754,12 @@ func fireAlert(ctx context.Context, serviceName string, alertType AlertType, sev
 }
 
 func handleOngoingAlert(ctx context.Context, serviceName string) {
-	barkCountStr, _ := rdb.Get(ctx, fmt.Sprintf(keyBarkCount, serviceName)).Result()
+	barkCountStr, _, _ := rdb.Get(ctx, fmt.Sprintf(keyBarkCount, serviceName))
 	barkCount, _ := strconv.Atoi(barkCountStr)
-	lastBarkStr, _ := rdb.Get(ctx, fmt.Sprintf(keyLastBarkAt, serviceName)).Result()
-	alertID, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertID, serviceName)).Result()
-	alertTypeStr, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertType, serviceName)).Result()
-	firstAtStr, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertFirstAt, serviceName)).Result()
+	lastBarkStr, _, _ := rdb.Get(ctx, fmt.Sprintf(keyLastBarkAt, serviceName))
+	alertID, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertID, serviceName))
+	alertTypeStr, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertType, serviceName))
+	firstAtStr, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertFirstAt, serviceName))
 
 	now := time.Now().UTC()
 
@@ -807,19 +807,19 @@ func handleOngoingAlert(ctx context.Context, serviceName string) {
 }
 
 func resolveAlert(ctx context.Context, serviceName, resolutionType string) {
-	alertID, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertID, serviceName)).Result()
-	alertTypeStr, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertType, serviceName)).Result()
-	firstAtStr, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertFirstAt, serviceName)).Result()
+	alertID, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertID, serviceName))
+	alertTypeStr, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertType, serviceName))
+	firstAtStr, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertFirstAt, serviceName))
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	// Clear alert state
-	pipe := rdb.Pipeline()
-	pipe.Del(ctx, fmt.Sprintf(keyAlertActive, serviceName))
-	pipe.Del(ctx, fmt.Sprintf(keyAlertID, serviceName))
-	pipe.Del(ctx, fmt.Sprintf(keyAlertType, serviceName))
-	pipe.Del(ctx, fmt.Sprintf(keyBarkCount, serviceName))
-	pipe.Del(ctx, fmt.Sprintf(keyLastBarkAt, serviceName))
-	pipe.Del(ctx, fmt.Sprintf(keyAlertFirstAt, serviceName))
+	pipe := rdb.NewPipeline()
+	pipe.Del(fmt.Sprintf(keyAlertActive, serviceName))
+	pipe.Del(fmt.Sprintf(keyAlertID, serviceName))
+	pipe.Del(fmt.Sprintf(keyAlertType, serviceName))
+	pipe.Del(fmt.Sprintf(keyBarkCount, serviceName))
+	pipe.Del(fmt.Sprintf(keyLastBarkAt, serviceName))
+	pipe.Del(fmt.Sprintf(keyAlertFirstAt, serviceName))
 	pipe.Exec(ctx)
 
 	_ = alertTypeStr // recorded for audit; resolved bark always uses AlertResolved type
@@ -840,7 +840,7 @@ func resolveAlert(ctx context.Context, serviceName, resolutionType string) {
 
 func bark(ctx context.Context, alert Alert) {
 	payload, _ := json.Marshal(alert)
-	if err := rdb.Publish(ctx, alertsChannel, payload).Err(); err != nil {
+	if err := rdb.Publish(ctx, alertsChannel, string(payload)); err != nil {
 		log.Printf("[augur-canis] Failed to publish alert: %v", err)
 	}
 }
@@ -851,8 +851,8 @@ func bark(ctx context.Context, alert Alert) {
 
 func acknowledgeAlert(ctx context.Context, alertID, acknowledgedBy, note string) error {
 	// Look up service name from alert ID
-	serviceName, err := rdb.Get(ctx, fmt.Sprintf(keyAlertByID, alertID)).Result()
-	if err == redis.Nil {
+	serviceName, ok, err := rdb.Get(ctx, fmt.Sprintf(keyAlertByID, alertID))
+	if !ok {
 		return fmt.Errorf("alert %s not found or already resolved", alertID)
 	}
 	if err != nil {
@@ -860,7 +860,7 @@ func acknowledgeAlert(ctx context.Context, alertID, acknowledgedBy, note string)
 	}
 
 	// Verify this alert is still active for this service
-	activeAlertID, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertID, serviceName)).Result()
+	activeAlertID, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertID, serviceName))
 	if activeAlertID != alertID {
 		return fmt.Errorf("alert %s is no longer the active alert for %s", alertID, serviceName)
 	}
@@ -871,8 +871,8 @@ func acknowledgeAlert(ctx context.Context, alertID, acknowledgedBy, note string)
 	rdb.Set(ctx, fmt.Sprintf(keyBarkCount, serviceName), "acknowledged", 0)
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	alertTypeStr, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertType, serviceName)).Result()
-	firstAtStr, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertFirstAt, serviceName)).Result()
+	alertTypeStr, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertType, serviceName))
+	firstAtStr, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertFirstAt, serviceName))
 
 	bark(context.Background(), Alert{
 		AlertID:       alertID,
@@ -896,13 +896,13 @@ func acknowledgeAlert(ctx context.Context, alertID, acknowledgedBy, note string)
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
-	redisOK := rdb.Ping(ctx).Err() == nil
+	redisOK := rdb.Ping(ctx) == nil
 
 	// Count active alerts
-	alertKeys, _ := rdb.Keys(ctx, "ac:state:*:alert_active").Result()
+	alertKeys, _ := rdb.Keys(ctx, "ac:state:*:alert_active")
 	activeAlerts := 0
 	for _, k := range alertKeys {
-		v, _ := rdb.Get(ctx, k).Result()
+		v, _, _ := rdb.Get(ctx, k)
 		if v == "1" {
 			activeAlerts++
 		}
@@ -985,7 +985,7 @@ func handleAcknowledge(w http.ResponseWriter, r *http.Request) {
 func handleActiveAlerts(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 
-	alertKeys, _ := rdb.Keys(ctx, "ac:state:*:alert_id").Result()
+	alertKeys, _ := rdb.Keys(ctx, "ac:state:*:alert_id")
 	alerts := []map[string]interface{}{}
 
 	for _, key := range alertKeys {
@@ -998,16 +998,16 @@ func handleActiveAlerts(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		isActive, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertActive, serviceName)).Result()
+		isActive, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertActive, serviceName))
 		if isActive != "1" {
 			continue
 		}
 
-		alertID, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertID, serviceName)).Result()
-		alertTypeVal, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertType, serviceName)).Result()
-		barkCount, _ := rdb.Get(ctx, fmt.Sprintf(keyBarkCount, serviceName)).Result()
-		firstAt, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertFirstAt, serviceName)).Result()
-		lastBark, _ := rdb.Get(ctx, fmt.Sprintf(keyLastBarkAt, serviceName)).Result()
+		alertID, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertID, serviceName))
+		alertTypeVal, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertType, serviceName))
+		barkCount, _, _ := rdb.Get(ctx, fmt.Sprintf(keyBarkCount, serviceName))
+		firstAt, _, _ := rdb.Get(ctx, fmt.Sprintf(keyAlertFirstAt, serviceName))
+		lastBark, _, _ := rdb.Get(ctx, fmt.Sprintf(keyLastBarkAt, serviceName))
 
 		alerts = append(alerts, map[string]interface{}{
 			"alert_id":     alertID,
@@ -1074,7 +1074,7 @@ func handleJobs(w http.ResponseWriter, r *http.Request) {
 
 		// Also persist to Redis for durability across AC restarts
 		data, _ := json.Marshal(req)
-		rdb.Set(ctx, fmt.Sprintf("ac:job:%s", req.ServiceName), data, 0)
+		rdb.Set(ctx, fmt.Sprintf("ac:job:%s", req.ServiceName), string(data), 0)
 
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(req)
@@ -1100,7 +1100,7 @@ func handleChecksStub(w http.ResponseWriter, r *http.Request) {
 	service = strings.TrimSuffix(service, "/")
 
 	ctx := context.Background()
-	keys, err := rdb.Keys(ctx, "ac:contract-suite:*").Result()
+	keys, err := rdb.Keys(ctx, "ac:contract-suite:*")
 	if err != nil || len(keys) == 0 {
 		json.NewEncoder(w).Encode(map[string]interface{}{"checks": []interface{}{}, "service": service})
 		return
@@ -1113,8 +1113,8 @@ func handleChecksStub(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	raw, err := rdb.Get(ctx, latest).Result()
-	if err != nil {
+	raw, ok, err := rdb.Get(ctx, latest)
+	if !ok || err != nil {
 		json.NewEncoder(w).Encode(map[string]interface{}{"checks": []interface{}{}, "service": service})
 		return
 	}
@@ -1287,7 +1287,10 @@ func main() {
 	log.Printf("[augur-canis] Initial barks: %d", maxInitialBarks)
 	log.Printf("[augur-canis] Contract tests: %d tests, interval %ds", len(setiContractTests), contractTestIntervalSec)
 
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[augur-canis] Server error: %v", err)
-	}
+	go func() {
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[augur-canis] Server error: %v", err)
+		}
+	}()
+	awaitShutdown(server)
 }
