@@ -15,6 +15,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -68,21 +70,95 @@ func envOrInt(key string, def int) int {
 // ---------------------------------------------------------------------------
 
 type RemoteApp struct {
-	Name               string `json:"name"`
-	Description        string `json:"description"`
-	Namespace          string `json:"namespace"`
+	Name                string `json:"name"`
+	Description         string `json:"description"`
+	Namespace           string `json:"namespace"`
 	ACEndpoint          string `json:"ac_endpoint"`
 	FederationEndpoint  string `json:"federation_endpoint"`
 	CaURL               string `json:"ca_url"`
-	RegistryURL        string `json:"registry_url"`
-	RegistryType       string `json:"registry_type"`
-	RegistryToken      string `json:"registry_token"`
+	RegistryURL         string `json:"registry_url"`
+	RegistryPlotsPath   string `json:"registry_plots_path"`
+	RegistryType        string `json:"registry_type"`
+	RegistryToken       string `json:"registry_token"`
+	RegistryTokenSecret string `json:"registry_token_secret"`
 }
 
 var (
 	appsMu sync.RWMutex
 	apps   map[string]*RemoteApp
 )
+
+// readK8sSecret reads a single key from a Kubernetes Secret using the
+// in-cluster service account token and the K8s API server.
+func readK8sSecret(namespace, secretName, key string) (string, error) {
+	// Read in-cluster service account token
+	tokenBytes, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	if err != nil {
+		return "", fmt.Errorf("read service account token: %v", err)
+	}
+	saToken := strings.TrimSpace(string(tokenBytes))
+
+	// K8s API server address from environment
+	apiServer := os.Getenv("KUBERNETES_SERVICE_HOST")
+	apiPort := os.Getenv("KUBERNETES_SERVICE_PORT")
+	if apiServer == "" {
+		apiServer = "kubernetes.default.svc"
+		apiPort = "443"
+	}
+	url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/secrets/%s",
+		apiServer, apiPort, namespace, secretName)
+
+	// Read cluster CA for TLS verification
+	caPool := x509.NewCertPool()
+	caData, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+	if err != nil {
+		return "", fmt.Errorf("read cluster CA: %v", err)
+	}
+	caPool.AppendCertsFromPEM(caData)
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: caPool},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+saToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("GET secret: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		return "", fmt.Errorf("permission denied reading secret %s/%s — check RBAC", namespace, secretName)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return "", fmt.Errorf("secret %s/%s not found", namespace, secretName)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("K8s API returned %d for secret %s/%s", resp.StatusCode, namespace, secretName)
+	}
+
+	var secret struct {
+		Data map[string][]byte `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&secret); err != nil {
+		return "", fmt.Errorf("decode secret: %v", err)
+	}
+
+	// K8s stores secret values base64-encoded — Go's JSON decoder decodes them automatically
+	val, ok := secret.Data[key]
+	if !ok {
+		return "", fmt.Errorf("key %q not found in secret %s/%s", key, namespace, secretName)
+	}
+	return strings.TrimSpace(string(val)), nil
+}
 
 func loadRemoteApps() error {
 	data, err := os.ReadFile(remoteAppsPath)
@@ -99,6 +175,17 @@ func loadRemoteApps() error {
 		// Default namespace to tag name if not specified
 		if a.Namespace == "" {
 			a.Namespace = tag
+		}
+		// Load registry token from K8s Secret if specified
+		if a.RegistryTokenSecret != "" && a.RegistryToken == "" {
+			token, err := readK8sSecret("seti", a.RegistryTokenSecret, "token")
+			if err != nil {
+				log.Printf("[connie-agent] %s: could not read registry token secret %q: %v",
+					tag, a.RegistryTokenSecret, err)
+			} else {
+				a.RegistryToken = token
+				log.Printf("[connie-agent] %s: registry token loaded from secret %q", tag, a.RegistryTokenSecret)
+			}
 		}
 		loaded[tag] = &a
 	}
@@ -442,7 +529,7 @@ func handleConstellationProxy(w http.ResponseWriter, r *http.Request) {
 	tag, action := parts[0], parts[1]
 
 	appsMu.RLock()
-	_, ok := apps[tag]
+	app, ok := apps[tag]
 	appsMu.RUnlock()
 	if !ok {
 		http.Error(w, `{"error":"unknown constellation"}`, http.StatusNotFound)
@@ -450,6 +537,12 @@ func handleConstellationProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Forward to signal-aggregator which holds the trusted mTLS connection to remote AC
+	// Special case: request-token goes to remote AC's federation port via connie-agent directly
+	if action == "request-token" {
+		handleConstellationRequestToken(w, r, tag, app)
+		return
+	}
+
 	target := signalAggregatorURL + "/federation/proxy/" + tag + "/" + action
 	req, err := http.NewRequest(r.Method, target, r.Body)
 	if err != nil {
@@ -594,6 +687,50 @@ func cleanupStaleFederations() {
 
 // publishSilenceWarning publishes a warning to seti:alerts when federation
 // silence is detected on a constellation channel.
+// handleConstellationRequestToken requests a short-lived token from the remote AC
+// using the Star-Gazer signed request over the federation port.
+func handleConstellationRequestToken(w http.ResponseWriter, r *http.Request, tag string, app *RemoteApp) {
+	caPool, _, err := fetchConstellationCA(app.CaURL)
+	if err != nil {
+		http.Error(w, `{"error":"could not fetch constellation CA"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	// Use the SETI instance cert — registered as monitor cert with remote AC during handshake
+	monitorCert := certMat.InstanceCert
+	tlsCfg := &tls.Config{
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return &monitorCert, nil
+		},
+		RootCAs:    caPool,
+		MinVersion: tls.VersionTLS13,
+	}
+	client := &http.Client{
+		Transport: &http.Transport{TLSClientConfig: tlsCfg},
+		Timeout:   15 * time.Second,
+	}
+
+	tokenURL := app.ACEndpoint + "/auth/session-token"
+	req, err := http.NewRequest(http.MethodPost, tokenURL, r.Body)
+	if err != nil {
+		http.Error(w, `{"error":"could not build token request"}`, http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[connie-agent] %s: token request failed: %v", tag, err)
+		http.Error(w, `{"error":"token request failed"}`, http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
 func publishSilenceWarning(tag string) {
 	rdb := NewRedisClient(redisURL)
 	payload, _ := json.Marshal(map[string]interface{}{

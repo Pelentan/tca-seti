@@ -43,99 +43,27 @@ func envOr(key, def string) string {
 // ---------------------------------------------------------------------------
 
 // PlotCall mirrors the contract PlotCall schema — the HTTP action for a step.
-type PlotCall struct {
-	Method  string            `json:"method"`
-	Path    string            `json:"path"`
-	Headers map[string]string `json:"headers,omitempty"`
-	Body    interface{}       `json:"body,omitempty"`
-}
-
-// PlotAssertion defines a semantic assertion on a step's response body.
-type PlotAssertion struct {
-	Field    string      `json:"field"`
-	Operator string      `json:"operator"` // equals, not_equals, contains, exists, not_exists, greater_than, less_than
-	Value    interface{} `json:"value,omitempty"`
-}
-
-// CaptureDefinition extracts a value from the response for use in later steps.
-type CaptureDefinition struct {
-	Name string `json:"name"` // referenced as {name} in subsequent steps
-	Path string `json:"path"` // dot-notation into the response body
-}
-
-// ExpectedCall defines an inter-service call expected in the observability stream.
-type ExpectedCall struct {
-	Caller         string `json:"caller"`
-	Callee         string `json:"callee"`
-	Method         string `json:"method,omitempty"`
-	Path           string `json:"path,omitempty"`
-	MinOccurrences int    `json:"min_occurrences,omitempty"`
-}
-
-// PlotStep supports both the contract schema (Call wrapper) and the legacy flat format.
-// Normalize() must be called before execution to resolve whichever format is present.
+// PlotStep is the unified step schema for all plots — internal and external.
+// Steps are always executed in the order provided.
+// For internal plots, the remote AC uses Service to route to the right internal service.
+// For external plots, SETI executes steps directly against the remote gateway using Path.
 type PlotStep struct {
-	StepNumber  int    `json:"step_number"`
-	Description string `json:"description"`
-
-	// Contract schema — preferred
-	Call             *PlotCall           `json:"call,omitempty"`
-	ExpectStatus     int                 `json:"expect_status,omitempty"`
-	Assertions       []PlotAssertion     `json:"assertions,omitempty"`
-	Capture          []CaptureDefinition `json:"capture,omitempty"`
-	ExpectCallChain  []ExpectedCall      `json:"expect_call_chain,omitempty"`
-
-	// Legacy flat format — still accepted for backward compatibility
-	Method           string            `json:"method,omitempty"`
-	Path             string            `json:"path,omitempty"`
-	Headers          map[string]string `json:"headers,omitempty"`
-	Body             interface{}       `json:"body,omitempty"`
-	ExpectedStatus   int               `json:"expected_status,omitempty"`
-	ExpectedStatuses []int             `json:"expected_statuses,omitempty"` // any one match passes
-	ExpectedChain    []ExpectedCall    `json:"expected_chain,omitempty"`
-	VerifyWithin     int               `json:"verify_within_seconds,omitempty"`
+	Step           int               `json:"step"`
+	Service        string            `json:"service,omitempty"`   // remote AC internal routing
+	Method         string            `json:"method"`
+	Path           string            `json:"path"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	Body           interface{}       `json:"body,omitempty"`
+	ExpectedStatus int               `json:"expected_status"`
+	ExpectedFields []string          `json:"expected_fields,omitempty"`
+	ExtractFields  map[string]string `json:"extract_fields,omitempty"`
+	StopOnFailure  bool              `json:"stop_on_failure,omitempty"`
+	Notes          string            `json:"notes,omitempty"`
 }
 
 // Normalize resolves the dual-format PlotStep into canonical fields.
 // After calling this, Method/Path/Headers/Body/ExpectedStatus/ExpectedChain
 // are always populated regardless of which format the JSON used.
-func (s *PlotStep) Normalize(captures map[string]string) {
-	// Resolve call wrapper → flat fields
-	if s.Call != nil {
-		s.Method = s.Call.Method
-		s.Path = s.Call.Path
-		if s.Call.Headers != nil {
-			s.Headers = s.Call.Headers
-		}
-		if s.Call.Body != nil {
-			s.Body = s.Call.Body
-		}
-	}
-	// Resolve expect_status → expected_status
-	if s.ExpectStatus != 0 && s.ExpectedStatus == 0 {
-		s.ExpectedStatus = s.ExpectStatus
-	}
-	// Resolve expect_call_chain → expected_chain
-	if len(s.ExpectCallChain) > 0 && len(s.ExpectedChain) == 0 {
-		s.ExpectedChain = s.ExpectCallChain
-	}
-	// Apply capture substitutions to path and body
-	if len(captures) > 0 {
-		s.Path = applyCaptures(s.Path, captures)
-		if bodyStr, ok := s.Body.(string); ok {
-			s.Body = applyCaptures(bodyStr, captures)
-		}
-	}
-}
-
-// applyCaptures replaces {name} tokens in a string with captured values.
-func applyCaptures(s string, captures map[string]string) string {
-	for k, v := range captures {
-		s = strings.ReplaceAll(s, "{"+k+"}", v)
-	}
-	return s
-}
-
 type Plot struct {
 	PlotID        string     `json:"plot_id"`
 	ApplicationID string     `json:"application_id"`
@@ -143,6 +71,10 @@ type Plot struct {
 	Description   string     `json:"description"`
 	Version       string     `json:"version"`
 	Author        string     `json:"author"` // "ai-lien" or wrangler ID
+	ExecutionMode string     `json:"execution_mode,omitempty"` // "internal" | "external"
+	GatewayURL    string     `json:"gateway_url,omitempty"`
+	Constellation string     `json:"constellation,omitempty"` // preserved from remote plot file
+	Context       map[string]string `json:"context,omitempty"`  // initial variable values
 	Steps         []PlotStep `json:"steps"`
 	Tags          []string   `json:"tags,omitempty"`
 	Flagged       bool       `json:"flagged"`
@@ -237,17 +169,35 @@ func handlePlots(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
-		req.PlotID = generateID()
-		req.CreatedAt = now
-		req.UpdatedAt = now
 
+		// Upsert — find existing plot with same name + application_id
 		mu.Lock()
-		plots[req.PlotID] = &req
-		mu.Unlock()
-
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(req)
-		log.Printf("[plot-store] Plot created: %s (%s) for %s — %d steps", req.PlotID, req.Name, req.ApplicationID, len(req.Steps))
+		var existing *Plot
+		for _, p := range plots {
+			if p.Name == req.Name && p.ApplicationID == req.ApplicationID {
+				existing = p
+				break
+			}
+		}
+		if existing != nil {
+			req.PlotID = existing.PlotID
+			req.CreatedAt = existing.CreatedAt
+			req.UpdatedAt = now
+			plots[req.PlotID] = &req
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(req)
+			log.Printf("[plot-store] Plot updated: %s (%s) for %s — %d steps", req.PlotID, req.Name, req.ApplicationID, len(req.Steps))
+		} else {
+			req.PlotID = generateID()
+			req.CreatedAt = now
+			req.UpdatedAt = now
+			plots[req.PlotID] = &req
+			mu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(req)
+			log.Printf("[plot-store] Plot created: %s (%s) for %s — %d steps", req.PlotID, req.Name, req.ApplicationID, len(req.Steps))
+		}
 		reportEvent("self", "POST", "/plots", 201, time.Since(start).Milliseconds())
 
 	default:

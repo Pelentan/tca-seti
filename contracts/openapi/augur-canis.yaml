@@ -1191,3 +1191,76 @@ components:
   #             passed: bool, actual_status: int, expected_status: int,
   #             actual_response?: object, failure_reason?: string,
   #             latency_ms: int, executed_at: ISO8601 }
+
+  /plots/run:
+    post:
+      summary: Execute a plot synchronously and return complete run results
+      description: >
+        Accepts a plot definition, executes each step against internal services,
+        and returns a complete PlotRun result.  Protected by monitor cert mTLS.
+        This is a standard AC capability — all constellation ACs implement it.
+      operationId: runPlot
+      tags: [Plots]
+      x-tca-security:
+        transport: mTLS
+        client_cert: monitor_cert
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plot_id, constellation, steps]
+              properties:
+                plot_id:
+                  type: string
+                constellation:
+                  type: string
+                steps:
+                  type: array
+                  items:
+                    type: object
+                context:
+                  type: object
+                  additionalProperties:
+                    type: string
+      responses:
+        '200':
+          description: Plot run complete — full results included
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlotRun'
+        '400':
+          description: Invalid request or wrong constellation
+        '503':
+          description: Session not established
+
+  /auth/session-token:
+    post:
+      summary: Issue a short-lived service account token for external plot execution
+      description: >
+        Issues a scoped, short-lived JWT for SETI to use when executing external
+        plot steps against this constellation's gateway.  Protected by monitor cert mTLS.
+      operationId: issueSessionToken
+      tags: [Auth]
+      x-tca-security:
+        transport: mTLS
+        client_cert: monitor_cert
+      responses:
+        '200':
+          description: Short-lived token issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                  gateway_url:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+        '503':
+          description: Session not established

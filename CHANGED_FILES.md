@@ -1,5 +1,6 @@
-Date: 2026-04-28 UTC
-Feature: Always run initiateFederation on startup — ensures SA has monitor cert even after SA restart.
-         Silence monitoring handles ongoing re-initiation.
-Files Modified: 1
-  - connie-agent/main.go
+Date: 2026-05-01 UTC
+Feature: Unified PlotStep schema — single schema for internal and external plots
+         SETI plots using old Call/Assertions/ExpectedChain schema will fail until updated.
+Files Modified: 2
+  - plot-store/main.go
+  - plot-test/main.go

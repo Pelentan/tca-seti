@@ -16,7 +16,8 @@ data:
         "federation_endpoint": "https://augur-canis.tca-vox.svc.cluster.local:3052",
         "ca_url": "http://cert-forge.tca-vox.svc.cluster.local:3022/ca",
         "registry_url": "https://api.github.com/repos/Pelentan/tca-vox/contents",
+        "registry_plots_path": "contracts/plots",
         "registry_type": "github",
-        "registry_token_secret": ""
+        "registry_token_secret": "tca-vox-registry-token"
       }
     }

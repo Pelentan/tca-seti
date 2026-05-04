@@ -52,25 +52,27 @@ func envOr(key, def string) string {
 // Plot model (mirrors Plot Store)
 // ---------------------------------------------------------------------------
 
-// PlotCall mirrors the contract PlotCall schema.
-type PlotCall struct {
-	Method  string            `json:"method"`
-	Path    string            `json:"path"`
-	Headers map[string]string `json:"headers,omitempty"`
-	Body    interface{}       `json:"body,omitempty"`
+// PlotStep is the unified step schema for all plots — internal and external.
+// Steps are always executed in the order provided.
+type PlotStep struct {
+	Step           int               `json:"step"`
+	Service        string            `json:"service,omitempty"`
+	Method         string            `json:"method"`
+	Path           string            `json:"path"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	Body           interface{}       `json:"body,omitempty"`
+	ExpectedStatus int               `json:"expected_status"`
+	ExpectedFields []string          `json:"expected_fields,omitempty"`
+	ExtractFields  map[string]string `json:"extract_fields,omitempty"`
+	StopOnFailure  bool              `json:"stop_on_failure,omitempty"`
+	Notes          string            `json:"notes,omitempty"`
 }
 
-// PlotAssertion defines a semantic assertion on a step's response body.
+// PlotAssertion and ExpectedCall are internal types used by SETI's own plot execution.
 type PlotAssertion struct {
 	Field    string      `json:"field"`
 	Operator string      `json:"operator"`
 	Value    interface{} `json:"value,omitempty"`
-}
-
-// CaptureDefinition extracts a value from the response for later steps.
-type CaptureDefinition struct {
-	Name string `json:"name"`
-	Path string `json:"path"`
 }
 
 type ExpectedCall struct {
@@ -81,56 +83,16 @@ type ExpectedCall struct {
 	MinOccurrences int    `json:"min_occurrences,omitempty"`
 }
 
-// PlotStep supports both the contract schema (Call wrapper) and the legacy flat format.
-type PlotStep struct {
-	StepNumber  int    `json:"step_number"`
-	Description string `json:"description"`
-
-	// Contract schema — preferred
-	Call            *PlotCall           `json:"call,omitempty"`
-	ExpectStatus    int                 `json:"expect_status,omitempty"`
-	Assertions      []PlotAssertion     `json:"assertions,omitempty"`
-	Capture         []CaptureDefinition `json:"capture,omitempty"`
-	ExpectCallChain []ExpectedCall      `json:"expect_call_chain,omitempty"`
-
-	// Legacy flat format — backward compatible
-	Method           string            `json:"method,omitempty"`
-	Path             string            `json:"path,omitempty"`
-	Headers          map[string]string `json:"headers,omitempty"`
-	Body             interface{}       `json:"body,omitempty"`
-	ExpectedStatus   int               `json:"expected_status,omitempty"`
-	ExpectedStatuses []int             `json:"expected_statuses,omitempty"` // any one match passes; overrides expected_status
-	ExpectedChain    []ExpectedCall    `json:"expected_chain,omitempty"`
-	VerifyWithin     int               `json:"verify_within_seconds,omitempty"`
-}
-
-// Normalize resolves dual-format fields into canonical flat fields.
+// applyCaptures replaces {name} tokens in path and body string values.
 // Must be called before execution. Applies capture substitutions to path and body.
+// Normalize applies capture substitutions to path and body — called before execution.
 func (s *PlotStep) Normalize(captures map[string]string) {
-	if s.Call != nil {
-		s.Method = s.Call.Method
-		s.Path = s.Call.Path
-		if s.Call.Headers != nil {
-			s.Headers = s.Call.Headers
-		}
-		if s.Call.Body != nil {
-			s.Body = s.Call.Body
-		}
+	if len(captures) == 0 {
+		return
 	}
-	if s.ExpectStatus != 0 && s.ExpectedStatus == 0 {
-		s.ExpectedStatus = s.ExpectStatus
-	}
-	if len(s.ExpectCallChain) > 0 && len(s.ExpectedChain) == 0 {
-		s.ExpectedChain = s.ExpectCallChain
-	}
-	if len(captures) > 0 {
-		s.Path = applyCaptures(s.Path, captures)
-		if bodyStr, ok := s.Body.(string); ok {
-			s.Body = applyCaptures(bodyStr, captures)
-		}
-		for i := range s.ExpectedChain {
-			s.ExpectedChain[i].Path = applyCaptures(s.ExpectedChain[i].Path, captures)
-		}
+	s.Path = applyCaptures(s.Path, captures)
+	if bodyStr, ok := s.Body.(string); ok {
+		s.Body = applyCaptures(bodyStr, captures)
 	}
 }
 
@@ -220,11 +182,15 @@ func evaluateAssertion(a PlotAssertion, body interface{}) AssertionResult {
 }
 
 type Plot struct {
-	PlotID        string     `json:"plot_id"`
-	ApplicationID string     `json:"application_id"`
-	Name          string     `json:"name"`
-	Description   string     `json:"description"`
-	Steps         []PlotStep `json:"steps"`
+	PlotID        string            `json:"plot_id"`
+	ApplicationID string            `json:"application_id"`
+	Name          string            `json:"name"`
+	Description   string            `json:"description"`
+	ExecutionMode string            `json:"execution_mode,omitempty"`
+	GatewayURL    string            `json:"gateway_url,omitempty"`
+	Constellation string            `json:"constellation,omitempty"`
+	Context       map[string]string `json:"context,omitempty"`
+	Steps         []PlotStep        `json:"steps"`
 }
 
 // ---------------------------------------------------------------------------
@@ -472,34 +438,9 @@ func executeStep(applicationID string, step PlotStep, jwt string) (int, interfac
 // ---------------------------------------------------------------------------
 
 func verifyChain(applicationID string, after time.Time, step PlotStep) (bool, []ExpectedCall, []ExpectedCall) {
-	if len(step.ExpectedChain) == 0 {
-		return true, nil, nil
-	}
-
-	within := step.VerifyWithin
-	if within == 0 {
-		within = 30
-	}
-
-	var result struct {
-		Passed    bool           `json:"passed"`
-		Matched   []ExpectedCall `json:"matched"`
-		Unmatched []ExpectedCall `json:"unmatched"`
-	}
-
-	_, err := postJSON(signalAggURL+"/verify/call-chain", map[string]interface{}{
-		"application_id": applicationID,
-		"after":          after.UTC().Format(time.RFC3339Nano),
-		"within_seconds": within,
-		"expected_calls": step.ExpectedChain,
-	}, &result)
-
-	if err != nil {
-		log.Printf("[plot-test] Signal Aggregator verify failed: %v", err)
-		return false, nil, step.ExpectedChain
-	}
-
-	return result.Passed, result.Matched, result.Unmatched
+	// ExpectedChain is not part of the unified PlotStep schema.
+	// SETI's own plots that use call chain verification need to be updated.
+	return true, nil, nil
 }
 
 // isRetryable returns true for failures that are likely transient —
@@ -540,7 +481,7 @@ func executeStepWithRetry(applicationID string, step PlotStep, jwt string) (int,
 				reason = execErr.Error()
 			}
 			log.Printf("[plot-test] Step %d transient failure (attempt %d/%d): %s — retrying in %s",
-				step.StepNumber, attempt, stepMaxAttempts, reason, stepRetryInterval)
+				step.Step, attempt, stepMaxAttempts, reason, stepRetryInterval)
 			time.Sleep(stepRetryInterval)
 		}
 	}
@@ -552,6 +493,197 @@ func executeStepWithRetry(applicationID string, step PlotStep, jwt string) (int,
 		execErr = fmt.Errorf("retry_exhausted after %d attempts: last status %d", stepMaxAttempts, status)
 	}
 	return status, responseBody, latency, execErr, stepMaxAttempts
+}
+
+// executeRunRemoteInternal forwards the plot to the remote AC via signal-aggregator's
+// federation proxy.  The remote AC executes all steps and returns a PlotRun result.
+func executeRunRemoteInternal(run *PlotRun, plot Plot, applicationID string) *PlotRun {
+	log.Printf("[plot-test] Executing plot %s on remote AC %s (internal mode)", plot.PlotID, applicationID)
+
+	proxyURL := fmt.Sprintf("%s/federation/proxy/%s/plots/run", signalAggURL, applicationID)
+
+	// Wrap in PlotRunRequest format expected by remote AC
+	plotRunReq := map[string]interface{}{
+		"plot_id":       plot.PlotID,
+		"constellation": applicationID,
+		"steps":         plot.Steps,
+		"context":       plot.Context,
+	}
+
+	var remoteRun PlotRun
+	status, err := postJSON(proxyURL, plotRunReq, &remoteRun)
+	if err != nil || status != http.StatusOK {
+		run.Status = "error"
+		run.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+		log.Printf("[plot-test] Remote AC execution failed for %s: status %d err %v", applicationID, status, err)
+		postJSON(resultsURL+"/plot-results", run, nil)
+		return run
+	}
+
+	// Merge remote run result — preserve our run ID but use remote step results
+	run.Status = remoteRun.Status
+	run.PassedSteps = remoteRun.PassedSteps
+	run.FailedSteps = remoteRun.FailedSteps
+	run.TotalSteps = remoteRun.TotalSteps
+	run.Steps = remoteRun.Steps
+	run.CompletedAt = remoteRun.CompletedAt
+	if run.CompletedAt == "" {
+		run.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+
+	runsMu.Lock()
+	runs[run.RunID] = run
+	runsMu.Unlock()
+
+	postJSON(resultsURL+"/plot-results", run, nil)
+	log.Printf("[plot-test] Remote plot %s completed: %s (%d/%d steps passed)",
+		plot.PlotID, run.Status, run.PassedSteps, run.TotalSteps)
+	return run
+}
+
+// executeRunRemoteExternal requests a short-lived token from connie-agent and
+// executes plot steps directly against the remote gateway.
+func executeRunRemoteExternal(run *PlotRun, plot Plot, applicationID string) *PlotRun {
+	log.Printf("[plot-test] Executing plot %s on remote gateway %s (external mode)", plot.PlotID, applicationID)
+
+	// Request a fresh token from connie-agent
+	connieURL := envOr("CONNIE_AGENT_URL", "https://connie-agent:4014")
+	var tokenResp map[string]interface{}
+	status, err := postJSON(fmt.Sprintf("%s/constellations/%s/request-token", connieURL, applicationID), nil, &tokenResp)
+	if err != nil || status != http.StatusOK {
+		run.Status = "error"
+		run.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+		log.Printf("[plot-test] Could not get token for %s: status %d err %v", applicationID, status, err)
+		postJSON(resultsURL+"/plot-results", run, nil)
+		return run
+	}
+
+	jwt, _ := tokenResp["token"].(string)
+	if jwt == "" {
+		run.Status = "error"
+		run.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+		log.Printf("[plot-test] Empty token returned for %s", applicationID)
+		postJSON(resultsURL+"/plot-results", run, nil)
+		return run
+	}
+
+	// Use the plot's gateway_url or fall back to connie response
+	gatewayURL := plot.GatewayURL
+	if g, ok := tokenResp["gateway_url"].(string); ok && g != "" && gatewayURL == "" {
+		gatewayURL = g
+	}
+	if gatewayURL == "" {
+		run.Status = "error"
+		run.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+		log.Printf("[plot-test] No gateway_url for external plot %s", plot.PlotID)
+		postJSON(resultsURL+"/plot-results", run, nil)
+		return run
+	}
+
+	// Execute steps against the remote gateway — same as local execution
+	// but using the remote gateway URL and the fresh token
+	captures := map[string]string{}
+	for _, step := range plot.Steps {
+		stepStart := time.Now()
+		step.Normalize(captures)
+
+		actualStatus, responseBody, latency, execErr, attempts := executeStepAgainstGateway(gatewayURL, step, jwt)
+
+		stepResult := StepResult{
+			StepNumber:     step.Step,
+			Description:    fmt.Sprintf("%s %s → %d", step.Method, step.Path, step.ExpectedStatus),
+			ExpectedStatus: step.ExpectedStatus,
+			ActualStatus:   actualStatus,
+			LatencyMs:      latency,
+			AttemptsCount:  attempts,
+			ExecutedAt:     stepStart.UTC().Format(time.RFC3339),
+			RequestMethod:  step.Method,
+			RequestBody:    step.Body,
+			ResponseBody:   responseBody,
+		}
+
+		passed := execErr == nil && actualStatus == step.ExpectedStatus
+		stepResult.Passed = passed
+		if !passed {
+			if execErr != nil {
+				stepResult.FailureReason = execErr.Error()
+			} else {
+				stepResult.FailureReason = fmt.Sprintf("expected %d got %d", step.ExpectedStatus, actualStatus)
+			}
+		}
+
+		// Extract captures using extract_fields map
+		if passed && len(step.ExtractFields) > 0 {
+			if bodyMap, ok := responseBody.(map[string]interface{}); ok {
+				for field, as := range step.ExtractFields {
+					if val, ok := bodyMap[field]; ok {
+						captures[as] = fmt.Sprintf("%v", val)
+					}
+				}
+			}
+		}
+
+		run.Steps = append(run.Steps, stepResult)
+		if passed {
+			run.PassedSteps++
+		} else {
+			run.FailedSteps++
+			break // stop on first failure for external plots
+		}
+	}
+
+	if run.FailedSteps > 0 {
+		run.Status = "failed"
+	} else {
+		run.Status = "passed"
+	}
+	run.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+
+	runsMu.Lock()
+	runs[run.RunID] = run
+	runsMu.Unlock()
+
+	postJSON(resultsURL+"/plot-results", run, nil)
+	log.Printf("[plot-test] External plot %s completed: %s (%d/%d steps passed)",
+		plot.PlotID, run.Status, run.PassedSteps, run.TotalSteps)
+	return run
+}
+
+// executeStepAgainstGateway executes a single plot step against a specific gateway URL.
+func executeStepAgainstGateway(gatewayURL string, step PlotStep, jwt string) (int, interface{}, int64, error, int) {
+	targetURL := strings.TrimRight(gatewayURL, "/") + step.Path
+
+	var bodyReader io.Reader
+	if step.Body != nil {
+		bodyBytes, _ := json.Marshal(step.Body)
+		bodyReader = bytes.NewReader(bodyBytes)
+	}
+
+	req, err := http.NewRequest(step.Method, targetURL, bodyReader)
+	if err != nil {
+		return 0, nil, 0, fmt.Errorf("build request: %v", err), 1
+	}
+	if jwt != "" {
+		req.Header.Set("Authorization", "Bearer "+jwt)
+	}
+	if step.Body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range step.Headers {
+		req.Header.Set(k, v)
+	}
+
+	start := time.Now()
+	resp, err := upstreamClient.Do(req)
+	latency := time.Since(start).Milliseconds()
+	if err != nil {
+		return 0, nil, latency, fmt.Errorf("request failed: %v", err), 1
+	}
+	defer resp.Body.Close()
+
+	var respBody interface{}
+	json.NewDecoder(resp.Body).Decode(&respBody)
+	return resp.StatusCode, respBody, latency, nil, 1
 }
 
 func executeRun(plotID, applicationID string) *PlotRun {
@@ -582,6 +714,24 @@ func executeRun(plotID, applicationID string) *PlotRun {
 	run.PlotName = plot.Name
 	run.TotalSteps = len(plot.Steps)
 
+	// Route based on execution mode
+	executionMode := plot.ExecutionMode
+	if executionMode == "" {
+		executionMode = "internal"
+	}
+
+	// For remote constellations, route through the appropriate execution path
+	if applicationID != "seti" && applicationID != "" {
+		switch executionMode {
+		case "internal":
+			// Forward to remote AC via signal-aggregator federation proxy
+			return executeRunRemoteInternal(run, plot, applicationID)
+		case "external":
+			// Execute directly against remote gateway with fresh token
+			return executeRunRemoteExternal(run, plot, applicationID)
+		}
+	}
+
 	// Get service account JWT for authenticated requests
 	var tokenData map[string]interface{}
 	jwt := ""
@@ -604,8 +754,8 @@ func executeRun(plotID, applicationID string) *PlotRun {
 		actualStatus, responseBody, latency, execErr, attempts := executeStepWithRetry(applicationID, step, jwt)
 
 		stepResult := StepResult{
-			StepNumber:     step.StepNumber,
-			Description:    step.Description,
+			StepNumber:     step.Step,
+			Description:    step.Notes,
 			ExpectedStatus: step.ExpectedStatus,
 			ActualStatus:   actualStatus,
 			LatencyMs:      latency,
@@ -615,25 +765,10 @@ func executeRun(plotID, applicationID string) *PlotRun {
 			RequestBody:    step.Body,
 			ResponseBody:   responseBody,
 		}
-		// When only expected_statuses is used, populate ExpectedStatus with
-		// the actual status if it matched (so the UI shows a clean pass),
-		// or the first listed value if it didn't (so the UI shows a real mismatch).
-		if step.ExpectedStatus == 0 && len(step.ExpectedStatuses) > 0 {
-			matched := false
-			for _, s := range step.ExpectedStatuses {
-				if actualStatus == s {
-					stepResult.ExpectedStatus = actualStatus
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				stepResult.ExpectedStatus = step.ExpectedStatuses[0]
-			}
-		}
+
 
 		if attempts > 1 {
-			log.Printf("[plot-test] Step %d required %d attempts", step.StepNumber, attempts)
+			log.Printf("[plot-test] Step %d required %d attempts", step.Step, attempts)
 		}
 
 		if execErr != nil {
@@ -642,38 +777,18 @@ func executeRun(plotID, applicationID string) *PlotRun {
 			stepResult.FailureReason = execErr.Error()
 		} else {
 			statusPassed := actualStatus == step.ExpectedStatus
-		if !statusPassed && len(step.ExpectedStatuses) > 0 {
-			for _, s := range step.ExpectedStatuses {
-				if actualStatus == s {
-					statusPassed = true
-					break
-				}
-			}
-		}
 
 			// Extract capture values from response body for use in subsequent steps
-			for _, cap := range step.Capture {
-				if val, found := resolvePath(responseBody, cap.Path); found {
-					captures[cap.Name] = fmt.Sprintf("%v", val)
-					log.Printf("[plot-test] Step %d captured %s = %v", step.StepNumber, cap.Name, val)
+			if len(step.ExtractFields) > 0 {
+				if bodyMap, ok := responseBody.(map[string]interface{}); ok {
+					for field, as := range step.ExtractFields {
+						if val, ok := bodyMap[field]; ok {
+							captures[as] = fmt.Sprintf("%v", val)
+							log.Printf("[plot-test] Step %d captured %s = %v", step.Step, as, val)
+						}
+					}
 				}
 			}
-
-			// Evaluate semantic assertions on response body
-			var assertionResults []AssertionResult
-			assertionsPassed, assertionsFailed := 0, 0
-			for _, assertion := range step.Assertions {
-				ar := evaluateAssertion(assertion, responseBody)
-				assertionResults = append(assertionResults, ar)
-				if ar.Passed {
-					assertionsPassed++
-				} else {
-					assertionsFailed++
-				}
-			}
-			stepResult.AssertionResults = assertionResults
-			stepResult.AssertionsPassed = assertionsPassed
-			stepResult.AssertionsFailed = assertionsFailed
 
 			// Brief delay to allow observability events to propagate
 			time.Sleep(500 * time.Millisecond)
@@ -684,18 +799,10 @@ func executeRun(plotID, applicationID string) *PlotRun {
 			stepResult.ChainMatched = matched
 			stepResult.ChainUnmatched = unmatched
 
-			assertionsPassed2 := assertionsFailed == 0
-			stepResult.Passed = statusPassed && chainPassed && assertionsPassed2
+			stepResult.Passed = statusPassed && chainPassed
 			if !statusPassed {
-				if len(step.ExpectedStatuses) > 0 {
-					stepResult.FailureReason = fmt.Sprintf("Expected one of %v, got %d",
-						step.ExpectedStatuses, actualStatus)
-				} else {
-					stepResult.FailureReason = fmt.Sprintf("Expected status %d, got %d",
-						step.ExpectedStatus, actualStatus)
-				}
-			} else if !assertionsPassed2 {
-				stepResult.FailureReason = fmt.Sprintf("%d assertion(s) failed", assertionsFailed)
+				stepResult.FailureReason = fmt.Sprintf("Expected status %d, got %d",
+					step.ExpectedStatus, actualStatus)
 			} else if !chainPassed {
 				stepResult.FailureReason = fmt.Sprintf("%d expected call(s) not observed in event stream",
 					len(unmatched))
@@ -714,7 +821,7 @@ func executeRun(plotID, applicationID string) *PlotRun {
 		writeStepWhiff(applicationID, runID, step, stepResult)
 
 		log.Printf("[plot-test] Step %d/%d (%s): passed=%v status=%d assertions=%d/%d chain=%v latency=%dms",
-			step.StepNumber, run.TotalSteps, step.Description,
+			step.Step, run.TotalSteps, step.Notes,
 			stepResult.Passed, actualStatus,
 			stepResult.AssertionsPassed, stepResult.AssertionsPassed+stepResult.AssertionsFailed,
 			stepResult.ChainPassed, latency)

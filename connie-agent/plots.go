@@ -59,7 +59,11 @@ func authHeader(app *RemoteApp) string {
 
 // listPlotFiles returns all .json files in contracts/plots/ from the repository.
 func listPlotFiles(app *RemoteApp) ([]repoFile, error) {
-	url := strings.TrimRight(app.RegistryURL, "/") + "/" + plotsSubPath
+	plotsPath := app.RegistryPlotsPath
+	if plotsPath == "" {
+		plotsPath = plotsSubPath
+	}
+	url := strings.TrimRight(app.RegistryURL, "/") + "/" + plotsPath
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -188,7 +192,15 @@ func syncPlots(tag string, app *RemoteApp) (int, error) {
 			continue
 		}
 
-		if err := postToPlotStore(content); err != nil {
+		// Inject application_id from the constellation tag
+		check["application_id"] = tag
+		enriched, err := json.Marshal(check)
+		if err != nil {
+			log.Printf("[connie-agent] %s: failed to re-marshal %s: %v", tag, f.Name, err)
+			continue
+		}
+
+		if err := postToPlotStore(enriched); err != nil {
 			log.Printf("[connie-agent] %s: failed to post %s to plot-store: %v", tag, f.Name, err)
 			continue
 		}

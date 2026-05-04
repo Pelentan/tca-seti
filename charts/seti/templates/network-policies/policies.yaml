@@ -403,6 +403,9 @@ spec:
         - podSelector:
             matchLabels:
               app: augur-canis
+        - podSelector:
+            matchLabels:
+              app: connie-agent
       ports:
         - port: {{ .Values.plotStore.port }}
 ---

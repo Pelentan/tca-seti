@@ -353,3 +353,20 @@ components:
           description: Contract suite detail
         '404':
           description: Unknown constellation or run
+
+  /constellations/{tag}/request-token:
+    post:
+      summary: Request a short-lived token from a remote constellation's AC
+      operationId: requestConstellationToken
+      tags: [Constellations]
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Token issued
+        '503':
+          description: Could not authenticate with remote AC
