@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +31,20 @@ var (
 	observabilityURL = envOr("OBSERVABILITY_URL", "https://seti-observability:4011")
 	plotsPath        = envOr("PLOTS_PATH", "/contracts/plots")
 )
+
+func validateHTTPSURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %v", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("URL scheme must be https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("URL must include a host")
+	}
+	return nil
+}
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -516,6 +531,11 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 			"code":    "INVALID_REQUEST",
 			"message": "registry_url, registry_type, and registry_token required",
 		})
+		return
+	}
+	if err := validateHTTPSURL(req.RegistryURL); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_ENDPOINT", "message": "registry_url: " + err.Error()})
 		return
 	}
 	if req.RegistryType == "" {

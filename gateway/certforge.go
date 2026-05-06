@@ -55,7 +55,7 @@ func obtainCerts(serviceName string) *CertMaterial {
 	caCertPEM := fetchCACert(forgeURL)
 	sans      := buildSANs(serviceName, instanceID)
 	certPEM, keyPEM, fingerprint, instanceCN, validUntil :=
-		requestInstanceCert(enrollURL, enrollCert, enrollKey, serviceName, instanceID, sans)
+		requestInstanceCert(enrollURL, enrollCert, enrollKey, serviceName, instanceID, caCertPEM, sans)
 
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
@@ -131,7 +131,7 @@ func fetchCACert(forgeURL string) []byte {
 	return nil
 }
 
-func requestInstanceCert(enrollURL, enrollCertPath, enrollKeyPath, serviceName, instanceID string, sans []string) ([]byte, []byte, string, string, time.Time) {
+func requestInstanceCert(enrollURL, enrollCertPath, enrollKeyPath, serviceName, instanceID string, caCertPEM []byte, sans []string) ([]byte, []byte, string, string, time.Time) {
 	enrollTLSCert, err := tls.LoadX509KeyPair(enrollCertPath, enrollKeyPath)
 	if err != nil {
 		log.Fatalf("[certforge] Cannot load enrollment cert %s: %v", enrollCertPath, err)
@@ -139,11 +139,19 @@ func requestInstanceCert(enrollURL, enrollCertPath, enrollKeyPath, serviceName, 
 
 	client := &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				Certificates:       []tls.Certificate{enrollTLSCert},
-				InsecureSkipVerify: true,
-				MinVersion:         tls.VersionTLS13,
-			},
+			TLSClientConfig: func() *tls.Config {
+				cfg := &tls.Config{
+					Certificates: []tls.Certificate{enrollTLSCert},
+					MinVersion:   tls.VersionTLS13,
+				}
+				pool := x509.NewCertPool()
+				if pool.AppendCertsFromPEM(caCertPEM) {
+					cfg.RootCAs = pool
+				} else {
+					log.Printf("[certforge] WARNING: could not parse CA cert for enrollment — proceeding without server verification")
+				}
+				return cfg
+			}(),
 		},
 		Timeout: 10 * time.Second,
 	}

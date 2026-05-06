@@ -173,7 +173,7 @@ func requestSessionCert(sessionInstanceID string) *CertMaterial {
 	enrollURL   := deriveEnrollmentURL(forgeURL, enrollPort)
 
 	certPEM, keyPEM, fingerprint, instanceCN, validUntil :=
-		requestInstanceCert(enrollURL, enrollCert, enrollKey, "augur-canis-session", sessionInstanceID)
+		requestInstanceCert(enrollURL, enrollCert, enrollKey, "augur-canis-session", sessionInstanceID, certMat.CACertPEM)
 	if certPEM == nil {
 		return nil
 	}

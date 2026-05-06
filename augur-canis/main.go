@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -85,6 +86,20 @@ var (
 	// Active alerts stored by alert_id for acknowledgment lookup
 	keyAlertByID = "ac:alert:%s" // ac:alert:{alert_id} → service_name
 )
+
+func validateHTTPSURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %v", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("URL scheme must be https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("URL must include a host")
+	}
+	return nil
+}
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -1067,6 +1082,11 @@ func handleJobs(w http.ResponseWriter, r *http.Request) {
 		if req.ServiceName == "" || req.NetworkEndpoint == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_REQUEST", "message": "service_name and network_endpoint required"})
+			return
+		}
+		if err := validateHTTPSURL(req.NetworkEndpoint); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_ENDPOINT", "message": "network_endpoint: " + err.Error()})
 			return
 		}
 		req.RegisteredAt = time.Now().UTC().Format(time.RFC3339)

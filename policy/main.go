@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -32,6 +33,20 @@ var (
 	jwtSecret        = mustReadSecretFile("JWT_SECRET_FILE")
 	signalAggURL     = envOr("SIGNAL_AGGREGATOR_URL", "https://signal-aggregator:4006")
 )
+
+func validateHTTPSURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %v", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("URL scheme must be https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("URL must include a host")
+	}
+	return nil
+}
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -972,6 +987,20 @@ func handleAvailableApplication(w http.ResponseWriter, r *http.Request) {
 					"message": "tag not in remote-apps.json and no valid app definition in request body",
 				})
 				return
+			}
+			if incoming.ACEndpoint != "" {
+				if err := validateHTTPSURL(incoming.ACEndpoint); err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_ENDPOINT", "message": "ac_endpoint: " + err.Error()})
+					return
+				}
+			}
+			if incoming.RegistryURL != "" {
+				if err := validateHTTPSURL(incoming.RegistryURL); err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_ENDPOINT", "message": "registry_url: " + err.Error()})
+					return
+				}
 			}
 			remoteAppsMu.Lock()
 			app = &RemoteApp{

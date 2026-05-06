@@ -69,10 +69,11 @@ async function requestInstanceCert(caCert: Buffer): Promise<{ cert: Buffer; key:
   const url        = `${enrollURL}/instance-cert`;
 
   const agent = new https.Agent({
-    cert: enrollCert,
-    key:  enrollKey,
-    rejectUnauthorized: false, // enrollment CA verification handled server-side
-    minVersion: 'TLSv1.3',
+    ca:                 caCert,
+    cert:               enrollCert,
+    key:                enrollKey,
+    rejectUnauthorized: true,
+    minVersion:         'TLSv1.3',
   });
 
   const body = JSON.stringify({ service_name: SERVICE_NAME, instance_id: instanceID });

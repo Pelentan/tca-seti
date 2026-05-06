@@ -5,7 +5,7 @@ defmodule FeedWrangler.MixProject do
     [
       app: :feed_wrangler,
       version: "0.1.0",
-      elixir: "~> 1.16",
+      elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps()
     ]
@@ -20,7 +20,9 @@ defmodule FeedWrangler.MixProject do
 
   defp deps do
     [
-      {:plug_cowboy, "~> 2.7"}
+      {:plug_cowboy, "~> 2.7"},
+      {:mix_audit, "~> 2.0", only: [:dev, :test], runtime: false},
+      {:sobelow,   "~> 0.13", only: [:dev, :test], runtime: false}
     ]
   end
 end

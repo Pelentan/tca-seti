@@ -37,10 +37,28 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 )
+
+// validateHTTPSURL returns an error if raw is not a valid https URL.
+// All inter-service endpoints in TCA are mTLS/HTTPS — any other scheme
+// is rejected at intake so it never reaches an outgoing HTTP call.
+func validateHTTPSURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %v", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("URL scheme must be https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("URL must include a host")
+	}
+	return nil
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -173,6 +191,10 @@ func connectFederatedApp(appID, acEndpoint, caCert string, sessionCert *x509.Cer
 //   POST /federation/proxy/{tag}/run-contract-tests
 //   GET  /federation/proxy/{tag}/contract-suites
 //   GET  /federation/proxy/{tag}/contract-suites/{runId}
+//   POST /federation/proxy/{tag}/plots/run
+//
+// Adding a route here requires a Contract change and full revalidation —
+// this allowlist is an intentional security checkpoint, not a maintenance burden.
 func handleFederationProxy(w http.ResponseWriter, r *http.Request) {
 	// Parse /federation/proxy/{tag}/{action...}
 	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/federation/proxy/"), "/", 2)
@@ -182,6 +204,20 @@ func handleFederationProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tag, action := parts[0], "/"+parts[1]
+
+	// Allowlist of permitted remote AC actions.  Extending this list requires
+	// a Contract update and revalidation — do not add entries without that process.
+	allowedActions := map[string]bool{
+		"/run-contract-tests": true,
+		"/contract-suites":    true,
+		"/plots/run":          true,
+	}
+	// contract-suites/{runId} — allow any path rooted at /contract-suites/
+	if !allowedActions[action] && !strings.HasPrefix(action, "/contract-suites/") {
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(map[string]string{"error": "action not permitted"})
+		return
+	}
 
 	fedMu.RLock()
 	app, ok := fedApps[tag]
@@ -679,6 +715,12 @@ func handleFederationSubscriptions(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_CERT", "message": "could not parse monitor cert/key: " + err.Error()})
+			return
+		}
+
+		if err := validateHTTPSURL(req.ACEndpoint); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_ENDPOINT", "message": "ac_endpoint: " + err.Error()})
 			return
 		}
 

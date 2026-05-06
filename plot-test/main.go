@@ -52,29 +52,28 @@ func envOr(key, def string) string {
 // Plot model (mirrors Plot Store)
 // ---------------------------------------------------------------------------
 
-// PlotStep is the unified step schema for all plots — internal and external.
-// Steps are always executed in the order provided.
-type PlotStep struct {
-	Step           int               `json:"step"`
-	Service        string            `json:"service,omitempty"`
-	Method         string            `json:"method"`
-	Path           string            `json:"path"`
-	Headers        map[string]string `json:"headers,omitempty"`
-	Body           interface{}       `json:"body,omitempty"`
-	ExpectedStatus int               `json:"expected_status"`
-	ExpectedFields []string          `json:"expected_fields,omitempty"`
-	ExtractFields  map[string]string `json:"extract_fields,omitempty"`
-	StopOnFailure  bool              `json:"stop_on_failure,omitempty"`
-	Notes          string            `json:"notes,omitempty"`
+// PlotCall mirrors the contract PlotCall schema — the HTTP action for a step.
+type PlotCall struct {
+	Method  string            `json:"method"`
+	Path    string            `json:"path"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Body    interface{}       `json:"body,omitempty"`
 }
 
-// PlotAssertion and ExpectedCall are internal types used by SETI's own plot execution.
+// PlotAssertion defines a semantic assertion on a step's response body.
 type PlotAssertion struct {
 	Field    string      `json:"field"`
 	Operator string      `json:"operator"`
 	Value    interface{} `json:"value,omitempty"`
 }
 
+// CaptureDefinition extracts a value from the response for use in later steps.
+type CaptureDefinition struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+// ExpectedCall defines an inter-service call expected in the observability stream.
 type ExpectedCall struct {
 	Caller         string `json:"caller"`
 	Callee         string `json:"callee"`
@@ -83,10 +82,68 @@ type ExpectedCall struct {
 	MinOccurrences int    `json:"min_occurrences,omitempty"`
 }
 
-// applyCaptures replaces {name} tokens in path and body string values.
-// Must be called before execution. Applies capture substitutions to path and body.
-// Normalize applies capture substitutions to path and body — called before execution.
+// PlotStep supports both the contract schema (Call wrapper) and the legacy flat format.
+// Normalize() must be called before execution to resolve whichever format is present.
+type PlotStep struct {
+	StepNumber  int    `json:"step_number"`
+	Description string `json:"description"`
+
+	// Contract schema (Format A) — call wrapper with expect_status
+	Call            *PlotCall           `json:"call,omitempty"`
+	ExpectStatus    int                 `json:"expect_status,omitempty"`
+	Assertions      []PlotAssertion     `json:"assertions,omitempty"`
+	Capture         []CaptureDefinition `json:"capture,omitempty"`
+	ExpectCallChain []ExpectedCall      `json:"expect_call_chain,omitempty"`
+
+	// Flat format (Format B) — canonical per PLOTS-PRIMER
+	Step           int               `json:"step"`
+	Service        string            `json:"service,omitempty"`
+	Method         string            `json:"method,omitempty"`
+	Path           string            `json:"path,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	Body           interface{}       `json:"body,omitempty"`
+	ExpectedStatus  int               `json:"expected_status,omitempty"`
+	ExpectedStatuses []int            `json:"expected_statuses,omitempty"`
+	ExpectedFields []string          `json:"expected_fields,omitempty"`
+	ExtractFields  map[string]string `json:"extract_fields,omitempty"`
+	ExpectedChain  []ExpectedCall    `json:"expected_chain,omitempty"`
+	StopOnFailure  bool              `json:"stop_on_failure,omitempty"`
+	Notes          string            `json:"notes,omitempty"`
+}
+
+// Normalize resolves the dual-format PlotStep into canonical flat fields.
+// After this call, Method/Path/Headers/Body/ExpectedStatus are always set
+// regardless of which format the JSON used.  Captures from prior steps
+// are substituted into Path and Body.
 func (s *PlotStep) Normalize(captures map[string]string) {
+	// Format A: resolve call wrapper → flat fields
+	if s.Call != nil {
+		if s.Method == "" {
+			s.Method = s.Call.Method
+		}
+		if s.Path == "" {
+			s.Path = s.Call.Path
+		}
+		if len(s.Headers) == 0 && len(s.Call.Headers) > 0 {
+			s.Headers = s.Call.Headers
+		}
+		if s.Body == nil && s.Call.Body != nil {
+			s.Body = s.Call.Body
+		}
+		s.Call = nil
+	}
+	if s.ExpectStatus != 0 && s.ExpectedStatus == 0 {
+		s.ExpectedStatus = s.ExpectStatus
+	}
+	// Format A capture array → extract_fields map
+	if len(s.Capture) > 0 && len(s.ExtractFields) == 0 {
+		s.ExtractFields = make(map[string]string, len(s.Capture))
+		for _, c := range s.Capture {
+			s.ExtractFields[c.Name] = c.Path
+		}
+		s.Capture = nil
+	}
+	// Apply captures from prior steps into Path and Body
 	if len(captures) == 0 {
 		return
 	}
@@ -94,6 +151,19 @@ func (s *PlotStep) Normalize(captures map[string]string) {
 	if bodyStr, ok := s.Body.(string); ok {
 		s.Body = applyCaptures(bodyStr, captures)
 	}
+}
+
+// statusMatches returns true if actual matches ExpectedStatus or any value in ExpectedStatuses.
+func statusMatches(actual int, step *PlotStep) bool {
+	if len(step.ExpectedStatuses) > 0 {
+		for _, s := range step.ExpectedStatuses {
+			if actual == s {
+				return true
+			}
+		}
+		return false
+	}
+	return actual == step.ExpectedStatus
 }
 
 func applyCaptures(s string, captures map[string]string) string {
@@ -602,7 +672,7 @@ func executeRunRemoteExternal(run *PlotRun, plot Plot, applicationID string) *Pl
 			ResponseBody:   responseBody,
 		}
 
-		passed := execErr == nil && actualStatus == step.ExpectedStatus
+		passed := execErr == nil && statusMatches(actualStatus, &step)
 		stepResult.Passed = passed
 		if !passed {
 			if execErr != nil {
@@ -776,7 +846,7 @@ func executeRun(plotID, applicationID string) *PlotRun {
 			stepResult.ChainPassed = false
 			stepResult.FailureReason = execErr.Error()
 		} else {
-			statusPassed := actualStatus == step.ExpectedStatus
+			statusPassed := statusMatches(actualStatus, &step)
 
 			// Extract capture values from response body for use in subsequent steps
 			if len(step.ExtractFields) > 0 {
