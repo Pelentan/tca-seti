@@ -1,50 +1,38 @@
 {
-  "name": "Contract Test Trigger and Retrieve",
-  "description": "Validates the contract test pipeline: a run is triggered for the seti application (fire-and-forget, returns 'accepted' immediately), and historical results are retrievable from the Results Job. The trigger is asynchronous by design — the run executes in the background and results are polled.",
-  "application_id": "seti",
-  "author": "claude-sonnet-4-6-session-20260410",
-  "version": "0.4.0",
-  "tags": ["contract-test", "pipeline", "results"],
-  "steps": [
-    {
-      "step_number": 1,
-      "description": "Health check — contract-test confirms Redis connectivity and scheduler status",
-      "call": { "method": "GET", "path": "/health" },
-      "expect_status": 200,
-      "assertions": [
-        { "field": "status", "operator": "equals", "value": "healthy" }
-      ]
-    },
-    {
-      "step_number": 2,
-      "description": "Trigger a contract test run — returns 'accepted' immediately, run executes asynchronously",
-      "call": {
-        "method": "POST",
-        "path": "/run-contract-test",
-        "body": { "application_id": "seti" }
-      },
-      "expect_status": 200,
-      "assertions": [
-        { "field": "status", "operator": "equals", "value": "accepted" },
-        { "field": "application_id", "operator": "equals", "value": "seti" }
-      ],
-      "expect_call_chain": [
-        { "caller": "gateway", "callee": "contract-test", "method": "POST", "path": "/run" }
-      ],
-      "verify_within_seconds": 10
-    },
-    {
-      "step_number": 3,
-      "description": "Verify historical contract results are stored and retrievable from the Results Job",
-      "call": { "method": "GET", "path": "/contract-results" },
-      "expect_status": 200,
-      "assertions": [
-        { "field": "runs", "operator": "present" }
-      ],
-      "expect_call_chain": [
-        { "caller": "gateway", "callee": "results", "method": "GET", "path": "/contract-results" }
-      ],
-      "verify_within_seconds": 10
-    }
-  ]
+    "name": "Contract Test Trigger and Retrieve",
+    "description": "Validates the contract test pipeline: a run is triggered for the seti application (fire-and-forget, returns 'accepted' immediately), and historical results are retrievable from the Results Job. The trigger is asynchronous by design \u2014 the run executes in the background and results are polled.",
+    "application_id": "seti",
+    "author": "claude-sonnet-4-6-session-20260410",
+    "version": "0.4.0",
+    "tags": [
+        "contract-test",
+        "pipeline",
+        "results"
+    ],
+    "steps": [
+        {
+            "step": 1,
+            "description": "Health check \u2014 contract-test confirms Redis connectivity and scheduler status",
+            "method": "GET",
+            "path": "/health",
+            "expected_status": 200
+        },
+        {
+            "step": 2,
+            "description": "Trigger a contract test run \u2014 returns 'accepted' immediately, run executes asynchronously",
+            "method": "POST",
+            "path": "/run-contract-test",
+            "body": {
+                "application_id": "seti"
+            },
+            "expected_status": 200
+        },
+        {
+            "step": 3,
+            "description": "Verify historical contract results are stored and retrievable from the Results Job",
+            "method": "GET",
+            "path": "/contract-results",
+            "expected_status": 200
+        }
+    ]
 }

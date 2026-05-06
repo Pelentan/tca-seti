@@ -52,23 +52,7 @@ func envOr(key, def string) string {
 // Plot model (mirrors Plot Store)
 // ---------------------------------------------------------------------------
 
-// PlotStep is the unified step schema for all plots — internal and external.
-// Steps are always executed in the order provided.
-type PlotStep struct {
-	Step           int               `json:"step"`
-	Service        string            `json:"service,omitempty"`
-	Method         string            `json:"method"`
-	Path           string            `json:"path"`
-	Headers        map[string]string `json:"headers,omitempty"`
-	Body           interface{}       `json:"body,omitempty"`
-	ExpectedStatus int               `json:"expected_status"`
-	ExpectedFields []string          `json:"expected_fields,omitempty"`
-	ExtractFields  map[string]string `json:"extract_fields,omitempty"`
-	StopOnFailure  bool              `json:"stop_on_failure,omitempty"`
-	Notes          string            `json:"notes,omitempty"`
-}
-
-// PlotAssertion and ExpectedCall are internal types used by SETI's own plot execution.
+// PlotAssertion and ExpectedCall are carried for JSON round-trip compatibility.
 type PlotAssertion struct {
 	Field    string      `json:"field"`
 	Operator string      `json:"operator"`
@@ -83,9 +67,40 @@ type ExpectedCall struct {
 	MinOccurrences int    `json:"min_occurrences,omitempty"`
 }
 
-// applyCaptures replaces {name} tokens in path and body string values.
-// Must be called before execution. Applies capture substitutions to path and body.
-// Normalize applies capture substitutions to path and body — called before execution.
+// PlotStep is the unified step schema per PLOTS-PRIMER.
+// All plots use flat fields — no call wrapper, no legacy aliases.
+type PlotStep struct {
+	Step             int               `json:"step"`
+	Description      string            `json:"description,omitempty"`
+	Service          string            `json:"service,omitempty"`
+	Method           string            `json:"method"`
+	Path             string            `json:"path"`
+	Headers          map[string]string `json:"headers,omitempty"`
+	Body             interface{}       `json:"body,omitempty"`
+	ExpectedStatus   int               `json:"expected_status"`
+	ExpectedStatuses []int             `json:"expected_statuses,omitempty"`
+	ExpectedFields   []string          `json:"expected_fields,omitempty"`
+	ExtractFields    map[string]string `json:"extract_fields,omitempty"`
+	ExpectedChain    []ExpectedCall    `json:"expected_chain,omitempty"`
+	StopOnFailure    bool              `json:"stop_on_failure,omitempty"`
+	Notes            string            `json:"notes,omitempty"`
+}
+
+// statusMatches returns true if actual matches ExpectedStatus or any value in ExpectedStatuses.
+func statusMatches(actual int, step *PlotStep) bool {
+	if len(step.ExpectedStatuses) > 0 {
+		for _, s := range step.ExpectedStatuses {
+			if actual == s {
+				return true
+			}
+		}
+		return false
+	}
+	return actual == step.ExpectedStatus
+}
+
+// Normalize applies capture substitutions from prior steps into Path and Body.
+// All plots are in unified flat format — no schema translation needed.
 func (s *PlotStep) Normalize(captures map[string]string) {
 	if len(captures) == 0 {
 		return
@@ -602,7 +617,7 @@ func executeRunRemoteExternal(run *PlotRun, plot Plot, applicationID string) *Pl
 			ResponseBody:   responseBody,
 		}
 
-		passed := execErr == nil && actualStatus == step.ExpectedStatus
+		passed := execErr == nil && statusMatches(actualStatus, &step)
 		stepResult.Passed = passed
 		if !passed {
 			if execErr != nil {
@@ -612,12 +627,13 @@ func executeRunRemoteExternal(run *PlotRun, plot Plot, applicationID string) *Pl
 			}
 		}
 
-		// Extract captures using extract_fields map
-		if passed && len(step.ExtractFields) > 0 {
+		// Extract captures using extract_fields map — runs regardless of pass/fail
+		// so cleanup steps always have the IDs they need even after unexpected statuses.
+		if len(step.ExtractFields) > 0 {
 			if bodyMap, ok := responseBody.(map[string]interface{}); ok {
-				for field, as := range step.ExtractFields {
-					if val, ok := bodyMap[field]; ok {
-						captures[as] = fmt.Sprintf("%v", val)
+				for varName, responseField := range step.ExtractFields {
+					if val, ok := bodyMap[responseField]; ok {
+						captures[varName] = fmt.Sprintf("%v", val)
 					}
 				}
 			}
@@ -776,15 +792,15 @@ func executeRun(plotID, applicationID string) *PlotRun {
 			stepResult.ChainPassed = false
 			stepResult.FailureReason = execErr.Error()
 		} else {
-			statusPassed := actualStatus == step.ExpectedStatus
+			statusPassed := statusMatches(actualStatus, &step)
 
 			// Extract capture values from response body for use in subsequent steps
 			if len(step.ExtractFields) > 0 {
 				if bodyMap, ok := responseBody.(map[string]interface{}); ok {
-					for field, as := range step.ExtractFields {
-						if val, ok := bodyMap[field]; ok {
-							captures[as] = fmt.Sprintf("%v", val)
-							log.Printf("[plot-test] Step %d captured %s = %v", step.Step, as, val)
+					for varName, responseField := range step.ExtractFields {
+						if val, ok := bodyMap[responseField]; ok {
+							captures[varName] = fmt.Sprintf("%v", val)
+							log.Printf("[plot-test] Step %d captured %s = %v", step.Step, varName, val)
 						}
 					}
 				}

@@ -10,8 +10,6 @@ defmodule FeedWrangler.CertForge do
 
   @service_name "feed-wrangler"
   @endpoint     "https://feed-wrangler:4007"
-  @enrollment_cert System.get_env("ENROLLMENT_CERT", "/certs/enrollment.crt")
-  @enrollment_key  System.get_env("ENROLLMENT_KEY",  "/certs/enrollment.key")
 
   defstruct [:ca_cert, :instance_cert, :instance_key, :fingerprint, :instance_cn, :instance_id]
 
@@ -35,7 +33,7 @@ defmodule FeedWrangler.CertForge do
     enroll_url  = derive_url(forge_url, enroll_port)
 
     with {:ok, ca_cert}    <- fetch_ca_cert(public_url),
-         {:ok, cert, key, fp, cn} <- request_instance_cert(enroll_url, instance_id) do
+         {:ok, cert, key, fp, cn} <- request_instance_cert(enroll_url, ca_cert, instance_id) do
       mat = %__MODULE__{
         ca_cert:       ca_cert,
         instance_cert: cert,
@@ -75,25 +73,29 @@ defmodule FeedWrangler.CertForge do
     end
   end
 
-  defp request_instance_cert(enroll_url, instance_id, attempt \\ 1)
-  defp request_instance_cert(_, _, 31), do: {:error, "Could not obtain instance cert after 30 attempts"}
-  defp request_instance_cert(enroll_url, instance_id, attempt) do
+  defp request_instance_cert(enroll_url, ca_cert, instance_id, attempt \\ 1)
+  defp request_instance_cert(_, _, _, 31), do: {:error, "Could not obtain instance cert after 30 attempts"}
+  defp request_instance_cert(enroll_url, ca_cert, instance_id, attempt) do
     url  = String.trim_trailing(enroll_url, "/") <> "/instance-cert"
     body = JSON.encode!(%{service_name: @service_name, instance_id: instance_id})
 
     enroll_cert = System.get_env("ENROLLMENT_CERT", "/certs/enrollment.crt")
     enroll_key  = System.get_env("ENROLLMENT_KEY",  "/certs/enrollment.key")
+    ca_path     = "/tmp/fw-enroll-ca-#{:erlang.unique_integer([:positive])}.crt"
+    File.write!(ca_path, ca_cert)
 
     {output, code} = System.cmd("curl", [
       "--silent", "--fail",
+      "--cacert",  ca_path,
       "--cert",    enroll_cert,
       "--key",     enroll_key,
-      "--insecure",  # enrollment CA verified server-side
       "--request", "POST",
       "--header",  "Content-Type: application/json",
       "--data",    body,
       url
     ], stderr_to_stdout: true)
+
+    File.rm(ca_path)
 
     if code == 0 do
       case JSON.decode(output) do
@@ -102,12 +104,12 @@ defmodule FeedWrangler.CertForge do
         _ ->
           Logger.info("[cert-forge] Waiting for /instance-cert (attempt #{attempt}/30)")
           Process.sleep(2_000)
-          request_instance_cert(enroll_url, instance_id, attempt + 1)
+          request_instance_cert(enroll_url, ca_cert, instance_id, attempt + 1)
       end
     else
       Logger.info("[cert-forge] Waiting for /instance-cert (attempt #{attempt}/30): curl exit #{code}")
       Process.sleep(2_000)
-      request_instance_cert(enroll_url, instance_id, attempt + 1)
+      request_instance_cert(enroll_url, ca_cert, instance_id, attempt + 1)
     end
   end
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,6 +32,20 @@ var (
 	plotsPath        = envOr("PLOTS_PATH", "/contracts/plots")
 )
 
+func validateHTTPSURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %v", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("URL scheme must be https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("URL must include a host")
+	}
+	return nil
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -54,7 +69,8 @@ type PlotStep struct {
 	Path           string            `json:"path"`
 	Headers        map[string]string `json:"headers,omitempty"`
 	Body           interface{}       `json:"body,omitempty"`
-	ExpectedStatus int               `json:"expected_status"`
+	ExpectedStatus   int               `json:"expected_status"`
+	ExpectedStatuses []int             `json:"expected_statuses,omitempty"`
 	ExpectedFields []string          `json:"expected_fields,omitempty"`
 	ExtractFields  map[string]string `json:"extract_fields,omitempty"`
 	StopOnFailure  bool              `json:"stop_on_failure,omitempty"`
@@ -516,6 +532,11 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 			"code":    "INVALID_REQUEST",
 			"message": "registry_url, registry_type, and registry_token required",
 		})
+		return
+	}
+	if err := validateHTTPSURL(req.RegistryURL); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_ENDPOINT", "message": "registry_url: " + err.Error()})
 		return
 	}
 	if req.RegistryType == "" {

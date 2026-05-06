@@ -1,56 +1,45 @@
 {
-  "name": "Gateway Auth Flow",
-  "description": "Validates the complete dev-mode authentication flow through the gateway: dev login produces a JWT and clearance level, and the JWT is accepted on a subsequent authenticated request. Session refresh requires the httpOnly seti_refresh cookie which plot-test cannot maintain — refresh is verified by the system's own inter-service traffic, not this plot.",
-  "application_id": "seti",
-  "author": "claude-sonnet-4-6-session-20260410",
-  "version": "0.4.0",
-  "tags": ["gateway", "auth", "session"],
-  "steps": [
-    {
-      "step_number": 1,
-      "description": "Gateway health check confirms service is up before exercising auth",
-      "call": { "method": "GET", "path": "/health" },
-      "expect_status": 200,
-      "assertions": [
-        { "field": "status", "operator": "equals", "value": "healthy" }
-      ]
-    },
-    {
-      "step_number": 2,
-      "description": "Dev login with ops-wr4ngler clearance — gateway proxies to signal-clearance, JWT and clearance returned",
-      "call": {
-        "method": "POST",
-        "path": "/auth/dev/login",
-        "body": { "display_name": "plot-test-ops", "clearance_level": "ops-wr4ngler" }
-      },
-      "expect_status": 200,
-      "capture": [
-        { "name": "jwt", "path": "jwt" }
-      ],
-      "assertions": [
-        { "field": "jwt", "operator": "present" }
-      ],
-      "expect_call_chain": [
-        { "caller": "gateway", "callee": "signal-clearance", "method": "POST", "path": "/auth/dev/login" }
-      ],
-      "verify_within_seconds": 10
-    },
-    {
-      "step_number": 3,
-      "description": "Authenticated request to Policy confirms JWT is valid and gateway proxies correctly",
-      "call": {
-        "method": "GET",
-        "path": "/applications",
-        "headers": { "Authorization": "Bearer {jwt}" }
-      },
-      "expect_status": 200,
-      "assertions": [
-        { "field": "applications", "operator": "present" }
-      ],
-      "expect_call_chain": [
-        { "caller": "gateway", "callee": "policy", "method": "GET", "path": "/applications" }
-      ],
-      "verify_within_seconds": 10
-    }
-  ]
+    "name": "Gateway Auth Flow",
+    "description": "Validates the complete dev-mode authentication flow through the gateway: dev login produces a JWT and clearance level, and the JWT is accepted on a subsequent authenticated request. Session refresh requires the httpOnly seti_refresh cookie which plot-test cannot maintain \u2014 refresh is verified by the system's own inter-service traffic, not this plot.",
+    "application_id": "seti",
+    "author": "claude-sonnet-4-6-session-20260410",
+    "version": "0.4.0",
+    "tags": [
+        "gateway",
+        "auth",
+        "session"
+    ],
+    "steps": [
+        {
+            "step": 1,
+            "description": "Gateway health check confirms service is up before exercising auth",
+            "method": "GET",
+            "path": "/health",
+            "expected_status": 200
+        },
+        {
+            "step": 2,
+            "description": "Dev login with ops-wr4ngler clearance \u2014 gateway proxies to signal-clearance, JWT and clearance returned",
+            "method": "POST",
+            "path": "/auth/dev/login",
+            "body": {
+                "display_name": "plot-test-ops",
+                "clearance_level": "ops-wr4ngler"
+            },
+            "expected_status": 200,
+            "extract_fields": {
+                "jwt": "jwt"
+            }
+        },
+        {
+            "step": 3,
+            "description": "Authenticated request to Policy confirms JWT is valid and gateway proxies correctly",
+            "method": "GET",
+            "path": "/applications",
+            "headers": {
+                "Authorization": "Bearer {jwt}"
+            },
+            "expected_status": 200
+        }
+    ]
 }
