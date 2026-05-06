@@ -1241,6 +1241,21 @@ func main() {
 	connectRedis()
 	loadPersistedJobs()
 
+	// Always ensure augur-canis is in its own job registry.
+	// Other services register via POST /jobs; augur-canis must do this for itself
+	// so it appears in contract test runs even after a fresh Redis start.
+	if _, exists := registeredJobs["augur-canis"]; !exists {
+		self := RegisteredJobRecord{
+			ServiceName:     "augur-canis",
+			NetworkEndpoint: envOr("AUGUR_CANIS_URL", "https://augur-canis:4010"),
+			RegisteredAt:    time.Now().UTC().Format(time.RFC3339),
+		}
+		registeredJobs["augur-canis"] = &self
+		data, _ := json.Marshal(self)
+		rdb.Set(context.Background(), "ac:job:augur-canis", string(data), 0)
+		log.Printf("[augur-canis] Self-registered as job: %s", self.NetworkEndpoint)
+	}
+
 	// Start dev UI if AC_UI_PORT is set (plain HTTP, no auth — dev/setup only)
 	startDevUI()
 

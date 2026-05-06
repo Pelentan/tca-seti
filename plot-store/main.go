@@ -69,7 +69,8 @@ type PlotStep struct {
 	Path           string            `json:"path"`
 	Headers        map[string]string `json:"headers,omitempty"`
 	Body           interface{}       `json:"body,omitempty"`
-	ExpectedStatus int               `json:"expected_status"`
+	ExpectedStatus   int               `json:"expected_status"`
+	ExpectedStatuses []int             `json:"expected_statuses,omitempty"`
 	ExpectedFields []string          `json:"expected_fields,omitempty"`
 	ExtractFields  map[string]string `json:"extract_fields,omitempty"`
 	StopOnFailure  bool              `json:"stop_on_failure,omitempty"`

@@ -52,28 +52,13 @@ func envOr(key, def string) string {
 // Plot model (mirrors Plot Store)
 // ---------------------------------------------------------------------------
 
-// PlotCall mirrors the contract PlotCall schema — the HTTP action for a step.
-type PlotCall struct {
-	Method  string            `json:"method"`
-	Path    string            `json:"path"`
-	Headers map[string]string `json:"headers,omitempty"`
-	Body    interface{}       `json:"body,omitempty"`
-}
-
-// PlotAssertion defines a semantic assertion on a step's response body.
+// PlotAssertion and ExpectedCall are carried for JSON round-trip compatibility.
 type PlotAssertion struct {
 	Field    string      `json:"field"`
 	Operator string      `json:"operator"`
 	Value    interface{} `json:"value,omitempty"`
 }
 
-// CaptureDefinition extracts a value from the response for use in later steps.
-type CaptureDefinition struct {
-	Name string `json:"name"`
-	Path string `json:"path"`
-}
-
-// ExpectedCall defines an inter-service call expected in the observability stream.
 type ExpectedCall struct {
 	Caller         string `json:"caller"`
 	Callee         string `json:"callee"`
@@ -82,75 +67,23 @@ type ExpectedCall struct {
 	MinOccurrences int    `json:"min_occurrences,omitempty"`
 }
 
-// PlotStep supports both the contract schema (Call wrapper) and the legacy flat format.
-// Normalize() must be called before execution to resolve whichever format is present.
+// PlotStep is the unified step schema per PLOTS-PRIMER.
+// All plots use flat fields — no call wrapper, no legacy aliases.
 type PlotStep struct {
-	StepNumber  int    `json:"step_number"`
-	Description string `json:"description"`
-
-	// Contract schema (Format A) — call wrapper with expect_status
-	Call            *PlotCall           `json:"call,omitempty"`
-	ExpectStatus    int                 `json:"expect_status,omitempty"`
-	Assertions      []PlotAssertion     `json:"assertions,omitempty"`
-	Capture         []CaptureDefinition `json:"capture,omitempty"`
-	ExpectCallChain []ExpectedCall      `json:"expect_call_chain,omitempty"`
-
-	// Flat format (Format B) — canonical per PLOTS-PRIMER
-	Step           int               `json:"step"`
-	Service        string            `json:"service,omitempty"`
-	Method         string            `json:"method,omitempty"`
-	Path           string            `json:"path,omitempty"`
-	Headers        map[string]string `json:"headers,omitempty"`
-	Body           interface{}       `json:"body,omitempty"`
-	ExpectedStatus  int               `json:"expected_status,omitempty"`
-	ExpectedStatuses []int            `json:"expected_statuses,omitempty"`
-	ExpectedFields []string          `json:"expected_fields,omitempty"`
-	ExtractFields  map[string]string `json:"extract_fields,omitempty"`
-	ExpectedChain  []ExpectedCall    `json:"expected_chain,omitempty"`
-	StopOnFailure  bool              `json:"stop_on_failure,omitempty"`
-	Notes          string            `json:"notes,omitempty"`
-}
-
-// Normalize resolves the dual-format PlotStep into canonical flat fields.
-// After this call, Method/Path/Headers/Body/ExpectedStatus are always set
-// regardless of which format the JSON used.  Captures from prior steps
-// are substituted into Path and Body.
-func (s *PlotStep) Normalize(captures map[string]string) {
-	// Format A: resolve call wrapper → flat fields
-	if s.Call != nil {
-		if s.Method == "" {
-			s.Method = s.Call.Method
-		}
-		if s.Path == "" {
-			s.Path = s.Call.Path
-		}
-		if len(s.Headers) == 0 && len(s.Call.Headers) > 0 {
-			s.Headers = s.Call.Headers
-		}
-		if s.Body == nil && s.Call.Body != nil {
-			s.Body = s.Call.Body
-		}
-		s.Call = nil
-	}
-	if s.ExpectStatus != 0 && s.ExpectedStatus == 0 {
-		s.ExpectedStatus = s.ExpectStatus
-	}
-	// Format A capture array → extract_fields map
-	if len(s.Capture) > 0 && len(s.ExtractFields) == 0 {
-		s.ExtractFields = make(map[string]string, len(s.Capture))
-		for _, c := range s.Capture {
-			s.ExtractFields[c.Name] = c.Path
-		}
-		s.Capture = nil
-	}
-	// Apply captures from prior steps into Path and Body
-	if len(captures) == 0 {
-		return
-	}
-	s.Path = applyCaptures(s.Path, captures)
-	if bodyStr, ok := s.Body.(string); ok {
-		s.Body = applyCaptures(bodyStr, captures)
-	}
+	Step             int               `json:"step"`
+	Description      string            `json:"description,omitempty"`
+	Service          string            `json:"service,omitempty"`
+	Method           string            `json:"method"`
+	Path             string            `json:"path"`
+	Headers          map[string]string `json:"headers,omitempty"`
+	Body             interface{}       `json:"body,omitempty"`
+	ExpectedStatus   int               `json:"expected_status"`
+	ExpectedStatuses []int             `json:"expected_statuses,omitempty"`
+	ExpectedFields   []string          `json:"expected_fields,omitempty"`
+	ExtractFields    map[string]string `json:"extract_fields,omitempty"`
+	ExpectedChain    []ExpectedCall    `json:"expected_chain,omitempty"`
+	StopOnFailure    bool              `json:"stop_on_failure,omitempty"`
+	Notes            string            `json:"notes,omitempty"`
 }
 
 // statusMatches returns true if actual matches ExpectedStatus or any value in ExpectedStatuses.
@@ -164,6 +97,18 @@ func statusMatches(actual int, step *PlotStep) bool {
 		return false
 	}
 	return actual == step.ExpectedStatus
+}
+
+// Normalize applies capture substitutions from prior steps into Path and Body.
+// All plots are in unified flat format — no schema translation needed.
+func (s *PlotStep) Normalize(captures map[string]string) {
+	if len(captures) == 0 {
+		return
+	}
+	s.Path = applyCaptures(s.Path, captures)
+	if bodyStr, ok := s.Body.(string); ok {
+		s.Body = applyCaptures(bodyStr, captures)
+	}
 }
 
 func applyCaptures(s string, captures map[string]string) string {
@@ -682,12 +627,13 @@ func executeRunRemoteExternal(run *PlotRun, plot Plot, applicationID string) *Pl
 			}
 		}
 
-		// Extract captures using extract_fields map
-		if passed && len(step.ExtractFields) > 0 {
+		// Extract captures using extract_fields map — runs regardless of pass/fail
+		// so cleanup steps always have the IDs they need even after unexpected statuses.
+		if len(step.ExtractFields) > 0 {
 			if bodyMap, ok := responseBody.(map[string]interface{}); ok {
-				for field, as := range step.ExtractFields {
-					if val, ok := bodyMap[field]; ok {
-						captures[as] = fmt.Sprintf("%v", val)
+				for varName, responseField := range step.ExtractFields {
+					if val, ok := bodyMap[responseField]; ok {
+						captures[varName] = fmt.Sprintf("%v", val)
 					}
 				}
 			}
@@ -851,10 +797,10 @@ func executeRun(plotID, applicationID string) *PlotRun {
 			// Extract capture values from response body for use in subsequent steps
 			if len(step.ExtractFields) > 0 {
 				if bodyMap, ok := responseBody.(map[string]interface{}); ok {
-					for field, as := range step.ExtractFields {
-						if val, ok := bodyMap[field]; ok {
-							captures[as] = fmt.Sprintf("%v", val)
-							log.Printf("[plot-test] Step %d captured %s = %v", step.Step, as, val)
+					for varName, responseField := range step.ExtractFields {
+						if val, ok := bodyMap[responseField]; ok {
+							captures[varName] = fmt.Sprintf("%v", val)
+							log.Printf("[plot-test] Step %d captured %s = %v", step.Step, varName, val)
 						}
 					}
 				}

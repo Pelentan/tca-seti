@@ -276,8 +276,13 @@ func syncNonFederation() {
 		if !ok {
 			continue
 		}
-		// Step 1: Write stargazer cert
-		if err := writeStarGazerCert(app.Namespace); err != nil {
+		// Step 1: Reload star-gazer key material then write cert.
+		// cert-forge may have rotated the star-gazer cert since startup —
+		// key must be reloaded before writing so signing stays in sync with
+		// whatever cert Vox receives.
+		if err := loadStarGazerKey(); err != nil {
+			log.Printf("[connie-agent] %s: star-gazer key reload failed: %v", tag, err)
+		} else if err := writeStarGazerCert(app.Namespace); err != nil {
 			log.Printf("[connie-agent] %s: cert write failed: %v", tag, err)
 		}
 		// Step 2: Sync plots
@@ -366,8 +371,11 @@ func syncAll() {
 			continue
 		}
 
-		// Write stargazer cert
-		if err := writeStarGazerCert(app.Namespace); err != nil {
+		// Reload star-gazer key then write cert — keeps signing key in sync with
+		// whatever cert Vox receives after a cert-forge rotation.
+		if err := loadStarGazerKey(); err != nil {
+			log.Printf("[connie-agent] %s: star-gazer key reload failed: %v", tag, err)
+		} else if err := writeStarGazerCert(app.Namespace); err != nil {
 			log.Printf("[connie-agent] %s: cert write failed: %v", tag, err)
 		} else {
 			log.Printf("[connie-agent] %s: stargazer cert written to namespace %s", tag, app.Namespace)
@@ -418,8 +426,10 @@ func syncConstellation(tag string) {
 
 	log.Printf("[connie-agent] %s: starting sync", tag)
 
-	// Step 1: Write stargazer cert
-	if err := writeStarGazerCert(app.Namespace); err != nil {
+	// Step 1: Reload star-gazer key then write cert
+	if err := loadStarGazerKey(); err != nil {
+		log.Printf("[connie-agent] %s: star-gazer key reload failed: %v", tag, err)
+	} else if err := writeStarGazerCert(app.Namespace); err != nil {
 		log.Printf("[connie-agent] %s: cert write failed: %v", tag, err)
 		state.mu.Lock()
 		state.CertStatus = "failed"

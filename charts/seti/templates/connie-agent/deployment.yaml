@@ -80,10 +80,11 @@ spec:
               mountPath: /etc/seti/remote-apps.json
               subPath: remote-apps.json
           livenessProbe:
-            tcpSocket:
-              port: {{ .Values.connieAgent.port }}
+            exec:
+              command: ["/healthcheck"]
             initialDelaySeconds: 45
             periodSeconds: 30
+            timeoutSeconds: 10
             failureThreshold: 3
       volumes:
         - name: seti-certs
