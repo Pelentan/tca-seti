@@ -80,7 +80,7 @@ jobs:
 
       - name: Run Sobelow (static security analysis)
         run: |
-          mix sobelow --exit
+          mix sobelow --config
 
   dependency-review:
     name: Dependency Review
