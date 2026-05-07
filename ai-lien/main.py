@@ -167,6 +167,17 @@ def fetch_lore_context(application_id: str, job_name: str = None) -> dict:
     context = {}
     application_id = sanitize_path_segment(application_id)
     job_name       = sanitize_path_segment(job_name) if job_name else job_name
+
+    # Strict allowlist validation — reject any ID that doesn't match a safe
+    # identifier pattern before it reaches a URL construction site.
+    _safe_id = re.compile(r'^[A-Za-z0-9._-]{1,100}$')
+    if not application_id or not _safe_id.fullmatch(application_id):
+        log.warning('Skipping Lore lookup: invalid application_id format')
+        return {}
+    if job_name and not _safe_id.fullmatch(job_name):
+        log.warning('Skipping Lore lookup: invalid job_name format')
+        return {}
+
     application_id_q = quote(application_id, safe='')
     job_name_q       = quote(job_name, safe='') if job_name else ''
     since_72h = time.strftime('%Y-%m-%dT%H:%M:%SZ',
