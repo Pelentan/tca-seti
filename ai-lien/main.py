@@ -26,7 +26,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from urllib.request import urlopen, Request as URLRequest
 import urllib.request
 import urllib.error
@@ -151,7 +151,7 @@ def report_event(callee: str, method: str, path: str, status: int, latency_ms: i
                 'status_code': status, 'latency_ms': latency_ms, 'protocol': 'mtls',
             })
         except Exception:
-            pass
+            pass  # Observability is best-effort — never crash the main thread
     threading.Thread(target=_send, daemon=True).start()
 
 # ---------------------------------------------------------------------------
@@ -167,22 +167,24 @@ def fetch_lore_context(application_id: str, job_name: str = None) -> dict:
     context = {}
     application_id = sanitize_path_segment(application_id)
     job_name       = sanitize_path_segment(job_name) if job_name else job_name
+    application_id_q = quote(application_id, safe='')
+    job_name_q       = quote(job_name, safe='') if job_name else ''
     since_72h = time.strftime('%Y-%m-%dT%H:%M:%SZ',
                                time.gmtime(time.time() - 72 * 3600))
 
     # Baseline for this job — what does healthy look like?
     if job_name:
         try:
-            baseline = _mtls_get(f'{LORE_URL}/baselines/{application_id}/{job_name}')
+            baseline = _mtls_get(f'{LORE_URL}/baselines/{application_id_q}/{job_name_q}')
             context['baseline'] = baseline
-            report_event('lore', 'GET', f'/baselines/{application_id}/{job_name}', 200, 0)
+            report_event('lore', 'GET', f'/baselines/{application_id_q}/{job_name_q}', 200, 0)
         except Exception:
             context['baseline'] = None  # No baseline established yet
 
     # Recent open incidents — what's already known to be wrong?
     try:
         incidents = _mtls_get(
-            f'{LORE_URL}/incidents?application_id={application_id}'
+            f'{LORE_URL}/incidents?application_id={application_id_q}'
             f'&status=open&since={since_72h}&limit=5'
         )
         context['recent_incidents'] = incidents.get('incidents', [])
@@ -195,7 +197,7 @@ def fetch_lore_context(application_id: str, job_name: str = None) -> dict:
     # Known patterns — recurring failure signatures
     try:
         patterns = _mtls_get(
-            f'{LORE_URL}/patterns?application_id={application_id}&limit=5'
+            f'{LORE_URL}/patterns?application_id={application_id_q}&limit=5'
         )
         context['known_patterns'] = patterns.get('patterns', [])
         report_event('lore', 'GET', '/patterns', 200, 0)
