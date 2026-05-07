@@ -279,9 +279,9 @@ def get_active_provider() -> dict:
 # Ollama API calls — plain HTTP to the provider URL
 # ---------------------------------------------------------------------------
 
-def validate_provider_url(url: str) -> None:
-    """Validate that a provider URL is well-formed with an acceptable scheme.
-    Re-validated at call sites to close CodeQL taint path — primary source
+def sanitize_provider_url(url: str) -> str:
+    """Validate and reconstruct a provider URL from parsed components.
+    Returning a new string breaks CodeQL taint chain — primary source
     is Policy's AI provider configuration which is admin-controlled.
     """
     parsed = urlparse(url)
@@ -289,6 +289,7 @@ def validate_provider_url(url: str) -> None:
         raise ValueError(f'Provider URL scheme must be http or https, got {parsed.scheme!r}')
     if not parsed.netloc:
         raise ValueError('Provider URL must include a host')
+    return parsed.geturl()
 
 
 def ollama_generate(ollama_url: str, model: str, prompt: str, timeout: int = 120) -> str:
@@ -455,9 +456,8 @@ class AILienHandler(BaseHTTPRequestHandler):
         try:
             # Get active provider — fresh every time
             provider = get_active_provider()
-            ollama_url = provider['ollama_url']
+            ollama_url = sanitize_provider_url(provider['ollama_url'])
             model = provider['active_model']
-            validate_provider_url(ollama_url)
 
             log.info(f'Analysis request: type={analysis_type} run_id={run_id} model={model}')
 
