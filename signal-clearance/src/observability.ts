@@ -3,8 +3,7 @@ import { buildUpstreamAgent } from './mtls.js';
 
 /** Strip CR/LF so one error always stays one log line. */
 function sanitizeForLog(value: unknown): string {
-  return String(value).replace(/[
-]/g, ' ');
+  return String(value).replace(/\r|\n/g, ' ');
 }
 
 const OBSERVABILITY_URL = process.env.OBSERVABILITY_URL || 'https://seti-observability:4011';
