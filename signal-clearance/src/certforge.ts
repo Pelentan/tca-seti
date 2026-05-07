@@ -8,7 +8,6 @@
 import https from 'https';
 import http from 'http';
 import fs from 'fs';
-import crypto from 'crypto';
 
 const FORGE_URL      = process.env.CERT_FORGE_URL      ?? 'https://cert-forge:4014';
 const PUBLIC_PORT    = process.env.PUBLIC_PORT          ?? '4016';

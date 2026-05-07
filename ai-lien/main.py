@@ -282,6 +282,11 @@ def get_active_provider() -> dict:
 # Ollama API calls — plain HTTP to the provider URL
 # ---------------------------------------------------------------------------
 
+def sanitize_for_log(value: object) -> str:
+    """Strip CR/LF so one event always stays one log line."""
+    return str(value).replace('\r', ' ').replace('\n', ' ')
+
+
 def sanitize_path_segment(value: str) -> str:
     """Strip anything that isn't alphanumeric, hyphen, or underscore.
     Prevents path traversal when user-supplied values are interpolated
@@ -457,7 +462,7 @@ class AILienHandler(BaseHTTPRequestHandler):
         # Enrich context with Lore institutional memory before analysis.
         # AI-lien with history is fundamentally different from AI-lien without it.
         if application_id:
-            log.info(f'Fetching Lore context for {application_id}/{job_name}')
+            log.info(f'Fetching Lore context for {sanitize_for_log(application_id)}/{sanitize_for_log(job_name)}')
             lore_context = fetch_lore_context(application_id, job_name or None)
             context['lore_institutional_memory'] = lore_context
             open_count = lore_context.get('open_incident_count', 0)
@@ -470,7 +475,7 @@ class AILienHandler(BaseHTTPRequestHandler):
             ollama_url = sanitize_provider_url(provider['ollama_url'])
             model = provider['active_model']
 
-            log.info(f'Analysis request: type={analysis_type} run_id={run_id} model={model}')
+            log.info(f'Analysis request: type={sanitize_for_log(analysis_type)} run_id={sanitize_for_log(run_id)} model={sanitize_for_log(model)}')
 
             result = double_tap(analysis_type, context, response_schema, ollama_url, model)
             result['run_id'] = run_id

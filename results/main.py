@@ -8,10 +8,13 @@ Phase 2: in-memory storage.
 Swap point: replace _store dicts with PostgreSQL in Phase 4.
 """
 
-import base64
-import hashlib
 import json
 import logging
+
+def sanitize_for_log(value: object) -> str:
+    """Strip CR/LF so one event always stays one log line."""
+    return str(value).replace('\r', ' ').replace('\n', ' ')
+
 import os
 import ssl
 from certforge import obtain_certs, build_client_ssl_context, build_server_ssl_context, self_register_with_ac
@@ -147,16 +150,13 @@ class ResultsHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        start = time.time()
-        status = 200
 
         if path == '/contract-results':
-            status = self._handle_store_contract_result()
+            self._handle_store_contract_result()
         elif path == '/plot-results':
-            status = self._handle_store_plot_result()
+            self._handle_store_plot_result()
         else:
             self.send_json(404, {'code': 'NOT_FOUND', 'message': f'No route for {path}'})
-            status = 404
 
 
 
@@ -188,8 +188,8 @@ class ResultsHandler(BaseHTTPRequestHandler):
         failed = run.get('failed_tests', 0)
         status = run.get('status', 'unknown')
         log.info(
-            f'Stored contract run {run_id} for {app_id}: '
-            f'{passed} passed, {failed} failed, status={status}'
+            f'Stored contract run {sanitize_for_log(run_id)} for {sanitize_for_log(app_id)}: '
+            f'{passed} passed, {failed} failed, status={sanitize_for_log(status)}'
         )
 
         self.send_json(201, {
@@ -245,7 +245,7 @@ class ResultsHandler(BaseHTTPRequestHandler):
             _plot_index[app_id].insert(0, run_id)
             _plot_index[app_id] = _plot_index[app_id][:100]
 
-        log.info(f'Stored plot run {run_id} for {app_id} (STUB)')
+        log.info(f'Stored plot run {sanitize_for_log(run_id)} for {sanitize_for_log(app_id)} (STUB)')
         self.send_json(201, {'run_id': run_id, 'stored_at': run['stored_at']})
         return 201
 

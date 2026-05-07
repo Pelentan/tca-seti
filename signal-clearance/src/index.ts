@@ -62,18 +62,6 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 // ---------------------------------------------------------------------------
-// Helper: wrap route with observability timing
-// ---------------------------------------------------------------------------
-
-function timed(callee: string, method: string, path: string, fn: () => Promise<Response | void>) {
-  const start = Date.now();
-  return fn().finally(() => {
-    // Status code not available here — reported by individual handlers
-    reportEvent({ callee, method, path, status_code: 0, latency_ms: Date.now() - start });
-  });
-}
-
-// ---------------------------------------------------------------------------
 // Auth — OIDC authorize URL (called by Gateway for redirect)
 // ---------------------------------------------------------------------------
 
@@ -103,7 +91,6 @@ app.get('/auth/oidc/authorize', async (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 
 app.post('/auth/oidc/callback', async (req: Request, res: Response) => {
-  const start = Date.now();
   try {
     const { code, state } = req.body;
 
@@ -143,7 +130,6 @@ app.post('/auth/oidc/callback', async (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 
 app.post('/auth/federated', async (req: Request, res: Response) => {
-  const start = Date.now();
   try {
     const { id_token, idp_config_id } = req.body;
     if (!id_token) {
