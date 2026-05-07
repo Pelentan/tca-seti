@@ -752,7 +752,16 @@ func handleFederationSubscriptions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := connectFederatedApp(req.ApplicationID, req.ACEndpoint, req.CACert,
+		// For reconnects, the endpoint is locked at first registration —
+		// a reconnecting caller cannot redirect to a different ACEndpoint.
+		// This also breaks CodeQL's taint path: the outgoing URL comes from
+		// stored state rather than the current request body.
+		acEndpoint := req.ACEndpoint
+		if exists {
+			acEndpoint = existing.ACEndpoint
+		}
+
+		if err := connectFederatedApp(req.ApplicationID, acEndpoint, req.CACert,
 			sessionCert, req.SessionCertID, monitorCert); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{
