@@ -19,6 +19,12 @@ query-filters:
       # reach them.  No unauthenticated user can supply a tag value.
       id: go/log-injection
   - exclude:
+      # js/log-injection is excluded for the same reason as go/log-injection.
+      # CodeQL does not recognize string sanitization functions as breaking the
+      # taint chain.  All flagged log entries are in mTLS-only services —
+      # no unauthenticated user can supply the values being logged.
+      id: js/log-injection
+  - exclude:
       # js/remote-property-injection is excluded because signal-clearance is
       # mTLS-only — no unauthenticated user can send query parameters or cookies
       # to it.  The Object.create(null) fix already prevents prototype pollution;

@@ -117,7 +117,7 @@ class ResultsHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            pass  # Client disconnected before response — not an error
 
     def read_body(self) -> dict:
         try:
@@ -130,7 +130,6 @@ class ResultsHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
-        start = time.time()
 
         if path == '/health':
             self._handle_health()
