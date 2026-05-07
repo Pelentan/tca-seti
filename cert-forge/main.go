@@ -388,12 +388,16 @@ func writeStaticCertFiles(mat *StaticCertMaterial) error {
 // PEM writer
 // ---------------------------------------------------------------------------
 
-func writePEM(path, blockType string, data []byte) error {
+func writePEM(path, blockType string, data []byte) (retErr error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil && retErr == nil {
+			retErr = cerr
+		}
+	}()
 	return pem.Encode(f, &pem.Block{Type: blockType, Bytes: data})
 }
 

@@ -462,6 +462,16 @@ func handleSubscriptions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		const maxWindowSize = 10_000
+		if req.WindowSize < 0 || req.WindowSize > maxWindowSize {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"code":    "INVALID_REQUEST",
+				"message": fmt.Sprintf("window_size must be between 0 and %d", maxWindowSize),
+			})
+			return
+		}
+
 		subMu.Lock()
 		if _, exists := subscriptions[req.ApplicationID]; exists {
 			subMu.Unlock()
@@ -487,13 +497,7 @@ func handleSubscriptions(w http.ResponseWriter, r *http.Request) {
 		windowMu.Lock()
 		ws := windowSize
 		if req.WindowSize > 0 {
-			ws = req.WindowSize
-		}
-		// Cap window size to prevent excessive memory allocation from
-		// caller-supplied values.
-		const maxWindowSize = 10_000
-		if ws > maxWindowSize {
-			ws = maxWindowSize
+			ws = req.WindowSize // already validated: 0 < ws <= maxWindowSize
 		}
 		windows[req.ApplicationID] = make([]ConstellationEvent, 0, ws)
 		windowMu.Unlock()

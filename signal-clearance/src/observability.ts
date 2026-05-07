@@ -1,6 +1,11 @@
 import https from 'https';
 import { buildUpstreamAgent } from './mtls.js';
 
+/** Strip CR/LF so one error always stays one log line. */
+function sanitizeForLog(value: unknown): string {
+  return String(value).replace(/\r|\n/g, ' ');
+}
+
 const OBSERVABILITY_URL = process.env.OBSERVABILITY_URL || 'https://seti-observability:4011';
 
 export function reportEvent(params: {
@@ -42,7 +47,7 @@ export function reportEvent(params: {
     );
 
     req.on('error', (err) => {
-      console.error(`[signal-clearance] observability report error: ${err.message}`);
+      console.error(`[signal-clearance] observability report error: ${sanitizeForLog(err.message)}`);
     });
 
     req.write(body);
