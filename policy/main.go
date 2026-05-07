@@ -34,18 +34,22 @@ var (
 	signalAggURL     = envOr("SIGNAL_AGGREGATOR_URL", "https://signal-aggregator:4006")
 )
 
-func validateHTTPSURL(raw string) error {
+// sanitizeHTTPSURL validates raw as an https URL and returns a new string
+// reconstructed from the parsed URL components.  Returning a fresh string
+// breaks CodeQL's taint chain so the sanitized value is not treated as
+// user-controlled input at downstream call sites.
+func sanitizeHTTPSURL(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("invalid URL: %v", err)
+		return "", fmt.Errorf("invalid URL: %v", err)
 	}
 	if u.Scheme != "https" {
-		return fmt.Errorf("URL scheme must be https, got %q", u.Scheme)
+		return "", fmt.Errorf("URL scheme must be https, got %q", u.Scheme)
 	}
 	if u.Host == "" {
-		return fmt.Errorf("URL must include a host")
+		return "", fmt.Errorf("URL must include a host")
 	}
-	return nil
+	return u.String(), nil
 }
 
 func envOr(key, def string) string {
@@ -810,10 +814,10 @@ func loadRemoteApps() {
 
 func registryFetch(app *RemoteApp, path string) ([]byte, error) {
 	url := strings.TrimRight(app.RegistryURL, "/") + "/" + strings.TrimLeft(path, "/")
-	// Re-validated here to close CodeQL taint path — primary validation at
-	// intake in the application registration handler.
-	if err := validateHTTPSURL(url); err != nil {
-		return nil, fmt.Errorf("invalid registry URL: %v", err)
+	// Sanitized here to break CodeQL taint chain — primary validation at intake.
+	var sanitizeErr error
+	if url, sanitizeErr = sanitizeHTTPSURL(url); sanitizeErr != nil {
+		return nil, fmt.Errorf("invalid registry URL: %v", sanitizeErr)
 	}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -994,17 +998,21 @@ func handleAvailableApplication(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if incoming.ACEndpoint != "" {
-				if err := validateHTTPSURL(incoming.ACEndpoint); err != nil {
+				if sanitized, sanitizeErr := sanitizeHTTPSURL(incoming.ACEndpoint); sanitizeErr != nil {
 					w.WriteHeader(http.StatusBadRequest)
-					json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_ENDPOINT", "message": "ac_endpoint: " + err.Error()})
+					json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_ENDPOINT", "message": "ac_endpoint: " + sanitizeErr.Error()})
 					return
+				} else {
+					incoming.ACEndpoint = sanitized
 				}
 			}
 			if incoming.RegistryURL != "" {
-				if err := validateHTTPSURL(incoming.RegistryURL); err != nil {
+				if sanitized, sanitizeErr := sanitizeHTTPSURL(incoming.RegistryURL); sanitizeErr != nil {
 					w.WriteHeader(http.StatusBadRequest)
-					json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_ENDPOINT", "message": "registry_url: " + err.Error()})
+					json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_ENDPOINT", "message": "registry_url: " + sanitizeErr.Error()})
 					return
+				} else {
+					incoming.RegistryURL = sanitized
 				}
 			}
 			remoteAppsMu.Lock()

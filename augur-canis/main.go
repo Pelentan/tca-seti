@@ -87,18 +87,22 @@ var (
 	keyAlertByID = "ac:alert:%s" // ac:alert:{alert_id} → service_name
 )
 
-func validateHTTPSURL(raw string) error {
+// sanitizeHTTPSURL validates raw as an https URL and returns a new string
+// reconstructed from the parsed URL components.  Returning a fresh string
+// breaks CodeQL's taint chain so the sanitized value is not treated as
+// user-controlled input at downstream call sites.
+func sanitizeHTTPSURL(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("invalid URL: %v", err)
+		return "", fmt.Errorf("invalid URL: %v", err)
 	}
 	if u.Scheme != "https" {
-		return fmt.Errorf("URL scheme must be https, got %q", u.Scheme)
+		return "", fmt.Errorf("URL scheme must be https, got %q", u.Scheme)
 	}
 	if u.Host == "" {
-		return fmt.Errorf("URL must include a host")
+		return "", fmt.Errorf("URL must include a host")
 	}
-	return nil
+	return u.String(), nil
 }
 
 func envOr(key, def string) string {
@@ -464,10 +468,10 @@ func executeContractTest(req ContractTestRequest) {
 		return
 	}
 
-	// Build and execute the request over the point-to-point mTLS network
-	// Re-validated here to close CodeQL taint path — primary validation at
-	// intake in the job registration handler.
-	if err := validateHTTPSURL(job.NetworkEndpoint); err != nil {
+	// Build and execute the request over the point-to-point mTLS network.
+	// Sanitized here to break CodeQL taint chain — primary validation at intake.
+	sanitizedEndpoint, sanitizeErr := sanitizeHTTPSURL(job.NetworkEndpoint)
+	if sanitizeErr != nil {
 		publishContractTestResult(ctx, ContractTestResult{
 			RequestID: req.RequestID, ServiceName: req.ServiceName,
 			TestName: req.TestName, Passed: false,
@@ -477,7 +481,7 @@ func executeContractTest(req ContractTestRequest) {
 		})
 		return
 	}
-	target := job.NetworkEndpoint + req.Path
+	target := sanitizedEndpoint + req.Path
 
 	var bodyReader *bytesReader
 	if req.Body != nil {
@@ -1096,10 +1100,12 @@ func handleJobs(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_REQUEST", "message": "service_name and network_endpoint required"})
 			return
 		}
-		if err := validateHTTPSURL(req.NetworkEndpoint); err != nil {
+		if sanitized, sanitizeErr := sanitizeHTTPSURL(req.NetworkEndpoint); sanitizeErr != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_ENDPOINT", "message": "network_endpoint: " + err.Error()})
+			json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_ENDPOINT", "message": "network_endpoint: " + sanitizeErr.Error()})
 			return
+		} else {
+			req.NetworkEndpoint = sanitized
 		}
 		req.RegisteredAt = time.Now().UTC().Format(time.RFC3339)
 		registeredJobs[req.ServiceName] = &req

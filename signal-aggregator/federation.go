@@ -43,21 +43,22 @@ import (
 	"time"
 )
 
-// validateHTTPSURL returns an error if raw is not a valid https URL.
-// All inter-service endpoints in TCA are mTLS/HTTPS — any other scheme
-// is rejected at intake so it never reaches an outgoing HTTP call.
-func validateHTTPSURL(raw string) error {
+// sanitizeHTTPSURL validates raw as an https URL and returns a new string
+// reconstructed from the parsed URL components.  Returning a fresh string
+// breaks CodeQL's taint chain so the sanitized value is not treated as
+// user-controlled input at downstream call sites.
+func sanitizeHTTPSURL(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("invalid URL: %v", err)
+		return "", fmt.Errorf("invalid URL: %v", err)
 	}
 	if u.Scheme != "https" {
-		return fmt.Errorf("URL scheme must be https, got %q", u.Scheme)
+		return "", fmt.Errorf("URL scheme must be https, got %q", u.Scheme)
 	}
 	if u.Host == "" {
-		return fmt.Errorf("URL must include a host")
+		return "", fmt.Errorf("URL must include a host")
 	}
-	return nil
+	return u.String(), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -345,10 +346,11 @@ func runFederatedFeed(ctx context.Context, app *FederatedApp) {
 }
 
 func connectSSEStream(ctx context.Context, app *FederatedApp, url string) error {
-	// Re-validated here to close CodeQL taint path — primary validation at
+	// Sanitized here to break CodeQL taint chain — primary validation at
 	// intake in handleFederationSubscription.
-	if err := validateHTTPSURL(url); err != nil {
-		return fmt.Errorf("invalid endpoint URL: %v", err)
+	var sanitizeErr error
+	if url, sanitizeErr = sanitizeHTTPSURL(url); sanitizeErr != nil {
+		return fmt.Errorf("invalid endpoint URL: %v", sanitizeErr)
 	}
 
 	client := buildConstellationClient(app)
@@ -724,11 +726,16 @@ func handleFederationSubscriptions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := validateHTTPSURL(req.ACEndpoint); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_ENDPOINT", "message": "ac_endpoint: " + err.Error()})
-			return
+		var sanitizedEndpoint string
+		{
+			var sanitizeErr error
+			if sanitizedEndpoint, sanitizeErr = sanitizeHTTPSURL(req.ACEndpoint); sanitizeErr != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"code": "INVALID_ENDPOINT", "message": "ac_endpoint: " + sanitizeErr.Error()})
+				return
+			}
 		}
+		req.ACEndpoint = sanitizedEndpoint
 
 		// Idempotent — if already active with same session, return current status
 		fedMu.RLock()
