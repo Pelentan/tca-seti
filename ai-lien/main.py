@@ -17,6 +17,7 @@ visible — not just the raw input and output.
 """
 
 import json
+import re
 import logging
 import os
 import ssl
@@ -164,6 +165,8 @@ def fetch_lore_context(application_id: str, job_name: str = None) -> dict:
     AI-lien with history is fundamentally different from AI-lien without it.
     """
     context = {}
+    application_id = sanitize_path_segment(application_id)
+    job_name       = sanitize_path_segment(job_name) if job_name else job_name
     since_72h = time.strftime('%Y-%m-%dT%H:%M:%SZ',
                                time.gmtime(time.time() - 72 * 3600))
 
@@ -278,6 +281,14 @@ def get_active_provider() -> dict:
 # ---------------------------------------------------------------------------
 # Ollama API calls — plain HTTP to the provider URL
 # ---------------------------------------------------------------------------
+
+def sanitize_path_segment(value: str) -> str:
+    """Strip anything that isn't alphanumeric, hyphen, or underscore.
+    Prevents path traversal when user-supplied values are interpolated
+    into URL path segments.
+    """
+    return re.sub(r'[^a-zA-Z0-9_\-]', '', value)
+
 
 def sanitize_provider_url(url: str) -> str:
     """Validate and reconstruct a provider URL from parsed components.
