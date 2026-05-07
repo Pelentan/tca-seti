@@ -415,6 +415,11 @@ type PlotSubmission struct {
 
 func registryFetch(req IngestRequest, path string) ([]byte, error) {
 	url := strings.TrimRight(req.RegistryURL, "/") + "/" + strings.TrimLeft(path, "/")
+	// Re-validated here to close CodeQL taint path — primary validation at
+	// intake in the plot ingest handler.
+	if err := validateHTTPSURL(url); err != nil {
+		return nil, fmt.Errorf("invalid registry URL: %v", err)
+	}
 	httpReq, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -472,6 +477,11 @@ func (f registryFile) fetchURL() string {
 }
 
 func fetchFileContent(req IngestRequest, downloadURL string) ([]byte, error) {
+	// Re-validated here to close CodeQL taint path — download URL originates
+	// from registry API response using a user-supplied registry URL.
+	if err := validateHTTPSURL(downloadURL); err != nil {
+		return nil, fmt.Errorf("invalid download URL: %v", err)
+	}
 	httpReq, err := http.NewRequest(http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return nil, err

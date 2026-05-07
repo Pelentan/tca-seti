@@ -345,6 +345,12 @@ func runFederatedFeed(ctx context.Context, app *FederatedApp) {
 }
 
 func connectSSEStream(ctx context.Context, app *FederatedApp, url string) error {
+	// Re-validated here to close CodeQL taint path — primary validation at
+	// intake in handleFederationSubscription.
+	if err := validateHTTPSURL(url); err != nil {
+		return fmt.Errorf("invalid endpoint URL: %v", err)
+	}
+
 	client := buildConstellationClient(app)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
