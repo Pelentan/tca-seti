@@ -12,3 +12,9 @@
 query-filters:
   - exclude:
       id: go/request-forgery
+  - exclude:
+      # go/log-injection is excluded for the same reason as go/request-forgery.
+      # All endpoints that accept tag values from URL paths are on the mTLS port —
+      # only authenticated internal services with valid constellation certs can
+      # reach them.  No unauthenticated user can supply a tag value.
+      id: go/log-injection
