@@ -191,9 +191,10 @@ export class App extends Router {
     try {
       await matched.handler(req, res);
     } catch (err) {
+      console.error('[router] Unhandled handler error:', err);
       if (!rawRes.headersSent) {
         rawRes.writeHead(500, { 'Content-Type': 'application/json' });
-        rawRes.end(JSON.stringify({ code: 'INTERNAL_ERROR', message: String(err) }));
+        rawRes.end(JSON.stringify({ code: 'INTERNAL_ERROR', message: 'An internal error occurred' }));
       }
     }
   }
@@ -231,7 +232,8 @@ function readBody(raw: IncomingMessage): Promise<any> {
 // ---------------------------------------------------------------------------
 
 function parseCookies(header: string | string[] | undefined): Record<string, string> {
-  const cookies: Record<string, string> = {};
+  // Object.create(null) — no prototype, prevents __proto__ / constructor injection.
+  const cookies: Record<string, string> = Object.create(null) as Record<string, string>;
   if (!header) return cookies;
   const cookieStr = Array.isArray(header) ? header.join('; ') : header;
   for (const pair of cookieStr.split(';')) {
@@ -249,7 +251,8 @@ function parseCookies(header: string | string[] | undefined): Record<string, str
 // ---------------------------------------------------------------------------
 
 function parseQuery(qs: string | undefined): Record<string, string> {
-  const query: Record<string, string> = {};
+  // Object.create(null) — no prototype, prevents __proto__ / constructor injection.
+  const query: Record<string, string> = Object.create(null) as Record<string, string>;
   if (!qs) return query;
   for (const pair of qs.split('&')) {
     const eqIdx = pair.indexOf('=');

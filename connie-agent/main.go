@@ -47,6 +47,17 @@ var (
 	startTime           = time.Now()
 )
 
+// sanitizeTag removes control characters from a constellation tag before
+// logging — prevents log injection from URL path parameters.
+func sanitizeTag(tag string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r < 0x20 {
+			return -1
+		}
+		return r
+	}, tag)
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -580,7 +591,7 @@ func handleSyncConstellation(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	tag := strings.TrimPrefix(r.URL.Path, "/sync/")
+	tag := sanitizeTag(strings.TrimPrefix(r.URL.Path, "/sync/"))
 	tag = strings.TrimSuffix(tag, "/")
 
 	state := getState(tag)

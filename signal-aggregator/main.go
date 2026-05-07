@@ -489,6 +489,12 @@ func handleSubscriptions(w http.ResponseWriter, r *http.Request) {
 		if req.WindowSize > 0 {
 			ws = req.WindowSize
 		}
+		// Cap window size to prevent excessive memory allocation from
+		// caller-supplied values.
+		const maxWindowSize = 10_000
+		if ws > maxWindowSize {
+			ws = maxWindowSize
+		}
 		windows[req.ApplicationID] = make([]ConstellationEvent, 0, ws)
 		windowMu.Unlock()
 

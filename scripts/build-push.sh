@@ -23,7 +23,7 @@ SERVICES=(
   "seti-observability:seti-observability/Dockerfile:."
   "lore:lore/Dockerfile:."
   "augur-canis:augur-canis/Dockerfile:."
-  "signal-clearance:signal-clearance/Dockerfile:signal-clearance"
+  "signal-clearance:signal-clearance/Dockerfile:."
   "policy:policy/Dockerfile:."
   "contract-test:contract-test/Dockerfile:."
   "results:results/Dockerfile:."

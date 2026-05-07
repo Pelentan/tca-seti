@@ -671,6 +671,17 @@ func executeContractTestSync(req ContractTestRequest) ContractTestResult {
 		}
 	}
 
+	// Re-validated here to close CodeQL taint path — primary validation at
+	// intake in the job registration handler.
+	if err = validateHTTPSURL(job.NetworkEndpoint); err != nil {
+		return ContractTestResult{
+			RequestID: req.RequestID, ServiceName: req.ServiceName,
+			TestName: req.TestName, Passed: false,
+			ExpectedStatus: req.ExpectedStatus,
+			FailureReason:  "invalid endpoint: " + err.Error(),
+			ExecutedAt:     time.Now().UTC().Format(time.RFC3339),
+		}
+	}
 	target := job.NetworkEndpoint + req.Path
 
 	var httpReq *http.Request

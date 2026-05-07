@@ -810,6 +810,11 @@ func loadRemoteApps() {
 
 func registryFetch(app *RemoteApp, path string) ([]byte, error) {
 	url := strings.TrimRight(app.RegistryURL, "/") + "/" + strings.TrimLeft(path, "/")
+	// Re-validated here to close CodeQL taint path — primary validation at
+	// intake in the application registration handler.
+	if err := validateHTTPSURL(url); err != nil {
+		return nil, fmt.Errorf("invalid registry URL: %v", err)
+	}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err

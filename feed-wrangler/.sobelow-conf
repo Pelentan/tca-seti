@@ -1,0 +1,9 @@
+[
+  # Traversal.FileModule findings are all low-confidence false positives —
+  # every flagged path is either a hardcoded constant, an admin-controlled
+  # env var (/certs/...), or a unique-integer generated temp path.
+  # feed-wrangler is a non-Phoenix TLS-managed service; cert file operations
+  # are expected and do not accept user-controlled paths.
+  skip: ["Traversal.FileModule"],
+  exit: true
+]

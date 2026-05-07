@@ -465,6 +465,18 @@ func executeContractTest(req ContractTestRequest) {
 	}
 
 	// Build and execute the request over the point-to-point mTLS network
+	// Re-validated here to close CodeQL taint path — primary validation at
+	// intake in the job registration handler.
+	if err := validateHTTPSURL(job.NetworkEndpoint); err != nil {
+		publishContractTestResult(ctx, ContractTestResult{
+			RequestID: req.RequestID, ServiceName: req.ServiceName,
+			TestName: req.TestName, Passed: false,
+			ExpectedStatus: req.ExpectedStatus,
+			FailureReason:  "invalid endpoint: " + err.Error(),
+			ExecutedAt:     time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
 	target := job.NetworkEndpoint + req.Path
 
 	var bodyReader *bytesReader

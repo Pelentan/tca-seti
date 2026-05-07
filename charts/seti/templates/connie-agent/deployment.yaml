@@ -22,6 +22,7 @@ spec:
         {{- include "seti.waitForCertForge" . | nindent 8 }}
         {{- include "seti.waitForAugurCanis" . | nindent 8 }}
         {{- include "seti.waitForSignalAggregator" . | nindent 8 }}
+        {{- include "seti.waitForPlotStore" . | nindent 8 }}
       terminationGracePeriodSeconds: 20
       containers:
         - name: connie-agent
