@@ -186,9 +186,14 @@ class ResultsHandler(BaseHTTPRequestHandler):
         passed = run.get('passed_tests', 0)
         failed = run.get('failed_tests', 0)
         status = run.get('status', 'unknown')
+        safe_run_id = sanitize_for_log(run_id)
+        safe_app_id = sanitize_for_log(app_id)
+        safe_status = sanitize_for_log(status)
+        safe_passed = sanitize_for_log(passed)
+        safe_failed = sanitize_for_log(failed)
         log.info(
-            f'Stored contract run {sanitize_for_log(run_id)} for {sanitize_for_log(app_id)}: '
-            f'{passed} passed, {failed} failed, status={sanitize_for_log(status)}'
+            f'Stored contract run {safe_run_id} for {safe_app_id}: '
+            f'{safe_passed} passed, {safe_failed} failed, status={safe_status}'
         )
 
         self.send_json(201, {
